@@ -1,0 +1,8 @@
+node_modules/
+ui/node_modules/
+ui/dist/
+ui/styled-system/
+cov_profile/
+gen/
+*.compiled
+kanban
