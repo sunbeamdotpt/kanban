@@ -43,6 +43,7 @@ use sunbeam_g2v::config::NatsConfig;
 
 use crate::auth::keto_dispatch::{dispatch, DispatchState};
 use crate::auth::logout_watermark::LogoutWatermark;
+use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
     attachment_service_server::AttachmentServiceServer,
     auth_service_server::AuthServiceServer,
@@ -290,12 +291,22 @@ pub async fn run() -> Result<()> {
 
     info!("Prometheus metrics declared");
 
-    // ── 8. Build tonic gRPC router ──────────────────────────────────────────
+    // ── 8. S3 client for AttachmentService ─────────────────────────────────
+    let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
+    info!("S3 client initialised (endpoint={})", std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "<default>".into()));
+
+    // ── Build tonic gRPC router ─────────────────────────────────────────────
     let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl {
         watermark: Arc::clone(&watermark),
     }))
-        .add_service(AttachmentServiceServer::new(AttachmentServiceImpl))
-        .add_service(BoardServiceServer::new(BoardServiceImpl))
+        .add_service(AttachmentServiceServer::new(AttachmentServiceImpl {
+            pool: pg_pool.clone(),
+            s3: Arc::clone(&s3_client),
+        }))
+        .add_service(BoardServiceServer::new(BoardServiceImpl {
+            pool: pg_pool.clone(),
+            keto: Arc::clone(&keto),
+        }))
         .add_service(CardServiceServer::new(CardServiceImpl))
         .add_service(ForgejoLinkServiceServer::new(ForgejoServiceImpl))
         .add_service(ProjectServiceServer::new(ProjectServiceImpl {

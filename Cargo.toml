@@ -50,6 +50,12 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.14"
 tower-http = { workspace = true }
 tokio-stream = { workspace = true }
+# Stage 3d: S3 presigning
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
