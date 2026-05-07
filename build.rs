@@ -1,6 +1,4 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ---- kanban v1 proto (tonic-prost client stubs, server=false) ----
-    // Paths are relative to the workspace root (where Cargo.toml of the workspace is)
     let kanban_protos = &[
         "../../proto/sunbeam/kanban/v1/auth.proto",
         "../../proto/sunbeam/kanban/v1/attachments.proto",
@@ -12,8 +10,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/sunbeam/kanban/v1/search.proto",
     ];
     let kanban_includes = &["../../proto"];
+
+    // ---- tonic-prost: server traits + client stubs ----
     tonic_prost_build::configure()
-        .build_server(false)
+        .build_server(true)
         .build_client(true)
         .compile_protos(kanban_protos, kanban_includes)?;
 
