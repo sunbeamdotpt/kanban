@@ -307,7 +307,10 @@ pub async fn run() -> Result<()> {
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
         }))
-        .add_service(CardServiceServer::new(CardServiceImpl))
+        .add_service(CardServiceServer::new(CardServiceImpl {
+            pool: pg_pool.clone(),
+            keto: Arc::clone(&keto),
+        }))
         .add_service(ForgejoLinkServiceServer::new(ForgejoServiceImpl))
         .add_service(ProjectServiceServer::new(ProjectServiceImpl {
             pool: pg_pool.clone(),
