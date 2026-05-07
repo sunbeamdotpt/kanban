@@ -1,0 +1,29 @@
+[package]
+name = "kanban"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Kanban board service"
+
+[lib]
+name = "kanban"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kanban"
+path = "src/main.rs"
+
+[dependencies]
+sunbeam-g2v = { path = "../../libs/sunbeam-g2v" }
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+prost.workspace = true
+redis = { workspace = true }
+parking_lot = { workspace = true }
+uuid.workspace = true
