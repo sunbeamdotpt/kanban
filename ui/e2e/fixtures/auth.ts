@@ -186,12 +186,7 @@ export interface AuthFixtures {
 
 export const test = base.extend<AuthFixtures>({
   authedPage: async ({ browser, baseURL }, use) => {
-    test.skip(
-      !process.env.KRATOS_ADMIN_URL,
-      "needs deployed kanban service: KRATOS_ADMIN_URL not set",
-    );
-
-    const email = `e2e-${Date.now()}@sunbeam-test.invalid`;
+const email = `e2e-${Date.now()}@sunbeam-test.invalid`;
     const identity = await provisionKratosIdentity(email);
     const session = await mintKratosSession(identity.id);
 
@@ -217,12 +212,7 @@ export const test = base.extend<AuthFixtures>({
   },
 
   ketoDeniedPage: async ({ browser, baseURL }, use) => {
-    test.skip(
-      !process.env.KRATOS_ADMIN_URL,
-      "needs deployed kanban service: KRATOS_ADMIN_URL not set",
-    );
-
-    const email = `e2e-denied-${Date.now()}@sunbeam-test.invalid`;
+const email = `e2e-denied-${Date.now()}@sunbeam-test.invalid`;
     const identity = await provisionKratosIdentity(email);
     const session = await mintKratosSession(identity.id);
 
@@ -249,12 +239,7 @@ export const test = base.extend<AuthFixtures>({
   },
 
   testProjectId: async ({ authedPage }, use) => {
-    test.skip(
-      !process.env.KRATOS_ADMIN_URL,
-      "needs deployed kanban service: KRATOS_ADMIN_URL not set",
-    );
-
-    // Create a test project via the API (needs a bearer token).
+// Create a test project via the API (needs a bearer token).
     // The bearer token is the Kratos session token — the kanban dev stack
     // accepts it when KANBAN_ACCEPT_SESSION_TOKEN=true is set.
     // @ts-expect-error -- authedPage does not expose token; seed.ts handles creation

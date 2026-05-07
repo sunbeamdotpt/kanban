@@ -820,7 +820,6 @@ mod tests {
     // ── Integration tests (needs shared Valkey + Keto) ───────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL) and shared keto (set KETO_GRPC_URL)"]
     async fn dispatch_rejects_revoked_token() {
         // Signal a logout for the test subject, then verify dispatch rejects
         // a token whose iat_ms is before the watermark.
@@ -877,7 +876,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared keto (set KETO_GRPC_URL) and shared valkey (set VALKEY_URL)"]
     async fn dispatch_returns_403_on_keto_denial() {
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
         let keto_url =

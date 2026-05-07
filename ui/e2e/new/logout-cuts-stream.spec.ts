@@ -35,10 +35,7 @@ const BASE_URL =
   process.env.KANBAN_E2E_BASE_URL ?? "http://localhost:47823";
 
 test.describe("Logout cuts active stream", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
   // Remove this skip once Stage 6c re-login prompt is implemented:
-  test.skip(true, SKIP_STAGE6C);
 
   test("SignalLogout closes stream within 2 s and shows re-login prompt", async ({
     browser,

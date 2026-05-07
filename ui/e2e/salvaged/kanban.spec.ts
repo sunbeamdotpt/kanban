@@ -11,7 +11,6 @@ const SKIP_REASON = "needs deployed kanban service (Stage 7e+)";
 const deployed = !!process.env.KANBAN_E2E_BASE_URL || process.env.CI === "true";
 
 test.describe("Kanban board", () => {
-  test.skip(!deployed, SKIP_REASON);
 
   test("board shows columns from template", async ({ page }) => {
     await createBoardAndNavigate(page, "Simple");

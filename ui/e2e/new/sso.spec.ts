@@ -24,7 +24,6 @@ const KRATOS_PUBLIC_URL =
   process.env.KRATOS_PUBLIC_URL ?? "http://localhost:4433";
 
 test.describe("SSO authentication flow", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
 
   test("anonymous visit to / redirects to Kratos login", async ({ page }) => {
     await page.goto("/");
@@ -45,7 +44,6 @@ test.describe("SSO authentication flow", () => {
   test("authenticated user lands on project list after login", async ({
     browser,
   }) => {
-    test.skip(!kratosAvailable, "needs KRATOS_ADMIN_URL");
 
     const email = `e2e-sso-${Date.now()}@sunbeam-test.invalid`;
 
@@ -108,8 +106,6 @@ test.describe("SSO authentication flow", () => {
   });
 
   test("logout via user menu clears session", async ({ browser }) => {
-    test.skip(!kratosAvailable, "needs KRATOS_ADMIN_URL");
-    test.skip(true, SKIP_AUTH_STATUS);
 
     const email = `e2e-logout-${Date.now()}@sunbeam-test.invalid`;
     const idRes = await fetch(`${KRATOS_ADMIN_URL}/admin/identities`, {

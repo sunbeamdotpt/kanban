@@ -414,10 +414,23 @@ mod tests {
             .expect("failed to connect to Postgres")
     }
 
-    fn make_service(pool: PgPool) -> AttachmentServiceImpl {
+    /// Anonymous PUT to create the bucket; idempotent on seaweedfs (returns
+    /// 200 whether the bucket existed or was just created).
+    async fn ensure_bucket_exists(cfg: &crate::integrations::s3::S3Config) {
+        let url = format!("{}/{}", cfg.endpoint.trim_end_matches('/'), cfg.bucket);
+        let _ = reqwest::Client::new()
+            .put(&url)
+            .send()
+            .await
+            .expect("seaweedfs unreachable; check S3_ENDPOINT");
+    }
+
+    async fn make_service(pool: PgPool) -> AttachmentServiceImpl {
+        let cfg = s3_config();
+        ensure_bucket_exists(&cfg).await;
         AttachmentServiceImpl {
             pool,
-            s3: Arc::new(S3Client::new(s3_config())),
+            s3: Arc::new(S3Client::new(cfg)),
         }
     }
 
@@ -450,10 +463,9 @@ mod tests {
     // ── Tests ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn request_presigned_upload_returns_signed_url() {
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
 
         let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -493,10 +505,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn presigned_upload_then_confirm_then_download_round_trip() {
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
@@ -585,10 +596,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn confirm_upload_rejects_when_file_not_in_s3() {
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
 
         let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -631,10 +641,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn delete_attachment_removes_from_s3_and_db() {
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
@@ -706,10 +715,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn list_attachments_by_card_returns_only_that_cards_rows() {
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
         let s3_cfg = s3_config();
 
         let card_a = seed_card_chain(&pool).await;
@@ -763,12 +771,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + seaweedfs)"]
     async fn confirm_upload_rejects_when_card_id_mismatches_checked_object_id() {
         // Security regression test: attacker presents attachment_id for card X
         // but puts card Y in the x-sunbeam-object-id header (authorized for Y).
         let pool = setup_pool().await;
-        let svc = make_service(pool.clone());
+        let svc = make_service(pool.clone()).await;
 
         let card_legit = seed_card_chain(&pool).await;
         let card_attacker = seed_card_chain(&pool).await;

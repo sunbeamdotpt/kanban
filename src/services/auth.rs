@@ -248,7 +248,6 @@ mod tests {
     // ── SignalLogout ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL)"]
     async fn signal_logout_writes_watermark_to_valkey() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_watermark(&url);
@@ -272,7 +271,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL)"]
     async fn signal_logout_subsequent_call_increases_watermark() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_watermark(&url);

@@ -344,7 +344,6 @@ mod tests {
 
     /// First subscriber opens the consumer and receives a published event.
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn subscribe_first_caller_opens_consumer_and_receives_published_event() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
@@ -371,7 +370,6 @@ mod tests {
     /// Two subscribers on the same board share a single consumer; only one entry
     /// exists in the boards map, and both receive the same event.
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn subscribe_second_caller_shares_consumer_no_duplicate() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
@@ -409,7 +407,6 @@ mod tests {
     /// After the last subscriber drops, the channel is removed from the map.
     /// A subsequent subscribe call opens a fresh consumer.
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn dropping_last_subscriber_tears_down_consumer() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
@@ -444,7 +441,6 @@ mod tests {
 
     /// Events on board A do not appear on board B's subscriber.
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn subscribe_to_different_boards_isolates_streams() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
@@ -478,7 +474,6 @@ mod tests {
     /// reading from the slow receiver. The fast receiver should still
     /// receive all 300 events.
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn lagged_receiver_does_not_block_others() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;

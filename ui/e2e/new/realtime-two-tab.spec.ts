@@ -31,10 +31,7 @@ const BASE_URL =
   process.env.KANBAN_E2E_BASE_URL ?? "http://localhost:47823";
 
 test.describe("Realtime two-tab synchronisation", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
   // Remove this skip once Stage 6 FE drag-and-drop is implemented:
-  test.skip(true, SKIP_STAGE6);
 
   test("drag in tab 1 reflects in tab 2 within 2 s via SubscribeBoard stream", async ({
     browser,

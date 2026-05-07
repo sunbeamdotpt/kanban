@@ -180,7 +180,6 @@ mod tests {
 
     /// A subject with no tuples → empty set, no error.
     #[tokio::test]
-    #[ignore = "needs shared keto"]
     async fn expand_returns_empty_set_for_unknown_subject() {
         let Some(ctx) = probe().await else { return };
 
@@ -204,7 +203,6 @@ mod tests {
 
     /// 5 tuples with page_size=2 → 3 pages, all 5 objects returned.
     #[tokio::test]
-    #[ignore = "needs shared keto"]
     async fn expand_paginates_when_results_exceed_page() {
         let Some(ctx) = probe().await else { return };
 
@@ -234,7 +232,6 @@ mod tests {
 
     /// 5 tuples, max_results=3 → Err before fetching beyond the ceiling.
     #[tokio::test]
-    #[ignore = "needs shared keto"]
     async fn expand_errors_when_exceeds_ceiling() {
         let Some(ctx) = probe().await else { return };
 

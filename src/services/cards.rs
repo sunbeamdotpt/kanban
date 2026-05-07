@@ -1947,7 +1947,6 @@ mod tests {
     // ── Tests ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn create_card_allocates_ref() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2001,7 +2000,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn create_card_in_different_projects_have_independent_seqs() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2045,7 +2043,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn move_card_within_same_board_succeeds() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2088,7 +2085,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn move_card_to_column_on_different_project_returns_invalid_argument() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2132,7 +2128,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn move_card_with_idempotency_key_replays_returns_same_state() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2184,7 +2179,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn update_card_bumps_revision_and_writes_event_log_row() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2237,7 +2231,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn delete_card_cascades_assignees_labels_checklist_comments() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2307,7 +2300,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn bulk_update_card_labels_writes_event_log_per_card() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2362,7 +2354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn assign_card_idempotent_on_repeat() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2400,7 +2391,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn add_checklist_item_appends_to_position_max_plus_one() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2440,7 +2430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn add_then_edit_comment_updates_body_and_writes_event_log() {
         let pool = setup_pool().await;
         let keto = setup_keto();
@@ -2490,7 +2479,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn delete_comment_rejects_when_caller_is_not_author_or_admin() {
         let pool = setup_pool().await;
         let keto = setup_keto();

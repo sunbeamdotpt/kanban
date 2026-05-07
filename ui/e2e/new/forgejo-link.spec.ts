@@ -39,9 +39,6 @@ const FORGEJO_ISSUE_NUMBER = parseInt(
 );
 
 test.describe("Forgejo issue linking", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!forgejoAvailable, SKIP_FORGEJO);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
 
   test("search, link, see badge, unlink, verify event_log", async ({
     browser,

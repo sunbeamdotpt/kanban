@@ -35,6 +35,7 @@ use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use uuid::Uuid;
 use sunbeam_g2v::config::AuthConfig;
 use sunbeam_g2v::middleware::auth::jwt::{JwtLayer, JwtValidator};
 use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
@@ -54,6 +55,7 @@ use crate::pb::{
     project_service_server::ProjectServiceServer,
     search_service_server::SearchServiceServer,
 };
+use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     attachments::AttachmentServiceImpl, auth::AuthServiceImpl,
     boards::BoardServiceImpl, cards::CardServiceImpl,
@@ -283,6 +285,13 @@ pub async fn run() -> Result<()> {
 
     info!("outbox dispatcher spawned");
 
+    // ── 4c. BoardSubscriberRegistry — per-pod NATS push consumer fanout ────
+    let pod_id = std::env::var("POD_NAME")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+    let board_registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), pod_id));
+
+    info!("BoardSubscriberRegistry constructed");
+
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
     let watermark = Arc::new(
         LogoutWatermark::new(&valkey_url)
@@ -325,6 +334,8 @@ pub async fn run() -> Result<()> {
         .add_service(BoardServiceServer::new(BoardServiceImpl {
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
+            registry: Arc::clone(&board_registry),
+            watermark: Arc::clone(&watermark),
         }))
         .add_service(CardServiceServer::new(CardServiceImpl {
             pool: pg_pool.clone(),
@@ -334,6 +345,8 @@ pub async fn run() -> Result<()> {
         .add_service(ProjectServiceServer::new(ProjectServiceImpl {
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
+            registry: Arc::clone(&board_registry),
+            watermark: Arc::clone(&watermark),
         }))
         .add_service(SearchServiceServer::new(SearchServiceImpl {
             keto: Arc::clone(&keto),

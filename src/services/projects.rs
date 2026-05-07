@@ -1,4 +1,11 @@
-//! ProjectService — Stage 3a implementation.
+//! ProjectService — Stage 3a + 4c implementation.
+//!
+//! Stage 4c: `SubscribeProject` returns `unimplemented` pending Stage 4c.5
+//! (per-project multi-board merge via `tokio_stream::StreamExt::merge` /
+//! `select_all` over per-board streams enumerated from
+//! `keto_expand_objects(KanbanBoard, view, subject)`).
+//!
+// (original doc below)
 //!
 //! Mirror-table write order: Keto FIRST, then SQL. If the SQL insert fails
 //! after a successful Keto write, we log a `mirror_drift` warning and let
@@ -24,11 +31,13 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
+use crate::auth::logout_watermark::LogoutWatermark;
+use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
-    AddMemberRequest, CreateProjectRequest, DeleteProjectRequest,
+    AddMemberRequest, BoardEventEnvelope, CreateProjectRequest, DeleteProjectRequest,
     GetProjectRequest, ListMembersRequest, ListMembersResponse,
-    ListProjectsRequest, ListProjectsResponse, Project, ProjectEvent,
+    ListProjectsRequest, ListProjectsResponse, Project,
     ProjectMember, RemoveMemberRequest, SubscribeProjectRequest,
     UpdateProjectRequest,
 };
@@ -43,6 +52,8 @@ const MAX_PROJECTS: usize = 10_000;
 pub struct ProjectServiceImpl {
     pub pool: PgPool,
     pub keto: Arc<KetoClient>,
+    pub registry: Arc<BoardSubscriberRegistry>,
+    pub watermark: Arc<LogoutWatermark>,
 }
 
 // ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
@@ -128,8 +139,8 @@ async fn fetch_member_count(pool: &PgPool, project_id: Uuid) -> i32 {
 
 // ── Type alias ───────────────────────────────────────────────────────────────
 
-type ProjectEventStream =
-    Pin<Box<dyn Stream<Item = Result<ProjectEvent, Status>> + Send + 'static>>;
+type SubscribeProjectStream =
+    Pin<Box<dyn Stream<Item = Result<BoardEventEnvelope, Status>> + Send + 'static>>;
 
 // ── impl ProjectService ──────────────────────────────────────────────────────
 
@@ -542,15 +553,22 @@ impl ProjectService for ProjectServiceImpl {
         Ok(Response::new(ListMembersResponse { members }))
     }
 
-    // ── SubscribeProject (Stage 4) ────────────────────────────────────────────
+    // ── SubscribeProject (Stage 4c — deferred to 4c.5) ───────────────────────
+    //
+    // TODO(4c.5): multi-board merge — enumerate all KanbanBoard objects visible
+    // to the subject via `keto_expand_objects(KanbanBoard, view, subject)`, then
+    // open one `build_subscribe_board_stream` per board and merge them via
+    // `tokio_stream::StreamExt::merge` / `select_all`.
 
-    type SubscribeProjectStream = ProjectEventStream;
+    type SubscribeProjectStream = SubscribeProjectStream;
 
     async fn subscribe_project(
         &self,
         _request: Request<SubscribeProjectRequest>,
     ) -> Result<Response<Self::SubscribeProjectStream>, Status> {
-        Err(Status::unimplemented("Stage 4 streaming"))
+        Err(Status::unimplemented(
+            "Stage 4c.5 — per-project multi-board merge not yet implemented",
+        ))
     }
 }
 
@@ -599,8 +617,25 @@ mod tests {
         }))
     }
 
-    fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
-        ProjectServiceImpl { pool, keto }
+    async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
+        let nats_url = std::env::var("NATS_URL")
+            .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let valkey_url = std::env::var("VALKEY_URL")
+            .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let nats = Arc::new(
+            sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
+                url: nats_url,
+                jetstream: true,
+                lease_duration: 30,
+            })
+            .await
+            .expect("NATS connect failed"),
+        );
+        let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-projects"));
+        let watermark = Arc::new(
+            LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"),
+        );
+        ProjectServiceImpl { pool, keto, registry, watermark }
     }
 
     /// Build an authenticated request carrying a subject in extensions.
@@ -639,11 +674,10 @@ mod tests {
     // ── Tests ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn create_then_get_returns_same_project() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
 
@@ -693,11 +727,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn list_projects_returns_only_visible_via_keto_expand() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject_a = format!("user:test-a-{}", Uuid::new_v4());
         let subject_b = format!("user:test-b-{}", Uuid::new_v4());
@@ -782,11 +815,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn update_project_applies_patch_fields_only() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
 
@@ -847,11 +879,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn delete_project_cascades_and_clears_keto_tuples() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
 
@@ -907,11 +938,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn add_member_writes_keto_then_sql_row() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
         let member = format!("user:test-member-{}", Uuid::new_v4());
@@ -973,11 +1003,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn remove_member_clears_both_keto_and_sql() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
         let member = format!("user:test-member-{}", Uuid::new_v4());
@@ -1049,11 +1078,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn list_members_returns_inserted_rows() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
         let viewer = format!("user:test-viewer-{}", Uuid::new_v4());
@@ -1123,11 +1151,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared compose (postgres + keto)"]
     async fn create_with_idempotency_key_returns_cached_response_on_replay() {
         let pool = setup_pool().await;
         let keto = setup_keto();
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
         let idem_key = format!("idem-test-{}", Uuid::new_v4());
@@ -1174,4 +1201,41 @@ mod tests {
             .await;
         cleanup_keto_for_subject(&keto, &subject).await;
     }
+
+    // ── Stage 4c SubscribeProject tests ──────────────────────────────────────
+
+    /// SubscribeProject returns Unimplemented (pending Stage 4c.5).
+    #[tokio::test]
+    async fn subscribe_project_returns_unimplemented_pending_stage_4c5() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let project_id = Uuid::new_v4().to_string();
+
+        let mut req = Request::new(SubscribeProjectRequest {
+            project_id: project_id.clone(),
+            since_seq: 0,
+        });
+        req.extensions_mut()
+            .insert(AuthContext::authenticated(&subject, None));
+        req.extensions_mut()
+            .insert(crate::auth::keto_dispatch::CheckedObjectId(project_id.clone()));
+
+        let result = svc.subscribe_project(req).await;
+
+        assert!(result.is_err(), "SubscribeProject must return an error (unimplemented)");
+        let status = result.err().expect("result was Ok after is_err check");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unimplemented,
+            "SubscribeProject must return Unimplemented pending Stage 4c.5, got {status:?}"
+        );
+    }
+
+    // NOTE: per-project multi-board merge test will be added together with
+    // the `subscribe_project` implementation (currently returns
+    // `Status::unimplemented`; covered by
+    // `subscribe_project_returns_unimplemented_pending_stage_4c5`).
 }

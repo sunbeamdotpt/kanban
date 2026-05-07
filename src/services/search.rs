@@ -427,7 +427,6 @@ mod tests {
     // ── Test: missing index → empty, no error ────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_returns_empty_when_index_missing() {
         let Some(os) = probe_opensearch().await else { return };
         let Some(keto) = probe_keto().await else { return };
@@ -471,7 +470,6 @@ mod tests {
     // ── Test: full-text match by title ────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_finds_card_by_title_match() {
         let Some(os) = probe_opensearch().await else { return };
         let Some(keto) = probe_keto().await else { return };
@@ -524,7 +522,6 @@ mod tests {
     // ── Test: filter by project_id ────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_filters_by_project_id() {
         let Some(os) = probe_opensearch().await else { return };
 
@@ -569,7 +566,6 @@ mod tests {
     // ── Test: filter by label_name ────────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_filters_by_label_name() {
         let Some(os) = probe_opensearch().await else { return };
 
@@ -613,7 +609,6 @@ mod tests {
     // ── Test: Keto post-filter drops unauthorized cards ───────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_post_filters_via_keto_expand() {
         let Some(os) = probe_opensearch().await else { return };
         let Some(keto) = probe_keto().await else { return };
@@ -698,7 +693,6 @@ mod tests {
     // ── Test: pagination via search_after cursor ──────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared opensearch + keto"]
     async fn search_paginates_via_next_cursor() {
         let Some(os) = probe_opensearch().await else { return };
 

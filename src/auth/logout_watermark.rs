@@ -173,7 +173,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL)"]
     async fn signal_then_query_returns_watermark() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
@@ -187,7 +186,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL)"]
     async fn is_token_valid_iat_boundary() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
@@ -216,7 +214,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL)"]
     async fn cache_hit_does_not_call_valkey() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
@@ -241,7 +238,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs shared valkey (set VALKEY_URL); sleeps 6s"]
     async fn signal_logout_persists_through_cache_expiry() {
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);

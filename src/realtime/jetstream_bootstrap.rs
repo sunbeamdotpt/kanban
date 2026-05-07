@@ -193,7 +193,6 @@ mod tests {
     /// enabled. Does **not** tear down the stream after the test (the stream
     /// is shared / idempotent).
     #[tokio::test]
-    #[ignore = "needs shared nats (set NATS_URL)"]
     async fn ensure_kanban_stream_is_idempotent() {
         let nats_url = std::env::var("NATS_URL")
             .unwrap_or_else(|_| "nats://localhost:4222".to_string());

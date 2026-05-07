@@ -54,9 +54,6 @@ async function deleteIdentity(id: string) {
 }
 
 test.describe("Keto permission enforcement", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
-  test.skip(!ketoAvailable, SKIP_KETO);
 
   test("user B without relations sees empty project list", async ({ browser }) => {
     const userB = await provision(`e2e-denied-b-${Date.now()}@sunbeam-test.invalid`);

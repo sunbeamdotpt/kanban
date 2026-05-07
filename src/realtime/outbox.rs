@@ -500,7 +500,6 @@ mod tests {
     // ── drain_once_publishes_new_rows_and_marks_them ──────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared nats + postgres"]
     async fn drain_once_publishes_new_rows_and_marks_them() {
         let pool = setup_pool().await;
         let nats = setup_nats().await;
@@ -560,7 +559,6 @@ mod tests {
     // ── drain_once_skips_already_dispatched_rows ──────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared nats + postgres"]
     async fn drain_once_skips_already_dispatched_rows() {
         let pool = setup_pool().await;
         let nats = setup_nats().await;
@@ -588,7 +586,6 @@ mod tests {
     // ── drain_once_is_idempotent_on_restart ──────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared nats + postgres"]
     async fn drain_once_is_idempotent_on_restart() {
         let pool = setup_pool().await;
         let nats = setup_nats().await;
@@ -624,7 +621,6 @@ mod tests {
     // ── drain_once_respects_batch_size ────────────────────────────────────────
 
     #[tokio::test]
-    #[ignore = "needs shared nats + postgres"]
     async fn drain_once_respects_batch_size() {
         let pool = setup_pool().await;
         let nats = setup_nats().await;
@@ -675,7 +671,6 @@ mod tests {
     // Ok(0) and all rows stay NULL.
 
     #[tokio::test]
-    #[ignore = "needs shared nats + postgres"]
     async fn drain_once_leaves_rows_undispatched_when_publish_fails() {
         let pool = setup_pool().await;
 

@@ -17,7 +17,6 @@ async function setupBoardWithCard(page: import("@playwright/test").Page) {
 }
 
 test.describe("Card detail features", () => {
-  test.skip(!deployed, SKIP_REASON);
 
   test("forgejo link search UI opens", async ({ page }) => {
     await setupBoardWithCard(page);

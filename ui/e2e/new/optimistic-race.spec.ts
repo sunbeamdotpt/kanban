@@ -61,10 +61,7 @@ async function dragCardToColumn(
 }
 
 test.describe("Optimistic race: 3 rapid drags", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
   // Remove this skip once Stage 6 FE optimistic queue is implemented:
-  test.skip(true, SKIP_STAGE6);
 
   test("final card position matches server after 3 rapid drags", async ({
     browser,

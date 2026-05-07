@@ -43,8 +43,6 @@ function makeTestPayload(): Uint8Array {
 }
 
 test.describe("Attachment upload round-trip", () => {
-  test.skip(!deployed, SKIP_DEPLOYED);
-  test.skip(!kratosAvailable, SKIP_KRATOS);
 
   test("presign upload → PUT → confirm → presign download → byte-identical", async ({
     browser,

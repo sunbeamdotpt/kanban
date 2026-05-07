@@ -22,7 +22,6 @@ async function createProjectAndExpand(page: import("@playwright/test").Page) {
 }
 
 test.describe("Boards", () => {
-  test.skip(!deployed, SKIP_REASON);
 
   test("create board from template", async ({ page }) => {
     await createProjectAndExpand(page);

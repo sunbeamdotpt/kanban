@@ -11,7 +11,6 @@ const SKIP_REASON = "needs deployed kanban service (Stage 7e+)";
 const deployed = !!process.env.KANBAN_E2E_BASE_URL || process.env.CI === "true";
 
 test.describe("Projects page", () => {
-  test.skip(!deployed, SKIP_REASON);
 
   test("shows the projects page heading", async ({ page }) => {
     await page.goto("/");
