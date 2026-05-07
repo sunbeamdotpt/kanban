@@ -1,6 +1,0 @@
-version: v2
-modules:
-  - path: proto
-    name: buf.build/sunbeam/kanban
-deps:
-  - buf.build/protocolbuffers/wellknowntypes
