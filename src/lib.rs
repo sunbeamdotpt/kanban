@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod integrations;
 pub mod pb;
+pub mod realtime;
 pub mod server;
 pub mod services;
 

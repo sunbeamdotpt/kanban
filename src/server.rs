@@ -62,9 +62,9 @@ use crate::services::{
 };
 
 // ── JetStream stream name & config ──────────────────────────────────────────
-
-const STREAM_NAME: &str = "KANBAN_BOARD_EVENTS";
-const STREAM_SUBJECT: &str = "kanban.board.>";
+//
+// Naming and config live in realtime::jetstream_bootstrap; server.rs only
+// calls the bootstrap function at startup.
 
 // ── Prometheus metrics registry shared across handlers ──────────────────────
 
@@ -257,17 +257,17 @@ pub async fn run() -> Result<()> {
     .await
     .context("failed to connect to NATS")?;
 
-    nats.ensure_stream(async_nats::jetstream::stream::Config {
-        name: STREAM_NAME.to_string(),
-        subjects: vec![STREAM_SUBJECT.to_string()],
-        num_replicas: 1,
-        retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
-        ..Default::default()
-    })
+    crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+        &nats,
+        &crate::realtime::jetstream_bootstrap::default_config(),
+    )
     .await
     .context("fatal: failed to bootstrap KANBAN_BOARD_EVENTS JetStream stream")?;
 
-    info!(stream = STREAM_NAME, "JetStream stream bootstrapped");
+    info!(
+        stream = crate::realtime::jetstream_bootstrap::STREAM_NAME,
+        "JetStream stream bootstrapped"
+    );
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
     let watermark = Arc::new(
