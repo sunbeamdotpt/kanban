@@ -29,6 +29,7 @@ anyhow.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 prost.workspace = true
+bytes.workspace = true
 tonic = "0.14"
 tonic-prost = "0.14"
 prost-types = "0.14"

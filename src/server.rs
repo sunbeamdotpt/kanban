@@ -249,13 +249,15 @@ pub async fn run() -> Result<()> {
     info!("Postgres connected and migrations applied");
 
     // ── 4. NATS + JetStream bootstrap (fatal on failure) ───────────────────
-    let nats = NatsClient::connect(&NatsConfig {
-        url: nats_url,
-        jetstream: true,
-        lease_duration: 30,
-    })
-    .await
-    .context("failed to connect to NATS")?;
+    let nats = Arc::new(
+        NatsClient::connect(&NatsConfig {
+            url: nats_url,
+            jetstream: true,
+            lease_duration: 30,
+        })
+        .await
+        .context("failed to connect to NATS")?,
+    );
 
     crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
         &nats,
@@ -268,6 +270,18 @@ pub async fn run() -> Result<()> {
         stream = crate::realtime::jetstream_bootstrap::STREAM_NAME,
         "JetStream stream bootstrapped"
     );
+
+    // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
+    // Drains undispatched event_log rows to NATS JetStream at 250ms poll
+    // cadence. Hold the handle so the task is not immediately dropped.
+    // TODO: graceful shutdown — plumb a CancellationToken and abort on SIGTERM.
+    let _outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
+        pg_pool.clone(),
+        Arc::clone(&nats),
+    )
+    .spawn();
+
+    info!("outbox dispatcher spawned");
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
     let watermark = Arc::new(

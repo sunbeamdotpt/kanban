@@ -8,6 +8,9 @@ pub mod server;
 pub mod services;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod codegen_smoke {
     #[test]
     fn types_exist() {

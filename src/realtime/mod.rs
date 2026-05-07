@@ -7,3 +7,5 @@
 
 pub mod cutover;
 pub mod jetstream_bootstrap;
+pub mod outbox;
+pub mod registry;

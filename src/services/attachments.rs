@@ -439,62 +439,11 @@ mod tests {
     }
 
     /// Seeds project → board → column → card chain and returns the card_id.
-    /// Each call is independent (fresh project per call) so tests don't collide.
+    /// Delegates to `test_support::seed_card_chain`; extracts card_id for
+    /// backwards compatibility with existing test call sites.
     async fn seed_card_chain(pool: &PgPool) -> Uuid {
-        let project_id = Uuid::new_v4();
-        let board_id = Uuid::new_v4();
-        let column_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4();
-        let suffix = project_id.simple().to_string();
-
-        sqlx::query(
-            "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at)
-             VALUES ($1, $2, $3, 'user:test', now(), now())"
-        )
-        .bind(project_id)
-        .bind(format!("test-proj-{}", &suffix[0..8]))
-        .bind(suffix[0..12].to_lowercase())
-        .execute(pool)
-        .await
-        .expect("seed project");
-
-        let board_suffix = board_id.simple().to_string();
-        sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, now(), now())"
-        )
-        .bind(board_id)
-        .bind(project_id)
-        .bind(format!("test-board-{}", &board_suffix[0..8]))
-        .bind(board_suffix[0..12].to_lowercase())
-        .execute(pool)
-        .await
-        .expect("seed board");
-
-        sqlx::query(
-            "INSERT INTO columns (id, board_id, title, position, created_at, updated_at)
-             VALUES ($1, $2, 'todo', 0, now(), now())"
-        )
-        .bind(column_id)
-        .bind(board_id)
-        .execute(pool)
-        .await
-        .expect("seed column");
-
-        let card_suffix = card_id.simple().to_string();
-        sqlx::query(
-            "INSERT INTO cards (id, board_id, column_id, project_id, ref, title, position, revision, created_by, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, 'test-card', 0, 0, 'user:test', now(), now())"
-        )
-        .bind(card_id)
-        .bind(board_id)
-        .bind(column_id)
-        .bind(project_id)
-        .bind(format!("T{}", &card_suffix[0..6].to_uppercase()))
-        .execute(pool)
-        .await
-        .expect("seed card");
-
+        let (_project_id, _board_id, _column_id, card_id) =
+            crate::test_support::seed_card_chain(pool).await;
         card_id
     }
 
