@@ -768,7 +768,7 @@ mod tests {
 
     fn database_url() -> String {
         std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/sunbeam".to_string())
+            .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
     }
 
     fn keto_read_url() -> String {
