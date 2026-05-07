@@ -32,7 +32,6 @@ use prometheus::{
 };
 use sqlx::postgres::PgPoolOptions;
 use tonic::service::Routes as TonicRoutes;
-use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
