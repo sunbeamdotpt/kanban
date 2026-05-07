@@ -438,50 +438,64 @@ mod tests {
             .await;
     }
 
-    // Insert a minimal card row so FK constraint is satisfied.
-    async fn insert_test_card(pool: &PgPool, card_id: Uuid) {
-        // cards table requires a board reference; we insert minimally.
-        // If the table schema requires board_id, we'll insert a board too.
-        // Use ON CONFLICT DO NOTHING in case prior test left a row.
-        // This is a best-effort helper: if cards have required FK to boards,
-        // the test should seed from higher up. For IT simplicity we use a
-        // pre-existing card or seed one via raw SQL.
-        //
-        // We look at the actual schema: cards(id, board_id, ...).
-        // We insert a fake board_id (also a UUID) — FK checks may fail if
-        // boards table enforces the constraint. If so, we need a real board.
-        // For these tests we rely on the compose environment having at least
-        // one test card seeded, OR we disable FK checks for the insert.
-        //
-        // Simplest approach: use a sub-SELECT that creates no board dependency
-        // by inserting with a board_id that refers to a boards row we also
-        // create. We use a deterministic test UUID for both.
-        let board_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    /// Seeds project → board → column → card chain and returns the card_id.
+    /// Each call is independent (fresh project per call) so tests don't collide.
+    async fn seed_card_chain(pool: &PgPool) -> Uuid {
+        let project_id = Uuid::new_v4();
+        let board_id = Uuid::new_v4();
+        let column_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4();
+        let suffix = project_id.simple().to_string();
 
-        // Try to create a minimal project/board if needed. Best effort.
-        let project_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        let _ = sqlx::query(
-            "INSERT INTO projects (id, name, slug, owner_id) VALUES ($1, 'test', 'TST', 'user:test') ON CONFLICT DO NOTHING"
+        sqlx::query(
+            "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at)
+             VALUES ($1, $2, $3, 'user:test', now(), now())"
         )
         .bind(project_id)
+        .bind(format!("test-proj-{}", &suffix[0..8]))
+        .bind(suffix[0..12].to_lowercase())
         .execute(pool)
-        .await;
+        .await
+        .expect("seed project");
 
-        let _ = sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug) VALUES ($1, $2, 'test-board', 'test-board') ON CONFLICT DO NOTHING"
+        let board_suffix = board_id.simple().to_string();
+        sqlx::query(
+            "INSERT INTO boards (id, project_id, name, slug, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, now(), now())"
         )
         .bind(board_id)
         .bind(project_id)
+        .bind(format!("test-board-{}", &board_suffix[0..8]))
+        .bind(board_suffix[0..12].to_lowercase())
         .execute(pool)
-        .await;
+        .await
+        .expect("seed board");
 
-        let _ = sqlx::query(
-            "INSERT INTO cards (id, board_id, title, column_id, position) VALUES ($1, $2, 'test card', gen_random_uuid(), 0) ON CONFLICT DO NOTHING"
+        sqlx::query(
+            "INSERT INTO columns (id, board_id, title, position, created_at, updated_at)
+             VALUES ($1, $2, 'todo', 0, now(), now())"
+        )
+        .bind(column_id)
+        .bind(board_id)
+        .execute(pool)
+        .await
+        .expect("seed column");
+
+        let card_suffix = card_id.simple().to_string();
+        sqlx::query(
+            "INSERT INTO cards (id, board_id, column_id, project_id, ref, title, position, revision, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'test-card', 0, 0, 'user:test', now(), now())"
         )
         .bind(card_id)
         .bind(board_id)
+        .bind(column_id)
+        .bind(project_id)
+        .bind(format!("T{}", &card_suffix[0..6].to_uppercase()))
         .execute(pool)
-        .await;
+        .await
+        .expect("seed card");
+
+        card_id
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
@@ -492,9 +506,8 @@ mod tests {
         let pool = setup_pool().await;
         let svc = make_service(pool.clone());
 
-        let card_id = Uuid::new_v4();
+        let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-        insert_test_card(&pool, card_id).await;
 
         let resp = svc
             .request_presigned_upload(authed_request_with_object(
@@ -538,9 +551,8 @@ mod tests {
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
-        let card_id = Uuid::new_v4();
+        let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-        insert_test_card(&pool, card_id).await;
 
         // Step 1: RequestPresignedUpload
         let upload_resp = svc
@@ -629,9 +641,8 @@ mod tests {
         let pool = setup_pool().await;
         let svc = make_service(pool.clone());
 
-        let card_id = Uuid::new_v4();
+        let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-        insert_test_card(&pool, card_id).await;
 
         // Create a pending attachment but never PUT to S3.
         let upload_resp = svc
@@ -678,9 +689,8 @@ mod tests {
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
-        let card_id = Uuid::new_v4();
+        let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-        insert_test_card(&pool, card_id).await;
 
         // Upload a real file.
         let upload_resp = svc
@@ -753,12 +763,9 @@ mod tests {
         let svc = make_service(pool.clone());
         let s3_cfg = s3_config();
 
-        let card_a = Uuid::new_v4();
-        let card_b = Uuid::new_v4();
+        let card_a = seed_card_chain(&pool).await;
+        let card_b = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-
-        insert_test_card(&pool, card_a).await;
-        insert_test_card(&pool, card_b).await;
 
         // Insert attachment for card_a directly (skip S3 — we only need SQL rows for list test).
         let att_a1 = Uuid::new_v4();
@@ -814,12 +821,9 @@ mod tests {
         let pool = setup_pool().await;
         let svc = make_service(pool.clone());
 
-        let card_legit = Uuid::new_v4();
-        let card_attacker = Uuid::new_v4();
+        let card_legit = seed_card_chain(&pool).await;
+        let card_attacker = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
-
-        insert_test_card(&pool, card_legit).await;
-        insert_test_card(&pool, card_attacker).await;
 
         // Create an attachment on card_legit.
         let upload_resp = svc
