@@ -1,16 +1,20 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "lib": ["ES2022", "DOM"],
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
     "strict": true,
     "esModuleInterop": true,
-    "skipLibCheck": true,
-    "outDir": "dist",
-    "rootDir": ".",
-    "types": ["node"]
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "sourceMap": true
   },
-  "include": ["e2e/**/*.ts", "playwright.config.ts"],
+  "include": ["src", "vitest.config.ts", "vite.config.ts", "e2e/**/*.ts", "playwright.config.ts"],
+  "references": [{ "path": "./tsconfig.node.json" }],
   "exclude": ["node_modules", "dist"]
 }
