@@ -43,6 +43,7 @@ use sunbeam_g2v::config::NatsConfig;
 
 use crate::auth::keto_dispatch::{dispatch, DispatchState};
 use crate::auth::logout_watermark::LogoutWatermark;
+use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
     attachment_service_server::AttachmentServiceServer,
@@ -295,6 +296,10 @@ pub async fn run() -> Result<()> {
     let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
     info!("S3 client initialised (endpoint={})", std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "<default>".into()));
 
+    // ── 8b. OpenSearch client for SearchService ─────────────────────────────
+    let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()));
+    info!("OpenSearch client initialised (url={})", std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into()));
+
     // ── Build tonic gRPC router ─────────────────────────────────────────────
     let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl {
         watermark: Arc::clone(&watermark),
@@ -316,7 +321,10 @@ pub async fn run() -> Result<()> {
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
         }))
-        .add_service(SearchServiceServer::new(SearchServiceImpl))
+        .add_service(SearchServiceServer::new(SearchServiceImpl {
+            keto: Arc::clone(&keto),
+            opensearch: Arc::clone(&opensearch_client),
+        }))
         .into_axum_router();
 
     // ── 9. Middleware stack (outer → inner) + axum Router ───────────────────
