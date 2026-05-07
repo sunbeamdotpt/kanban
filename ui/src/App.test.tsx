@@ -22,6 +22,6 @@ describe("App", () => {
         </MemoryRouter>
       </FrameworkProvider>,
     );
-    expect(screen.getByText(/Sunbeam Kanban/i)).toBeInTheDocument();
+    expect(screen.getByText("Projects")).toBeInTheDocument();
   });
 });
