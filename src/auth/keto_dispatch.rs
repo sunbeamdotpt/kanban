@@ -453,9 +453,23 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 pub async fn dispatch(
     Extension(state): Extension<Arc<DispatchState>>,
     Extension(auth): Extension<AuthContext>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
+    let req = dispatch_check(state, auth, req).await?;
+    Ok(next.run(req).await)
+}
+
+/// Inner authorization check, separated from the Tower middleware shell so it
+/// can be unit-tested without spinning up an axum Router.  Returns the request
+/// (with `CheckedObjectId` inserted on Header-source RPCs) when authorized;
+/// returns the same `(StatusCode, String)` the middleware would surface on
+/// rejection.
+pub(crate) async fn dispatch_check(
+    state: Arc<DispatchState>,
+    auth: AuthContext,
+    mut req: Request,
+) -> Result<Request, (StatusCode, String)> {
     // 1. Require authentication.
     if !auth.is_authenticated {
         return Err((
@@ -577,8 +591,7 @@ pub async fn dispatch(
         }
     }
 
-    // 7. Proceed to the handler.
-    Ok(next.run(req).await)
+    Ok(req)
 }
 
 // ============================================================================
@@ -909,10 +922,11 @@ mod tests {
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
-    /// Drive `dispatch` to completion without a real Tower `Next` and return
-    /// the status code.  Extensions must already be inserted before calling.
+    /// Run the production `dispatch_check` against a request and return either
+    /// 200 (would proceed to the handler) or the rejection status code.
+    /// Extensions for `Arc<DispatchState>` and `AuthContext` must be inserted
+    /// on the request before calling.
     async fn dispatch_raw(mut req: HttpRequest<Body>) -> StatusCode {
-        // Extract extensions that dispatch expects to find.
         let state = req
             .extensions_mut()
             .remove::<Arc<DispatchState>>()
@@ -922,24 +936,10 @@ mod tests {
             .remove::<AuthContext>()
             .expect("AuthContext extension missing");
 
-        // Re-insert as Extensions so axum's extractor can find them.
-        req.extensions_mut().insert(Extension(state));
-        req.extensions_mut().insert(Extension(auth));
-
-        // We can't call `dispatch` directly without a real Next.
-        // Instead, replicate its logic to verify the status code.
-        // This is acceptable for unit tests: the production path is integration-tested.
-        let auth: &AuthContext = req
-            .extensions()
-            .get::<Extension<AuthContext>>()
-            .map(|e| &e.0)
-            .unwrap();
-
-        if !auth.is_authenticated {
-            return StatusCode::UNAUTHORIZED;
+        match dispatch_check(state, auth, req).await {
+            Ok(_) => StatusCode::OK,
+            Err((status, _)) => status,
         }
-
-        StatusCode::OK // Simplified; full path tested via ignored integration tests
     }
 
     // ── Proto scanning helper ────────────────────────────────────────────────
