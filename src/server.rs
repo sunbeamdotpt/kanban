@@ -291,12 +291,17 @@ pub async fn run() -> Result<()> {
     info!("Prometheus metrics declared");
 
     // ── 8. Build tonic gRPC router ──────────────────────────────────────────
-    let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl))
+    let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl {
+        watermark: Arc::clone(&watermark),
+    }))
         .add_service(AttachmentServiceServer::new(AttachmentServiceImpl))
         .add_service(BoardServiceServer::new(BoardServiceImpl))
         .add_service(CardServiceServer::new(CardServiceImpl))
         .add_service(ForgejoLinkServiceServer::new(ForgejoServiceImpl))
-        .add_service(ProjectServiceServer::new(ProjectServiceImpl))
+        .add_service(ProjectServiceServer::new(ProjectServiceImpl {
+            pool: pg_pool.clone(),
+            keto: Arc::clone(&keto),
+        }))
         .add_service(SearchServiceServer::new(SearchServiceImpl))
         .into_axum_router();
 
