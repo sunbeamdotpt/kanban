@@ -12,7 +12,12 @@
     "resolveJsonModule": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "sourceMap": true
+    "sourceMap": true,
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "styled-system/*": ["./styled-system/*"]
+    }
   },
   "include": ["src", "vitest.config.ts", "vite.config.ts", "e2e/**/*.ts", "playwright.config.ts"],
   "references": [{ "path": "./tsconfig.node.json" }],
