@@ -210,8 +210,8 @@ export function SettingsPage() {
 }
 
 const settingsRoot = css({
-  padding: "32px 48px 64px",
-  maxWidth: "920px",
+  padding: "48px 56px 96px",
+  maxWidth: "960px",
   margin: "0 auto",
   width: "100%",
 });
@@ -219,56 +219,57 @@ const settingsRoot = css({
 const eyebrow = css({
   display: "inline-flex",
   alignItems: "center",
-  gap: "6px",
+  gap: "8px",
   fontFamily: "body",
   fontSize: "11px",
   fontWeight: "button",
   letterSpacing: "0.15em",
   textTransform: "uppercase",
   color: "sunbeam.orange",
-  marginBottom: "6px",
+  marginBottom: "16px",
 });
 
 const titleStyle = css({
   fontFamily: "heading",
   fontSize: "3rem",
   fontWeight: "431",
-  lineHeight: 0.95,
+  lineHeight: 1.25,
   color: "text.primary",
   margin: 0,
 });
 
 const subtitle = css({
   fontFamily: "body",
-  fontSize: "14px",
+  fontSize: "15px",
   color: "text.secondary",
-  marginTop: "8px",
-  marginBottom: "32px",
+  marginTop: "16px",
+  marginBottom: "56px",
+  lineHeight: 1.5,
 });
 
 const section = css({
   borderTop: "1px solid",
   borderColor: "border.subtle",
-  paddingTop: "28px",
-  marginTop: "8px",
+  paddingTop: "40px",
+  marginTop: "16px",
 });
 
 const sectionTitle = css({
   fontFamily: "heading",
-  fontSize: "20px",
+  fontSize: "22px",
   fontWeight: "heading",
   color: "text.primary",
   margin: 0,
-  marginBottom: "20px",
+  marginBottom: "28px",
 });
 
 const row = css({
   display: "flex",
   alignItems: "flex-start",
   justifyContent: "space-between",
-  gap: "32px",
-  paddingBottom: "20px",
-  marginBottom: "20px",
+  gap: "48px",
+  paddingBottom: "28px",
+  marginBottom: "28px",
   borderBottom: "1px dashed",
   borderColor: "border.subtle",
 });
@@ -277,7 +278,7 @@ const rowLast = css({
   display: "flex",
   alignItems: "flex-start",
   justifyContent: "space-between",
-  gap: "32px",
+  gap: "48px",
 });
 
 const rowLabelGroup = css({
@@ -297,7 +298,8 @@ const rowDesc = css({
   fontFamily: "body",
   fontSize: "13px",
   color: "text.muted",
-  marginTop: "4px",
+  marginTop: "6px",
+  lineHeight: 1.5,
 });
 
 const inputCell = css({ width: "240px", flexShrink: 0 });
