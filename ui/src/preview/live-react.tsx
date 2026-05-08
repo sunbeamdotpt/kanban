@@ -105,7 +105,6 @@ export function LiveReact() {
         card={beam204}
         open={modalOpen}
         onClose={() => setModalOpen(false)}
-        readOnly
       />
     </>
   );
