@@ -19,13 +19,20 @@
 
 import { useState } from "react";
 import { css } from "styled-system/css";
-import { Icon, TextInput } from "@sunbeam/beam-ui";
+import { Avatar, Button, Icon, TextInput } from "@sunbeam/beam-ui";
 
 interface ProjectInfo {
   icon: string;
   name: string;
   cardPrefix: string;
   description: string;
+}
+
+interface Member {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
 }
 
 const initialProject: ProjectInfo = {
@@ -35,8 +42,17 @@ const initialProject: ProjectInfo = {
   description: "The Sunbeam component library and design language showcase.",
 };
 
+const initialMembers: Member[] = [
+  { id: "sp", name: "Sofia Pereira", email: "sp@sunbeam.pt", role: "Design lead" },
+  { id: "mc", name: "Miguel Costa", email: "mc@sunbeam.pt", role: "Engineer" },
+  { id: "ak", name: "Ana Kraft", email: "ak@sunbeam.pt", role: "Engineer" },
+  { id: "mb", name: "Mariana Brito", email: "mb@sunbeam.pt", role: "Designer" },
+  { id: "lr", name: "Luís Rocha", email: "lr@sunbeam.pt", role: "Engineer" },
+];
+
 export function SettingsPage() {
   const [project, setProject] = useState<ProjectInfo>(initialProject);
+  const [members] = useState<Member[]>(initialMembers);
 
   return (
     <div className={settingsRoot}>
@@ -92,6 +108,35 @@ export function SettingsPage() {
               onChange={(e) => setProject({ ...project, description: e.target.value })}
             />
           </div>
+        </div>
+      </section>
+
+      <section className={section}>
+        <h3 className={sectionTitle}>
+          Members <span className={sectionCount}>· {members.length}</span>
+        </h3>
+        <p className={sectionDesc}>People with access to all boards in this project.</p>
+
+        <ul className={memberList}>
+          {members.map((m) => (
+            <li key={m.id} className={memberRow}>
+              <Avatar name={m.name} size="md" />
+              <div className={memberIdentity}>
+                <span className={memberName}>{m.name}</span>
+                <span className={memberEmail}>{m.email}</span>
+              </div>
+              <span className={memberRole}>{m.role}</span>
+              <button type="button" className={moreButton} aria-label={`Member actions for ${m.name}`}>
+                <Icon name="more_horiz" size={18} />
+              </button>
+            </li>
+          ))}
+        </ul>
+
+        <div className={inviteRow}>
+          <Button variant="ghost" onClick={() => undefined}>
+            <Icon name="person_add" size={16} /> Invite member
+          </Button>
         </div>
       </section>
     </div>
@@ -224,4 +269,86 @@ const codePill = css({
   borderColor: "border.subtle",
   borderRadius: "sm",
   color: "sunbeam.orange",
+});
+
+const sectionCount = css({
+  fontFamily: "body",
+  fontWeight: "body",
+  color: "text.muted",
+});
+
+const sectionDesc = css({
+  fontFamily: "body",
+  fontSize: "13px",
+  color: "text.muted",
+  marginTop: "-12px",
+  marginBottom: "20px",
+});
+
+const memberList = css({
+  listStyle: "none",
+  margin: 0,
+  padding: 0,
+  display: "flex",
+  flexDirection: "column",
+  gap: "12px",
+});
+
+const memberRow = css({
+  display: "flex",
+  alignItems: "center",
+  gap: "14px",
+  padding: "10px 4px",
+  borderBottom: "1px dashed",
+  borderColor: "border.subtle",
+  _last: { borderBottom: "none" },
+});
+
+const memberIdentity = css({
+  display: "flex",
+  flexDirection: "column",
+  gap: "2px",
+  flex: 1,
+  minWidth: 0,
+});
+
+const memberName = css({
+  fontFamily: "body",
+  fontSize: "14px",
+  fontWeight: "button",
+  color: "text.primary",
+});
+
+const memberEmail = css({
+  fontFamily: "mono",
+  fontSize: "12px",
+  color: "text.muted",
+});
+
+const memberRole = css({
+  fontFamily: "body",
+  fontSize: "11px",
+  fontWeight: "button",
+  letterSpacing: "0.12em",
+  textTransform: "uppercase",
+  color: "sunbeam.orange",
+});
+
+const moreButton = css({
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: "32px",
+  height: "32px",
+  borderRadius: "sm",
+  border: "1px solid transparent",
+  background: "transparent",
+  cursor: "pointer",
+  color: "text.muted",
+  transition: "border-color 0.15s, color 0.15s",
+  _hover: { borderColor: "border.warm", color: "sunbeam.orange" },
+});
+
+const inviteRow = css({
+  marginTop: "16px",
 });
