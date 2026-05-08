@@ -21,7 +21,9 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { Button } from "@sunbeam/beam-ui";
 import { KanbanCardDetail, type KanbanCardData } from "@sunbeam/beam-ui/components/ui/kanban-card-detail";
+import { SettingsPage } from "../routes/settings-page";
 import refCss from "./ref-styles.css?raw";
 import refBody from "./ref-body.html?raw";
 
@@ -73,42 +75,38 @@ const beam204: KanbanCardData = {
 export function LiveReact() {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [modalOpen, setModalOpen] = useState(() => new URLSearchParams(window.location.search).get("modal") === "1");
+  const [showSettings, setShowSettings] = useState(() => new URLSearchParams(window.location.search).get("settings") === "1");
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
     while (host.firstChild) host.removeChild(host.firstChild);
+    if (showSettings) return;
     const range = document.createRange();
     range.selectNodeContents(host);
     const frag = range.createContextualFragment(refBody);
     host.appendChild(frag);
-  }, []);
+  }, [showSettings]);
 
   return (
     <>
       <style>{refCss}</style>
       <style>{SCOPE_OVERRIDES}</style>
-      <button
-        type="button"
-        onClick={() => setModalOpen((v) => !v)}
-        style={{
-          position: "absolute",
-          right: 12,
-          bottom: 12,
-          zIndex: 200,
-          padding: "6px 12px",
-          background: "#fa520f",
-          color: "#fff",
-          border: "none",
-          borderRadius: 4,
-          fontSize: 12,
-          fontWeight: 600,
-          cursor: "pointer",
-        }}
-      >
-        {modalOpen ? "close modal" : "show card modal"}
-      </button>
-      <div ref={hostRef} className="preview-host" />
+      <div style={{ position: "absolute", right: 12, bottom: 12, zIndex: 200, display: "flex", gap: 6 }}>
+        <Button variant="primary" onClick={() => setShowSettings((v) => !v)}>
+          {showSettings ? "show board" : "show settings"}
+        </Button>
+        <Button variant="primary" onClick={() => setModalOpen((v) => !v)}>
+          {modalOpen ? "close modal" : "show card modal"}
+        </Button>
+      </div>
+      {showSettings ? (
+        <div className="preview-host" style={{ overflow: "auto" }}>
+          <SettingsPage />
+        </div>
+      ) : (
+        <div ref={hostRef} className="preview-host" />
+      )}
       <KanbanCardDetail
         card={beam204}
         open={modalOpen}
@@ -117,3 +115,4 @@ export function LiveReact() {
     </>
   );
 }
+

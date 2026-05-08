@@ -146,9 +146,9 @@ export function SettingsPage() {
                 <span className={memberEmail}>{m.email}</span>
               </div>
               <span className={memberRole}>{m.role}</span>
-              <button type="button" className={moreButton} aria-label={`Member actions for ${m.name}`}>
+              <Button variant="ghost" onClick={() => undefined}>
                 <Icon name="more_horiz" size={18} />
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
@@ -398,21 +398,6 @@ const memberRole = css({
   letterSpacing: "0.12em",
   textTransform: "uppercase",
   color: "sunbeam.orange",
-});
-
-const moreButton = css({
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  width: "32px",
-  height: "32px",
-  borderRadius: "sm",
-  border: "1px solid transparent",
-  background: "transparent",
-  cursor: "pointer",
-  color: "text.muted",
-  transition: "border-color 0.15s, color 0.15s",
-  _hover: { borderColor: "border.warm", color: "sunbeam.orange" },
 });
 
 const inviteRow = css({
