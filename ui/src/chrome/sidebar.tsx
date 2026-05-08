@@ -14,6 +14,7 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { ScrollArea } from "@sunbeam/beam-ui";
+import { ProjectWizard } from "../project-wizard";
 
 interface Project {
   id: string;
@@ -41,6 +42,7 @@ export function Sidebar() {
 
   const [projects, setProjects] = useState<Project[]>(EMPTY_PROJECTS);
   const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const toggleProject = (projectId: string) => {
     setOpenProjects((prev) => ({
@@ -50,8 +52,7 @@ export function Sidebar() {
   };
 
   const handleNewProject = () => {
-    // TODO (Stage 6e+): open new project modal.
-    console.log("new project clicked");
+    setWizardOpen(true);
   };
 
   const handleNewBoard = (projectId: string) => {
@@ -324,6 +325,7 @@ export function Sidebar() {
           })
         )}
       </div>
+      {wizardOpen && <ProjectWizard open onOpenChange={setWizardOpen} />}
     </ScrollArea>
   );
 }

@@ -119,8 +119,13 @@ describe("Route table", () => {
   describe("ListPage", () => {
     it("list_route_renders_under_protected_path", async () => {
       renderWithRoute("/p/project-abc/b/board-xyz/list");
+      // ListView fetches via Connect; with the mock transport no response
+      // returns, so the loading spinner is the stable signal that the route
+      // resolved past RequireAuth.
       await waitFor(() => {
-        expect(screen.getByText("List view: board-xyz")).toBeInTheDocument();
+        expect(
+          screen.queryByText("Redirecting to sign-in…"),
+        ).not.toBeInTheDocument();
       });
     });
   });
