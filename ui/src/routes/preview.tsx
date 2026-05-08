@@ -78,7 +78,7 @@ export function PreviewPage() {
           />
         )}
         {(mode === "live" || mode === "split") && (
-          <div style={{ flex: 1, overflow: "auto", minWidth: 0 }}>
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
             <LiveReact />
           </div>
         )}
