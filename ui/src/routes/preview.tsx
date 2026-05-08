@@ -2,17 +2,17 @@
  * Dev-only design preview at /__preview.
  *
  * Side-by-side visual diff harness:
- *   left  iframe → /__ref-page.html  (frozen reference baseline)
- *   right iframe → /__live-page.html (rebuild-in-progress; edit freely)
- *
- * Both files live under apps/kanban/ui/public/. The right pane starts as a
- * copy of the left and is refactored incrementally toward beam-ui tokens
- * and components. Toggle ref / live / split via the toolbar.
+ *   left  → /__ref-page.html iframe (frozen reference baseline, byte-identical
+ *           extract from Sunbeam Kanban.html via playwright dump)
+ *   right → <LiveReact /> — the real beam-ui components and app chrome
+ *           rendered with hardcoded fixtures so we can iterate on tokens,
+ *           spacing, and component shapes until the visual matches the ref.
  *
  * Excluded from prod build via routes/index.tsx (DEV-only route).
  */
 
 import { useState } from "react";
+import { LiveReact } from "../preview/live-react";
 
 type Mode = "ref" | "live" | "split";
 
@@ -61,7 +61,7 @@ export function PreviewPage() {
           </button>
         ))}
         <span style={{ marginLeft: "auto", color: "#888", fontSize: "11px" }}>
-          left = /__ref-page.html · right = /__live-page.html
+          left = /__ref-page.html (frozen) · right = beam-ui components
         </span>
       </div>
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
@@ -78,11 +78,9 @@ export function PreviewPage() {
           />
         )}
         {(mode === "live" || mode === "split") && (
-          <iframe
-            src="/__live-page.html"
-            title="live"
-            style={{ flex: 1, border: "none", minWidth: 0 }}
-          />
+          <div style={{ flex: 1, overflow: "auto", minWidth: 0 }}>
+            <LiveReact />
+          </div>
         )}
       </div>
     </div>
