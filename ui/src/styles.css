@@ -1,4 +1,6 @@
-@layer reset, base, tokens, recipes, utilities;
+/* `ref` is the dev-only preview harness layer (see preview/live-react.tsx).
+   Declared first so it has lowest priority and Panda atoms always win. */
+@layer ref, reset, base, tokens, recipes, utilities;
 
 html {
   -webkit-font-smoothing: antialiased;

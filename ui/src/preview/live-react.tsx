@@ -74,7 +74,7 @@ export function LiveReact() {
 
   return (
     <>
-      <style>{refCss}</style>
+      <style>{`@layer ref { ${refCss} }`}</style>
       <style>{SCOPE_OVERRIDES}</style>
       <button
         type="button"
