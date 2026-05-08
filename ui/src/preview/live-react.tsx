@@ -25,8 +25,8 @@ import refCss from "./ref-styles.css?raw";
 import refBody from "./ref-body.html?raw";
 
 const SCOPE_OVERRIDES = `
-.preview-host { height: 100%; display: block; min-width: 0; min-height: 0; overflow: hidden; }
-.preview-host > .app { height: 100%; }
+.preview-host { position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; }
+.preview-host > .app { width: 100%; height: 100%; max-width: 100%; }
 .preview-host .col { max-height: 100%; }
 `;
 
