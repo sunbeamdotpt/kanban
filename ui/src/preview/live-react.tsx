@@ -28,7 +28,9 @@ import refBody from "./ref-body.html?raw";
 const SCOPE_OVERRIDES = `
 .preview-host { position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; }
 .preview-host > .app { width: 100%; height: 100%; max-width: 100%; }
-.preview-host .col { max-height: 100%; }
+.preview-host .col { max-height: 100%; flex: 1 1 0; min-width: 0; max-width: 320px; width: auto; }
+.preview-host .col.col--add { display: none; }
+.preview-host .board { width: 100%; }
 `;
 
 const beam204: KanbanCardData = {
