@@ -226,14 +226,14 @@ const eyebrow = css({
   letterSpacing: "0.15em",
   textTransform: "uppercase",
   color: "sunbeam.orange",
-  marginBottom: "16px",
+  marginBottom: 0,
 });
 
 const titleStyle = css({
   fontFamily: "heading",
   fontSize: "3rem",
   fontWeight: "431",
-  lineHeight: 1.25,
+  lineHeight: 1.0,
   color: "text.primary",
   margin: 0,
 });
@@ -242,7 +242,7 @@ const subtitle = css({
   fontFamily: "body",
   fontSize: "15px",
   color: "text.secondary",
-  marginTop: "16px",
+  marginTop: "32px",
   marginBottom: "56px",
   lineHeight: 1.5,
 });

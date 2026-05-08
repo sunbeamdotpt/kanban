@@ -44,6 +44,14 @@ const SCOPE_OVERRIDES = `
 .preview-host .main { min-width: 0; min-height: 0; overflow: hidden; }
 .preview-host .col { max-height: 100% !important; }
 .preview-host .col.col--add { display: none; }
+/* The ref CSS injects unlayered h1..h5 base rules with line-height 0.95 and
+   font-size 3-3.5rem, which beat Panda's layered atoms. Reapply the shape
+   Panda would have used so settings/modal headings inside .preview-host
+   render the way the React components specified. */
+.preview-host h1 { font-family: var(--font-heading); font-weight: 431; font-size: 3rem; line-height: 1; margin: 0; color: var(--text-primary); }
+.preview-host h2 { font-family: var(--font-heading); font-weight: 575; font-size: 1.5rem; line-height: 1.2; margin: 0; color: var(--text-primary); }
+.preview-host h3 { font-family: var(--font-heading); font-weight: var(--fw-heading, 575); font-size: 1.375rem; line-height: 1.3; margin: 0; color: var(--text-primary); }
+.preview-host h4 { font-family: var(--font-heading); font-weight: var(--fw-heading, 575); font-size: 1.125rem; line-height: 1.3; margin: 0; color: var(--text-primary); }
 `;
 
 const beam204: KanbanCardData = {
