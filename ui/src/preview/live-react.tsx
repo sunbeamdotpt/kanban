@@ -25,14 +25,22 @@ import { KanbanCardDetail, type KanbanCardData } from "@sunbeam/beam-ui/componen
 import refCss from "./ref-styles.css?raw";
 import refBody from "./ref-body.html?raw";
 
+// The ref CSS uses `height: 100vh` on .app and `calc(100vh - 220px)` on .col,
+// which assume a fullscreen context. Inside the preview harness LiveReact
+// lives in a flex pane that's `100vh - toolbar`. Override using !important
+// because .app has identical specificity in the ref stylesheet (0,1,0) and
+// `.preview-host > .app` (0,2,0) only barely wins; some browsers race the
+// cascade vs `100vh` resolution. Forcing it removes ambiguity.
 const SCOPE_OVERRIDES = `
-.preview-host { position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; }
-.preview-host > .app { width: 100%; height: 100%; max-width: 100%; }
-.preview-host .col { max-height: 100%; flex: 1 1 0; min-width: 0; width: auto; }
+.preview-host { position: absolute; inset: 0; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
+.preview-host #root { width: 100%; height: 100%; display: contents; }
+.preview-host .app { width: 100% !important; height: 100% !important; max-width: 100%; }
+.preview-host .col { max-height: 100% !important; flex: 1 1 0; min-width: 0; width: auto; }
 .preview-host .col.col--add { display: none; }
 .preview-host .board { width: 100%; flex-wrap: nowrap; }
-.preview-host .boardwrap { padding: 16px 16px 28px; }
+.preview-host .boardwrap { padding: 16px 16px 28px; min-height: 0; }
 .preview-host .boardhead { padding: 18px 16px 12px; }
+.preview-host .main { min-height: 0; overflow: hidden; }
 `;
 
 const beam204: KanbanCardData = {
