@@ -74,7 +74,7 @@ export function LiveReact() {
 
   return (
     <>
-      <style>{`@scope (.preview-host) { ${refCss} }`}</style>
+      <style>{refCss}</style>
       <style>{SCOPE_OVERRIDES}</style>
       <button
         type="button"

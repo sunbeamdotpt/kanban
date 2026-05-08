@@ -19,6 +19,16 @@ html {
   font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
 }
 
+/* The dev-only /__preview harness injects the reference's full stylesheet,
+   which contains an unlayered `h2 { font-size: 3rem }` base rule. The
+   KanbanCardDetail modal renders into a body-level portal where that rule
+   would otherwise win over the component's 24px Panda atom. Pin it. */
+[data-scope="dialog"][data-part="content"] h2 {
+  font-size: 1.5rem;
+  font-weight: 575;
+  line-height: 1.2;
+}
+
 body {
   margin: 0;
   padding: 0;
