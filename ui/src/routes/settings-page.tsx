@@ -81,7 +81,12 @@ export function SettingsPage() {
         {project.name}
       </div>
       <h1 className={titleStyle}>Project Settings</h1>
-      <p className={subtitle}>{project.description}</p>
+      {/* Inline marginTop to win over ref CSS injected in /__preview, which
+          sets unlayered `p { margin: 0 }` and beats Panda atoms by being
+          unlayered. In production this just adds redundancy. */}
+      <p className={subtitle} style={{ marginTop: 48, marginBottom: 64 }}>
+        {project.description}
+      </p>
 
       <section className={section}>
         <h3 className={sectionTitle}>Project</h3>
@@ -242,8 +247,8 @@ const subtitle = css({
   fontFamily: "body",
   fontSize: "15px",
   color: "text.secondary",
-  marginTop: "32px",
-  marginBottom: "56px",
+  marginTop: "48px",
+  marginBottom: "64px",
   lineHeight: 1.5,
 });
 
