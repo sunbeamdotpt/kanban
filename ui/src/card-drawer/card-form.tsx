@@ -4,6 +4,8 @@
  */
 
 import { Form, FormField, z } from "@sunbeam/beam-ui/form";
+import { Button } from "@sunbeam/beam-ui";
+import { MarkdownEditor } from "@sunbeam/beam-ui/components/ui/markdown-editor";
 import { type Card } from "../gen/sunbeam/kanban/v1/cards_pb";
 import { css } from "styled-system/css";
 
@@ -59,11 +61,10 @@ export function CardForm({ card, onSubmit, isLoading = false }: CardFormProps) {
             <label className={labelStyle} htmlFor="description">
               Description
             </label>
-            <textarea
-              id="description"
-              {...methods.register("description")}
+            <MarkdownEditor
+              value={methods.watch("description") ?? ""}
+              onChange={(val: string) => methods.setValue("description", val)}
               placeholder="Add a description..."
-              className={textareaStyle}
             />
           </div>
 
@@ -95,13 +96,9 @@ export function CardForm({ card, onSubmit, isLoading = false }: CardFormProps) {
           </div>
 
           <div className={formActions}>
-            <button
-              type="submit"
-              disabled={isLoading}
-              className={submitButton}
-            >
-              {isLoading ? "Saving..." : "Save Changes"}
-            </button>
+            <Button variant="primary" type="submit" disabled={isLoading}>
+              {isLoading ? "Saving…" : "Save Changes"}
+            </Button>
           </div>
         </>
       )}
@@ -140,24 +137,6 @@ const labelStyle = css({
   letterSpacing: "0.05em",
 });
 
-const textareaStyle = css({
-  padding: "10px 12px",
-  fontSize: "14px",
-  fontFamily: "body",
-  color: "text.primary",
-  backgroundColor: "bg.card",
-  border: "1px solid",
-  borderColor: "border.default",
-  borderRadius: "0",
-  outline: "none",
-  minHeight: "120px",
-  resize: "vertical",
-  transition: "border-color 0.15s ease",
-  _focus: {
-    borderColor: "sunbeam.orange",
-  },
-});
-
 const formActions = css({
   display: "flex",
   gap: "8px",
@@ -166,21 +145,3 @@ const formActions = css({
   borderColor: "border.subtle",
 });
 
-const submitButton = css({
-  padding: "10px 16px",
-  fontSize: "14px",
-  fontWeight: "button",
-  color: "white",
-  backgroundColor: "sunbeam.orange",
-  border: "none",
-  borderRadius: "0",
-  cursor: "pointer",
-  transition: "opacity 0.15s ease",
-  _hover: {
-    opacity: 0.9,
-  },
-  _disabled: {
-    opacity: 0.5,
-    cursor: "not-allowed",
-  },
-});

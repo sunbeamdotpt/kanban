@@ -80,21 +80,21 @@ describe("Topbar", () => {
       </MemoryRouter>,
     );
 
-    const searchInput = screen.getByText(/Jump to card, board, or person/);
+    const searchInput = screen.getByRole("textbox", { name: /search/i });
     expect(searchInput).toBeInTheDocument();
 
     // Verify the search input has the ⌘K hint.
     expect(screen.getByText("⌘K")).toBeInTheDocument();
   });
 
-  it("renders notifications button (no-op for Stage 6d)", () => {
+  it("renders notifications button", () => {
     render(
       <MemoryRouter>
         <Topbar />
       </MemoryRouter>,
     );
 
-    const notifButton = screen.getByTitle("Notifications");
+    const notifButton = screen.getByRole("button", { name: /notifications/i });
     expect(notifButton).toBeInTheDocument();
   });
 

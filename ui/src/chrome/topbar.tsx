@@ -11,7 +11,7 @@
 
 import { useCallback, useState } from "react";
 import { useLocation, useParams } from "react-router";
-import { CommandPalette, useCommandPaletteShortcut } from "@sunbeam/beam-ui";
+import { CommandPalette, useCommandPaletteShortcut, NotificationCenter } from "@sunbeam/beam-ui";
 import { Breadcrumbs } from "./breadcrumbs";
 import { UserMenu } from "./user-menu";
 
@@ -95,31 +95,56 @@ export function Topbar() {
         }}
       >
         <div
-          onClick={handleSearchClick}
           style={{
+            position: "relative",
             display: "flex",
             alignItems: "center",
-            gap: "8px",
-            padding: "8px 12px",
-            borderRadius: "6px",
-            border: "1px solid var(--beam-color-border)",
-            backgroundColor: "var(--beam-color-bg-secondary)",
-            cursor: "pointer",
             flex: 1,
-            fontSize: "14px",
-            color: "var(--beam-color-text-tertiary)",
           }}
         >
-          <span>🔍</span>
-          <span>Jump to card, board, or person…</span>
           <span
             style={{
-              marginLeft: "auto",
+              position: "absolute",
+              left: "10px",
+              fontSize: "14px",
+              pointerEvents: "none",
+              color: "var(--beam-color-text-tertiary)",
+            }}
+          >
+            🔍
+          </span>
+          <input
+            readOnly
+            onClick={handleSearchClick}
+            onFocus={handleSearchClick}
+            placeholder="Jump to card, board, or person…"
+            aria-label="Search"
+            style={{
+              paddingLeft: "32px",
+              paddingRight: "48px",
+              paddingTop: "8px",
+              paddingBottom: "8px",
+              borderRadius: "6px",
+              border: "1px solid var(--beam-color-border)",
+              backgroundColor: "var(--beam-color-bg-secondary)",
+              cursor: "pointer",
+              flex: 1,
+              width: "100%",
+              fontSize: "14px",
+              color: "var(--beam-color-text-tertiary)",
+              outline: "none",
+            }}
+          />
+          <span
+            style={{
+              position: "absolute",
+              right: "10px",
               padding: "2px 6px",
               backgroundColor: "var(--beam-color-bg-tertiary)",
               borderRadius: "4px",
               fontSize: "12px",
               fontFamily: "monospace",
+              pointerEvents: "none",
             }}
           >
             ⌘K
@@ -127,25 +152,12 @@ export function Topbar() {
         </div>
       </div>
 
-      {/* Notifications (no-op for Stage 6d) */}
-      <button
-        title="Notifications"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: "40px",
-          height: "40px",
-          borderRadius: "6px",
-          border: "none",
-          backgroundColor: "transparent",
-          cursor: "pointer",
-          color: "var(--beam-color-text-secondary)",
-          fontSize: "20px",
-        }}
-      >
-        🔔
-      </button>
+      {/* Notifications */}
+      <NotificationCenter
+        notifications={[]}
+        onMarkRead={() => {}}
+        onMarkAllRead={() => {}}
+      />
 
       {/* User menu (avatar + dropdown) */}
       <UserMenu />
