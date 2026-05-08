@@ -13,10 +13,17 @@ import { BoardPage } from "./board-page";
 import { ListPage } from "./list-page";
 import { SettingsPage } from "./settings-page";
 import { NotFound } from "./not-found";
+import { PreviewPage } from "./preview";
+
+const devOnlyRoutes = import.meta.env.DEV
+  ? [{ path: "/__preview", element: <PreviewPage /> }]
+  : [];
 
 export const appRoutes = [
   // Public auth routes
   ...authRoutes,
+  // Dev-only design preview (excluded from prod build)
+  ...devOnlyRoutes,
 
   // Protected application routes (all wrapped in AppChrome)
   {
