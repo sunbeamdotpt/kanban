@@ -35,6 +35,12 @@ interface Member {
   role: string;
 }
 
+interface Board {
+  id: string;
+  name: string;
+  description: string;
+}
+
 const initialProject: ProjectInfo = {
   icon: "palette",
   name: "Beam UI",
@@ -50,9 +56,23 @@ const initialMembers: Member[] = [
   { id: "lr", name: "Luís Rocha", email: "lr@sunbeam.pt", role: "Engineer" },
 ];
 
+const initialBoards: Board[] = [
+  {
+    id: "components",
+    name: "Components",
+    description: "Day-to-day work on the component catalogue — new primitives, fixes, accessibility passes.",
+  },
+  {
+    id: "v2-migration",
+    name: "v2 Migration",
+    description: "Customer-facing migration tooling, breaking change docs, codemods.",
+  },
+];
+
 export function SettingsPage() {
   const [project, setProject] = useState<ProjectInfo>(initialProject);
   const [members] = useState<Member[]>(initialMembers);
+  const [boards] = useState<Board[]>(initialBoards);
 
   return (
     <div className={settingsRoot}>
@@ -136,6 +156,52 @@ export function SettingsPage() {
         <div className={inviteRow}>
           <Button variant="ghost" onClick={() => undefined}>
             <Icon name="person_add" size={16} /> Invite member
+          </Button>
+        </div>
+      </section>
+
+      <section className={section}>
+        <h3 className={sectionTitle}>
+          Boards <span className={sectionCount}>· {boards.length}</span>
+        </h3>
+        <p className={sectionDesc}>Each project can hold multiple boards. Add or rename below.</p>
+
+        {boards.map((b, i) => (
+          <div key={b.id} className={i === boards.length - 1 ? rowLast : row}>
+            <div className={rowLabelGroup}>
+              <p className={rowLabel}>{b.name}</p>
+              <p className={rowDesc}>{b.description}</p>
+            </div>
+            <div className={boardActions}>
+              <Button variant="ghost" onClick={() => undefined}>
+                <Icon name="edit" size={14} /> Rename
+              </Button>
+              <Button variant="ghost" onClick={() => undefined}>
+                <Icon name="delete" size={14} />
+              </Button>
+            </div>
+          </div>
+        ))}
+
+        <div className={inviteRow}>
+          <Button variant="ghost" onClick={() => undefined}>
+            <Icon name="add" size={16} /> New board
+          </Button>
+        </div>
+      </section>
+
+      <section className={dangerSection}>
+        <h3 className={dangerTitle}>Danger zone</h3>
+
+        <div className={rowLast}>
+          <div className={rowLabelGroup}>
+            <p className={rowLabel}>Archive project</p>
+            <p className={rowDesc}>
+              Hides this project from the sidebar. Boards and cards are preserved.
+            </p>
+          </div>
+          <Button variant="ghost" onClick={() => undefined}>
+            Archive
           </Button>
         </div>
       </section>
@@ -351,4 +417,26 @@ const moreButton = css({
 
 const inviteRow = css({
   marginTop: "16px",
+});
+
+const boardActions = css({
+  display: "flex",
+  gap: "6px",
+  flexShrink: 0,
+});
+
+const dangerSection = css({
+  borderTop: "1px solid",
+  borderColor: "border.subtle",
+  paddingTop: "28px",
+  marginTop: "8px",
+});
+
+const dangerTitle = css({
+  fontFamily: "heading",
+  fontSize: "20px",
+  fontWeight: "heading",
+  color: "#dc2626",
+  margin: 0,
+  marginBottom: "20px",
 });
