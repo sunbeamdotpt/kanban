@@ -1,0 +1,31 @@
+schema: 1
+project:
+  name: kanban
+  kind: rust-app
+  description: "Kanban board service — Rust Axum + connect-rust + NATS JetStream."
+targets:
+  build:
+    exec: "cargo build --release"
+  test:
+    exec: [cargo, nextest, run]
+  lint:
+    exec: "cargo clippy -- -D warnings"
+  fmt:
+    exec: "cargo fmt"
+  clean:
+    exec: "cargo clean"
+  doc:
+    exec: "cargo doc --no-deps"
+deps:
+  services:
+    - postgres
+    - valkey
+    - nats
+    - opensearch
+    - keto
+    - hydra
+    - kratos
+tenant:
+  namespace: kanban
+outputs:
+  - target/release/kanban
