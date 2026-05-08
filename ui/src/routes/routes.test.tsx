@@ -134,7 +134,7 @@ describe("Route table", () => {
     it("settings_route_renders_under_protected_path", async () => {
       renderWithRoute("/p/project-abc/b/board-xyz/settings");
       await waitFor(() => {
-        expect(screen.getByText("Board settings")).toBeInTheDocument();
+        expect(screen.getByText("Project Settings")).toBeInTheDocument();
       });
     });
   });
