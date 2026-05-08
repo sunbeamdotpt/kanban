@@ -23,6 +23,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@sunbeam/beam-ui";
 import { KanbanCardDetail, type KanbanCardData } from "@sunbeam/beam-ui/components/ui/kanban-card-detail";
+import { AppChrome } from "../chrome";
 import { SettingsPage } from "../routes/settings-page";
 import refCss from "./ref-styles.css?raw";
 import refBody from "./ref-body.html?raw";
@@ -101,8 +102,10 @@ export function LiveReact() {
         </Button>
       </div>
       {showSettings ? (
-        <div className="preview-host" style={{ overflow: "auto" }}>
-          <SettingsPage />
+        <div className="preview-host">
+          <AppChrome>
+            <SettingsPage />
+          </AppChrome>
         </div>
       ) : (
         <div ref={hostRef} className="preview-host" />
