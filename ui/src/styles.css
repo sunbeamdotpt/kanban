@@ -1,10 +1,22 @@
-/* `ref` is the dev-only preview harness layer (see preview/live-react.tsx).
-   Declared first so it has lowest priority and Panda atoms always win. */
-@layer ref, reset, base, tokens, recipes, utilities;
+@layer reset, base, tokens, recipes, utilities;
 
 html {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
 }
 
 body {
