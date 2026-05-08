@@ -24,6 +24,7 @@ import { useEffect, useRef, useState } from "react";
 import { Button } from "@sunbeam/beam-ui";
 import { KanbanCardDetail, type KanbanCardData } from "@sunbeam/beam-ui/components/ui/kanban-card-detail";
 import { AppChrome } from "../chrome";
+import { BreadcrumbOverrideProvider } from "../chrome/breadcrumb-context";
 import { SettingsPage } from "../routes/settings-page";
 import refCss from "./ref-styles.css?raw";
 import refBody from "./ref-body.html?raw";
@@ -111,9 +112,17 @@ export function LiveReact() {
       </div>
       {showSettings ? (
         <div className="preview-host">
-          <AppChrome>
-            <SettingsPage />
-          </AppChrome>
+          <BreadcrumbOverrideProvider
+            value={{
+              projectId: "beam-ui",
+              boardId: "components",
+              pathname: "/p/beam-ui/b/components/settings",
+            }}
+          >
+            <AppChrome>
+              <SettingsPage />
+            </AppChrome>
+          </BreadcrumbOverrideProvider>
         </div>
       ) : (
         <div ref={hostRef} className="preview-host" />

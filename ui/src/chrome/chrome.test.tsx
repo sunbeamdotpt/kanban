@@ -68,9 +68,9 @@ describe("Topbar", () => {
         />
       </MemoryRouter>,
     );
-    // The breadcrumbs should show abbreviated project and board IDs.
-    expect(screen.getByText(/Project abc/)).toBeInTheDocument();
-    expect(screen.getByText(/Board xyz/)).toBeInTheDocument();
+    // The breadcrumbs derive a title-cased name from the slug.
+    expect(screen.getByText("Abc123456")).toBeInTheDocument();
+    expect(screen.getByText("Xyz789012")).toBeInTheDocument();
   });
 
   it("renders search input that triggers command palette", () => {
@@ -132,7 +132,7 @@ describe("Breadcrumbs", () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/Project abc/)).toBeInTheDocument();
+    expect(screen.getByText("Abc12345")).toBeInTheDocument();
   });
 
   it("renders project and board names when both are present", () => {
@@ -145,8 +145,8 @@ describe("Breadcrumbs", () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByText(/Project abc/)).toBeInTheDocument();
-    expect(screen.getByText(/Board xyz/)).toBeInTheDocument();
+    expect(screen.getByText("Abc12345")).toBeInTheDocument();
+    expect(screen.getByText("Xyz67890")).toBeInTheDocument();
     expect(screen.getByText("/")).toBeInTheDocument(); // separator
   });
 
@@ -324,6 +324,6 @@ describe("AppChrome layout", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText(/Project proj/)).toBeInTheDocument();
+    expect(screen.getByText("Proj1")).toBeInTheDocument();
   });
 });

@@ -13,6 +13,7 @@ import { useCallback, useState } from "react";
 import { useLocation, useParams } from "react-router";
 import { CommandPalette, useCommandPaletteShortcut, NotificationCenter } from "@sunbeam/beam-ui";
 import { Breadcrumbs } from "./breadcrumbs";
+import { useBreadcrumbOverride } from "./breadcrumb-context";
 import { UserMenu } from "./user-menu";
 
 /**
@@ -36,6 +37,10 @@ function StarIcon() {
 export function Topbar() {
   const params = useParams<{ projectId?: string; boardId?: string }>();
   const location = useLocation();
+  const override = useBreadcrumbOverride();
+  const projectId = override?.projectId ?? params.projectId;
+  const boardId = override?.boardId ?? params.boardId;
+  const pathname = override?.pathname ?? location.pathname;
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 
   // Wire ⌘K shortcut to open command palette.
@@ -78,9 +83,9 @@ export function Topbar() {
       {/* Breadcrumbs: project / board / view */}
       <div style={{ flex: 1, minWidth: 0 }}>
         <Breadcrumbs
-          projectId={params.projectId}
-          boardId={params.boardId}
-          pathname={location.pathname}
+          projectId={projectId}
+          boardId={boardId}
+          pathname={pathname}
         />
       </div>
 
