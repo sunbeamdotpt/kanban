@@ -1,331 +1,415 @@
 /**
  * Sidebar: workspace > project > boards tree with expand/collapse.
  *
- * Renders:
- * - "Workspace" heading with "+ New project" button
- * - Project list (initially empty; TODO Stage 6e+ wire to useProjects())
- * - Each project row with chevron to expand/show boards
- * - Each board links to /p/:projectId/b/:boardId
- * - "+ New board" button under active project
+ * Wired to real data via:
+ *   - ProjectService.ListProjects  → project rows
+ *   - BoardService.ListBoards      → board rows under each project
  *
- * TODO (Stage 6e+): wire sidebar data to ProjectService.ListProjects + BoardService.ListBoards.
+ * Active project/board highlighted from URL params.
  */
 
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router";
-import { ScrollArea } from "@sunbeam/beam-ui";
+import { useQuery } from "@tanstack/react-query";
+import { useRpcClient } from "@sunbeam/g2v/hooks";
+import { css, cx } from "styled-system/css";
+import { ProjectService } from "../gen/sunbeam/kanban/v1/projects_pb";
+import { BoardService } from "../gen/sunbeam/kanban/v1/boards_pb";
 import { ProjectWizard } from "../project-wizard";
+import { BoardWizard } from "../board-wizard/board-wizard";
 
-interface Project {
-  id: string;
-  name: string;
-  icon: string;
-  color: string;
-  boards: Board[];
+// ── Deterministic project icon palette ───────────────────────────────────────
+
+const PROJECT_ICONS = ["palette", "auto_awesome", "sports_score", "language", "hub", "bolt", "rocket_launch", "diamond"];
+const PROJECT_COLORS = ["#fa520f", "#fb6424", "#7c3aed", "#1abc9c", "#ffb83e", "#0ea5e9", "#ec4899", "#84cc16"];
+
+function iconForProject(id: string): string {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return PROJECT_ICONS[Math.abs(h) % PROJECT_ICONS.length];
 }
 
-interface Board {
-  id: string;
-  name: string;
-  icon: string;
+function colorForProject(id: string, explicitColor?: string): string {
+  if (explicitColor && explicitColor.startsWith("#")) return explicitColor;
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return PROJECT_COLORS[Math.abs(h) % PROJECT_COLORS.length];
 }
 
-/**
- * Placeholder data for Stage 6d.
- * TODO (Stage 6e+): replace with useProjects() hook.
- */
-const EMPTY_PROJECTS: Project[] = [];
+// ── Styles ───────────────────────────────────────────────────────────────────
+
+const sidebar = css({
+  backgroundColor: "bg.page",
+  overflowY: "auto",
+  padding: "12px 0 24px",
+  display: "flex",
+  flexDirection: "column",
+  height: "100%",
+});
+
+const section = css({
+  padding: "0 8px",
+});
+
+const sectionHead = css({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "6px 8px",
+  fontFamily: "body",
+  fontSize: "10px",
+  fontWeight: "button",
+  letterSpacing: "0.15em",
+  textTransform: "uppercase",
+  color: "sunbeam.orange",
+});
+
+const sectionHeadBtn = css({
+  background: "transparent",
+  border: "none",
+  cursor: "pointer",
+  color: "text.muted",
+  padding: "2px",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  _hover: { color: "sunbeam.orange" },
+});
+
+const projectRow = css({
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  width: "100%",
+  padding: "7px 8px",
+  background: "transparent",
+  borderLeft: "2px solid transparent",
+  marginLeft: "-2px",
+  cursor: "pointer",
+  fontFamily: "body",
+  fontWeight: "button",
+  fontSize: "13px",
+  color: "text.primary",
+  textAlign: "left",
+  borderRadius: "0 2px 2px 0",
+  transition: "background 0.12s",
+  _hover: { backgroundColor: "cream" },
+});
+
+const chevron = css({
+  color: "text.muted",
+  transition: "transform 0.15s",
+  flexShrink: 0,
+  fontSize: "16px !important",
+});
+
+const projectIcon = css({
+  width: "22px",
+  height: "22px",
+  borderRadius: "sm",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  fontFamily: "heading",
+  fontWeight: "button",
+  fontSize: "11px",
+  color: "ivory",
+  letterSpacing: "-0.02em",
+  flexShrink: 0,
+});
+
+const itemLabel = css({
+  flex: "1 1 0%",
+  minWidth: 0,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+});
+
+const projectCount = css({
+  fontFamily: "mono",
+  fontSize: "10px",
+  color: "text.muted",
+});
+
+const boardsWrap = css({
+  display: "flex",
+  flexDirection: "column",
+  padding: "2px 0 6px",
+});
+
+const boardRow = css({
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  padding: "5px 8px 5px 38px",
+  borderLeft: "2px solid transparent",
+  marginLeft: "-2px",
+  cursor: "pointer",
+  background: "transparent",
+  fontFamily: "body",
+  fontWeight: "body",
+  fontSize: "13px",
+  color: "text.secondary",
+  textAlign: "left",
+  width: "100%",
+  borderRadius: "0 2px 2px 0",
+  transition: "color 0.12s, background 0.12s",
+  position: "relative",
+  _hover: {
+    color: "sunbeam.orange",
+    backgroundColor: "cream",
+  },
+  "& .board-gear": { display: "none" },
+  "& .board-count": { marginLeft: "auto" },
+  "&:hover .board-gear, &.is-active .board-gear": { display: "inline-flex", opacity: 1 },
+  "&:hover .board-count, &.is-active .board-count": { display: "none" },
+});
+
+const boardRowActive = css({
+  color: "sunbeam.orange !important",
+  borderLeftColor: "sunbeam.orange !important",
+  backgroundColor: "rgba(250, 82, 15, 0.06) !important",
+  fontWeight: "button !important",
+});
+
+const boardIcon = css({
+  fontSize: "14px !important",
+  color: "text.muted",
+});
+
+const boardCount = css({
+  fontFamily: "mono",
+  fontSize: "10px",
+  color: "text.muted",
+});
+
+const boardGear = css({
+  color: "text.muted",
+  marginLeft: "auto",
+  opacity: 0,
+  padding: "2px",
+  borderRadius: "sm",
+  transition: "opacity 0.12s, color 0.12s, background 0.12s",
+  fontSize: "14px !important",
+  _hover: { color: "sunbeam.orange", backgroundColor: "cream.deep" },
+});
+
+const addBoardBtn = css({
+  display: "flex",
+  alignItems: "center",
+  gap: "6px",
+  padding: "5px 8px 5px 38px",
+  background: "transparent",
+  border: "none",
+  fontFamily: "body",
+  fontWeight: "body",
+  fontSize: "12px",
+  color: "text.muted",
+  cursor: "pointer",
+  textAlign: "left",
+  width: "100%",
+  _hover: { color: "sunbeam.orange" },
+});
+
+// ── BoardRow (fetches boards for one project) ─────────────────────────────────
+
+function BoardRows({
+  projectId,
+  activeProjectId,
+  activeBoardId,
+  onBoardClick,
+  onNewBoard,
+}: {
+  projectId: string;
+  activeProjectId?: string;
+  activeBoardId?: string;
+  onBoardClick: (pid: string, bid: string) => void;
+  onNewBoard: (pid: string) => void;
+}) {
+  const boardClient = useRpcClient(BoardService);
+  const boardsQuery = useQuery({
+    queryKey: ["boards", projectId],
+    enabled: Boolean(projectId),
+    staleTime: 30_000,
+    queryFn: () => boardClient.listBoards({ projectId }),
+  });
+
+  const boards = boardsQuery.data?.boards ?? [];
+
+  return (
+    <div className={boardsWrap}>
+      {boardsQuery.isLoading && (
+        <div style={{ padding: "4px 8px", fontSize: "11px", color: "var(--text-muted)" }}>
+          Loading…
+        </div>
+      )}
+      {boards.map((board) => {
+        const isActive = activeProjectId === projectId && activeBoardId === board.id;
+        return (
+          <button
+            key={board.id}
+            onClick={() => onBoardClick(projectId, board.id)}
+            className={cx(boardRow, isActive && boardRowActive, isActive && "is-active")}
+          >
+            <span className={cx("material-symbols-outlined", boardIcon)} aria-hidden="true">
+              {board.icon || "view_kanban"}
+            </span>
+            <span className={itemLabel}>{board.name}</span>
+            <span
+              className={cx("material-symbols-outlined", boardGear, "board-gear")}
+              aria-hidden="true"
+              title="Board settings"
+              onClick={(e) => {
+                e.stopPropagation();
+                onBoardClick(projectId, board.id);
+                // Navigate to board settings after a tick so the board route loads first
+                setTimeout(() => {
+                  window.location.href = `/p/${projectId}/b/${board.id}/settings`;
+                }, 0);
+              }}
+            >
+              settings
+            </span>
+            <span className={cx(boardCount, "board-count")}>{board.cardsCount}</span>
+          </button>
+        );
+      })}
+
+      <button className={addBoardBtn} onClick={() => onNewBoard(projectId)}>
+        <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: "14px", lineHeight: 1 }}>add</span>
+        <span>New board</span>
+      </button>
+    </div>
+  );
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
 
 export function Sidebar() {
   const params = useParams<{ projectId?: string; boardId?: string }>();
   const navigate = useNavigate();
+  const projectClient = useRpcClient(ProjectService);
 
-  const [projects, setProjects] = useState<Project[]>(EMPTY_PROJECTS);
   const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [boardWizardProjectId, setBoardWizardProjectId] = useState<string | null>(null);
+
+  const projectsQuery = useQuery({
+    queryKey: ["projects"],
+    staleTime: 0,
+    retry: 3,
+    retryDelay: 500,
+    queryFn: () => projectClient.listProjects({}),
+  });
+
+  const projects = projectsQuery.data?.projects ?? [];
 
   const toggleProject = (projectId: string) => {
-    setOpenProjects((prev) => ({
-      ...prev,
-      [projectId]: !prev[projectId],
-    }));
+    setOpenProjects((prev) => ({ ...prev, [projectId]: !prev[projectId] }));
   };
 
-  const handleNewProject = () => {
-    setWizardOpen(true);
+  const handleBoardClick = (pid: string, bid: string) => {
+    navigate(`/p/${pid}/b/${bid}`);
   };
 
-  const handleNewBoard = (projectId: string) => {
-    // TODO (Stage 6e+): open new board modal.
-    console.log("new board clicked for project:", projectId);
-  };
-
-  const handleBoardClick = (projectId: string, boardId: string) => {
-    navigate(`/p/${projectId}/b/${boardId}`);
-  };
+  // Auto-expand the active project on first render.
+  const activeProjectId = params.projectId;
+  if (activeProjectId && !(activeProjectId in openProjects) && projects.some((p) => p.id === activeProjectId)) {
+    setOpenProjects((prev) => ({ ...prev, [activeProjectId]: true }));
+  }
 
   return (
-    <ScrollArea>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          padding: "12px",
-          minHeight: "100%",
-        }}
-      >
+    <div className={sidebar}>
+      <div className={section}>
         {/* Workspace heading + New project button */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            marginBottom: "16px",
-            paddingBottom: "12px",
-            borderBottom: "1px solid var(--beam-color-border)",
-          }}
-        >
-          <h3
-            style={{
-              fontSize: "13px",
-              fontWeight: "600",
-              color: "var(--beam-color-text-secondary)",
-              margin: 0,
-              textTransform: "uppercase",
-              letterSpacing: "0.5px",
-            }}
-          >
-            Workspace
-          </h3>
+        <div className={sectionHead}>
+          <span>Workspace</span>
           <button
-            onClick={handleNewProject}
+            onClick={() => setWizardOpen(true)}
             title="New project"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: "28px",
-              height: "28px",
-              borderRadius: "4px",
-              border: "none",
-              backgroundColor: "transparent",
-              cursor: "pointer",
-              color: "var(--beam-color-text-secondary)",
-              fontSize: "16px",
-              transition: "background-color 0.2s",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.backgroundColor =
-                "var(--beam-color-bg-secondary)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.backgroundColor = "transparent";
-            }}
+            aria-label="New project"
+            className={sectionHeadBtn}
           >
-            +
+            <span className="material-symbols-outlined" style={{ fontSize: "16px", lineHeight: 1 }}>add</span>
           </button>
         </div>
 
-        {/* Projects list */}
-        {projects.length === 0 ? (
-          <div
-            style={{
-              padding: "16px 8px",
-              textAlign: "center",
-              color: "var(--beam-color-text-tertiary)",
-              fontSize: "12px",
-            }}
-          >
-            No projects yet. Click the + button to create one.
+        {/* Loading state */}
+        {projectsQuery.isLoading && (
+          <div style={{ padding: "8px", textAlign: "center", color: "var(--text-muted)", fontSize: "12px" }}>
+            Loading projects…
           </div>
-        ) : (
-          projects.map((project) => {
-            const isOpen = openProjects[project.id] ?? true;
-            const isActive = params.projectId === project.id;
-
-            return (
-              <div key={project.id} style={{ marginBottom: "8px" }}>
-                {/* Project row */}
-                <button
-                  onClick={() => toggleProject(project.id)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    width: "100%",
-                    padding: "8px",
-                    backgroundColor: isActive
-                      ? "var(--beam-color-bg-secondary)"
-                      : "transparent",
-                    border: "none",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    color: "var(--beam-color-text)",
-                    fontSize: "13px",
-                    transition: "background-color 0.2s",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isActive) {
-                      e.currentTarget.style.backgroundColor =
-                        "var(--beam-color-bg-secondary)";
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isActive) {
-                      e.currentTarget.style.backgroundColor = "transparent";
-                    }
-                  }}
-                >
-                  {/* Chevron */}
-                  <span
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      width: "20px",
-                      transform: isOpen ? "rotate(90deg)" : "rotate(0deg)",
-                      transition: "transform 0.2s",
-                      color: "var(--beam-color-text-tertiary)",
-                      fontSize: "14px",
-                    }}
-                  >
-                    &gt;
-                  </span>
-
-                  {/* Project icon + name + board count */}
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      width: "24px",
-                      height: "24px",
-                      borderRadius: "4px",
-                      backgroundColor: project.color,
-                      color: "white",
-                      fontSize: "12px",
-                      fontWeight: "600",
-                    }}
-                  >
-                    {project.icon[0].toUpperCase()}
-                  </div>
-
-                  <span style={{ flex: 1, textAlign: "left" }}>
-                    {project.name}
-                  </span>
-
-                  <span
-                    style={{
-                      backgroundColor: "var(--beam-color-bg-tertiary)",
-                      padding: "2px 6px",
-                      borderRadius: "3px",
-                      fontSize: "11px",
-                      color: "var(--beam-color-text-tertiary)",
-                    }}
-                  >
-                    {project.boards.length}
-                  </span>
-                </button>
-
-                {/* Boards list (when expanded) */}
-                {isOpen && (
-                  <div style={{ paddingLeft: "8px", marginTop: "4px" }}>
-                    {project.boards.map((board) => {
-                      const isBoardActive =
-                        params.projectId === project.id &&
-                        params.boardId === board.id;
-
-                      return (
-                        <button
-                          key={board.id}
-                          onClick={() =>
-                            handleBoardClick(project.id, board.id)
-                          }
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "8px",
-                            width: "100%",
-                            padding: "6px 8px",
-                            backgroundColor: isBoardActive
-                              ? "var(--beam-color-accent)"
-                              : "transparent",
-                            border: "none",
-                            borderRadius: "4px",
-                            cursor: "pointer",
-                            color: isBoardActive
-                              ? "white"
-                              : "var(--beam-color-text)",
-                            fontSize: "12px",
-                            transition: "background-color 0.2s",
-                            marginBottom: "2px",
-                          }}
-                          onMouseEnter={(e) => {
-                            if (!isBoardActive) {
-                              e.currentTarget.style.backgroundColor =
-                                "var(--beam-color-bg-secondary)";
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            if (!isBoardActive) {
-                              e.currentTarget.style.backgroundColor =
-                                "transparent";
-                            }
-                          }}
-                        >
-                          <span style={{ fontSize: "12px" }}>
-                            {board.icon === "kanban" ? "📊" : "📋"}
-                          </span>
-                          <span style={{ flex: 1, textAlign: "left" }}>
-                            {board.name}
-                          </span>
-                        </button>
-                      );
-                    })}
-
-                    {/* New board button */}
-                    {isActive && (
-                      <button
-                        onClick={() => handleNewBoard(project.id)}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          width: "100%",
-                          padding: "6px 8px",
-                          backgroundColor: "transparent",
-                          border: "1px dashed var(--beam-color-border)",
-                          borderRadius: "4px",
-                          cursor: "pointer",
-                          color: "var(--beam-color-text-tertiary)",
-                          fontSize: "12px",
-                          transition: "all 0.2s",
-                          marginTop: "4px",
-                        }}
-                        onMouseEnter={(e) => {
-                          e.currentTarget.style.backgroundColor =
-                            "var(--beam-color-bg-secondary)";
-                          e.currentTarget.style.borderColor =
-                            "var(--beam-color-text-tertiary)";
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.backgroundColor = "transparent";
-                          e.currentTarget.style.borderColor =
-                            "var(--beam-color-border)";
-                        }}
-                      >
-                        <span>+</span>
-                        <span>New board</span>
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })
         )}
+
+        {/* Empty state */}
+        {!projectsQuery.isLoading && projects.length === 0 && (
+          <div style={{ padding: "12px 8px", textAlign: "center", color: "var(--text-muted)", fontSize: "12px" }}>
+            No projects yet.
+          </div>
+        )}
+
+        {/* Project rows */}
+        {projects.map((project) => {
+          const isOpen = openProjects[project.id] ?? false;
+          const isActive = params.projectId === project.id;
+          const icon = project.icon || iconForProject(project.id);
+          const color = colorForProject(project.id, project.color);
+
+          return (
+            <div key={project.id}>
+              <button
+                onClick={() => toggleProject(project.id)}
+                className={projectRow}
+                data-open={isOpen}
+              >
+                <span
+                  className={cx("material-symbols-outlined", chevron)}
+                  aria-hidden="true"
+                  style={{ transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }}
+                >
+                  chevron_right
+                </span>
+
+                <span className={projectIcon} style={{ background: color }}>
+                  <span className="material-symbols-outlined" style={{ fontSize: "14px", color: "#fff" }}>
+                    {icon}
+                  </span>
+                </span>
+
+                <span className={itemLabel}>{project.name}</span>
+
+                <span className={projectCount}>
+                  {/* Count is computed from boards query when expanded, or we could show nothing */}
+                </span>
+              </button>
+
+              {isOpen && (
+                <BoardRows
+                  projectId={project.id}
+                  activeProjectId={params.projectId}
+                  activeBoardId={params.boardId}
+                  onBoardClick={handleBoardClick}
+                  onNewBoard={(pid) => setBoardWizardProjectId(pid)}
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
+
       {wizardOpen && <ProjectWizard open onOpenChange={setWizardOpen} />}
-    </ScrollArea>
+      {boardWizardProjectId && (
+        <BoardWizard
+          open={Boolean(boardWizardProjectId)}
+          onOpenChange={(open) => { if (!open) setBoardWizardProjectId(null); }}
+          projectId={boardWizardProjectId}
+          onCreated={(boardId) => {
+            navigate(`/p/${boardWizardProjectId}/b/${boardId}`);
+            setBoardWizardProjectId(null);
+          }}
+        />
+      )}
+    </div>
   );
 }
