@@ -64,16 +64,16 @@ pub async fn expand_objects(
             ));
         }
 
-        let (tuples, next_token) = client
-            .list_relation_tuples(
-                q.namespace,
-                Some(q.relation),
-                Some(q.subject),
-                page_size,
-                &page_token,
-            )
-            .await
-            .map_err(|e| anyhow!("keto list_relation_tuples: {}", e))?;
+        let (tuples, next_token) = crate::auth::keto_compat::list_relation_tuples(
+            client,
+            q.namespace,
+            Some(q.relation),
+            Some(q.subject),
+            page_size,
+            &page_token,
+        )
+        .await
+        .map_err(|e| anyhow!("keto list_relation_tuples: {}", e))?;
 
         let count = tuples.len();
         page_num += 1;
@@ -169,10 +169,13 @@ mod tests {
 
     /// Delete all tuples for `subject` in `NS`/`RELATION` (test teardown).
     async fn cleanup(ctx: &KetoCtx, subject: &str) {
-        if let Err(e) = ctx
-            .client
-            .delete_relation_tuples(NS, Some(RELATION), Some(subject))
-            .await
+        if let Err(e) = crate::auth::keto_compat::delete_relation_tuples(
+            &ctx.client,
+            NS,
+            Some(RELATION),
+            Some(subject),
+        )
+        .await
         {
             eprintln!("[keto_expand] cleanup failed for subject={subject}: {e}");
         }

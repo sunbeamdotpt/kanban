@@ -1,93 +1,352 @@
 # AGENTS.md — Sunbeam Kanban
 
-Rust service + TypeScript SPA for real-time collaborative board management. Gated by Keto, streamed via NATS JetStream, live-synced across replicas with ≤30ms eventual consistency.
+> AI coding agent guide for the Kanban project. Read this first before modifying code.
 
-## Quick Start
+## Project Overview
 
-**Dev URL:** `http://localhost:47823`
+Sunbeam Kanban is a real-time collaborative board management service. It consists of:
 
-**Required compose services:** postgres, valkey, nats, keto, kratos, opensearch, seaweedfs.
+- **Backend:** Rust service (`kanban`) built on Axum + Tonic (Connect-RPC/gRPC), talking to PostgreSQL, NATS JetStream, Keto (permissions), Valkey (logout watermarks), OpenSearch (search), and S3 (attachments).
+- **Frontend:** TypeScript React SPA (`kanban-ui`) built with Vite, TanStack Query, Connect-Web, and `@sunbeam/beam-ui` design system.
+- **Protocol:** Connect-RPC over h2 with SSE fallback. All RPCs are defined in Protobuf at `proto/sunbeam/kanban/v1/`.
+- **Auth:** Hydra issues JWTs; Keto checks per-object permissions; `x-sunbeam-object-id` header gates every mutating RPC.
+- **Realtime:** Mutations write to Postgres `event_log` → outbox dispatcher publishes to NATS JetStream `kanban.board.{id}.events` → per-pod `BoardSubscriberRegistry` fans out via `tokio::sync::broadcast` to all connected clients.
+
+---
+
+## Semantic Memory Search (Optional)
+
+If a `sunbeam-memory` MCP server is available in your environment, use it for codebase search instead of `grep` or `rg`.
+
+1. **Initialize the repository first.** Before searching, ensure this codebase is indexed:
+   - Call `add_watch_target` with the absolute path to this repository.
+   - Wait for indexing to complete, then search.
+2. **Prefer semantic search.** Use `search_facts` with natural-language queries about behavior, design decisions, known issues, and prior changes.
+3. **Store useful findings.** If you discover something future agents should remember (a gotcha, invariant, or decision), call `store_fact` with a concise note and a source URN when possible.
+
+`sunbeam-memory` is **optional**. If the server is not available, skip these steps and use `grep` / `rg` / `Read` as usual. Do not fail, stall, or ask the user to install it.
+
+---
+
+## Technology Stack
+
+### Backend (`/src/`)
+
+| Concern | Technology |
+|---------|------------|
+| HTTP / RPC framework | Axum 0.8 + Tonic 0.14 (Connect-RPC compatible) |
+| Async runtime | Tokio |
+| Database | PostgreSQL 16+ via `sqlx` 0.8 (dynamic API, **no compile-time macros**) |
+| Migrations | `sqlx::migrate!("./migrations")` embedded at compile time |
+| Message queue | NATS JetStream (`async-nats` 0.47) |
+| Permissions | Ory Keto (gRPC read 4466 / write 4467) |
+| Auth middleware | `sunbeam-g2v` JwtLayer + local `keto_dispatch` middleware |
+| Cache / watermark | Valkey (Redis protocol) via `redis` crate |
+| Search | OpenSearch |
+| Object storage | S3 (presigned URLs) |
+| Observability | OpenTelemetry OTLP + Prometheus metrics + `tracing` |
+| Build | Cargo; `tonic-prost-build` generates Rust proto code at build time |
+
+### Frontend (`/ui/src/`)
+
+| Concern | Technology |
+|---------|------------|
+| Framework | React 19 + React Router 7 |
+| Build tool | Vite 6 |
+| Styling | Panda CSS via `@sunbeam/beam-ui` preset (`panda.config.ts`) |
+| State (server) | TanStack Query 5 (`useRpcQuery`, `useRpcMutation`, `useRpcStream` from `@sunbeam/g2v`) |
+| State (client) | `@legendapp/state` |
+| RPC transport | Connect-Web 2 (`@connectrpc/connect-web`) |
+| Proto codegen | `buf generate` → TypeScript (`@bufbuild/protobuf` v2) |
+| Unit tests | Vitest 2 + `@testing-library/react` + jsdom |
+| E2E tests | Playwright 1.48 |
+
+## Project Structure
+
+```
+kanban/
+├── Cargo.toml                  # Rust package manifest
+├── build.rs                    # tonic-prost-build proto compilation
+├── sunbeam.yaml                # Sunbeam workspace target definitions
+├── Dockerfile                  # Multi-stage Rust build → distroless
+├── migrations/                 # sqlx migration scripts (one-way, no down)
+│   ├── 0001_projects.sql
+│   ├── ...
+│   └── seeds/dev_fixtures.sql  # Dev seed data (idempotent)
+├── src/
+│   ├── main.rs                 # tokio::main → server::run()
+│   ├── lib.rs                  # Module declarations + codegen smoke test
+│   ├── server.rs               # Bootstrap: Postgres, NATS, Valkey, Keto, Axum router
+│   ├── pb.rs                   # Re-exports of tonic-generated proto modules
+│   ├── test_support.rs         # Shared test seeders (project/board/column/card chain)
+│   ├── bin/keto-coverage.rs    # CI binary: verifies MATRIX covers all proto RPCs
+│   ├── auth/
+│   │   ├── keto_dispatch.rs    # Static 49-entry dispatch matrix + middleware
+│   │   ├── keto_expand.rs      # `expand_objects` helper for list post-filtering
+│   │   └── logout_watermark.rs # Valkey-backed token revocation
+│   ├── realtime/
+│   │   ├── jetstream_bootstrap.rs  # Ensures KANBAN_BOARD_EVENTS stream exists
+│   │   ├── outbox.rs               # Polls event_log → publishes to JetStream
+│   │   ├── registry.rs             # Per-pod NATS push consumer + broadcast fanout
+│   │   └── cutover.rs              # Resume-token deduplication for subscribers
+│   ├── integrations/
+│   │   ├── opensearch.rs       # OpenSearch client
+│   │   └── s3.rs               # S3 presigned URL client
+│   └── services/
+│       ├── mod.rs              # Tonic service registration
+│       ├── auth.rs             # WhoAmI, SignalLogout
+│       ├── projects.rs         # Project CRUD + SubscribeProject
+│       ├── boards.rs           # Board CRUD + column ops + SubscribeBoard
+│       ├── cards.rs            # 17-card RPCs (the largest service)
+│       ├── attachments.rs      # Presigned upload/download/confirm/delete
+│       ├── forgejo.rs          # Forgejo issue linking
+│       └── search.rs           # Global card search (post-filtered via Keto)
+├── ui/
+│   ├── package.json
+│   ├── vite.config.ts          # Dev server on :47823, React dedupe aliases
+│   ├── vitest.config.ts        # jsdom, single-react plugin, inline Ark UI
+│   ├── playwright.config.ts    # E2E against localhost:47823
+│   ├── panda.config.ts         # beam-ui preset
+│   ├── buf.gen.yaml            # TypeScript proto codegen config
+│   └── src/
+│       ├── main.tsx            # React root + FrameworkProvider + BrowserRouter
+│       ├── App.tsx             # useRoutes(appRoutes)
+│       ├── test-setup.ts       # matchMedia polyfill for jsdom
+│       ├── styles.css          # Panda layers + Material Symbols + dialog fixes
+│       ├── routes/index.tsx    # Route map: auth → shell → pages
+│       ├── auth/               # OIDC, PKCE, transport, require-auth, state-bridge
+│       ├── shell/              # KanbanShell, layout, subheader, breadcrumbs
+│       ├── chrome/             # Sidebar, topbar, user-menu
+│       ├── board/              # useBoard, useBoardSubscription, board-view, pending-mutations
+│       ├── list-view/          # List page rendering
+│       ├── card-drawer/        # Card detail form
+│       ├── project-wizard/     # Create-project flow
+│       ├── preview/            # Dev-only design preview harness
+│       ├── tweaks/             # Dev tweaks panel
+│       └── gen/                # Generated protobuf TypeScript (committed)
+└── .integration/
+    ├── keto-namespaces.config.ts   # Ory Keto OPL namespace definitions
+    ├── validate.ts                 # Type-checks namespace config
+    └── README.md
+```
+
+## Build & Run Commands
+
+### Prerequisites
+
+All services run via the Sunbeam compose stack:
 
 ```sh
-sunbeam ops compose up kanban     # Start all services for local dev
-sunbeam ops compose ps            # Verify they're running
+cd /Users/sienna/Development/sunbeam
+sunbeam ops compose up kanban   # Starts postgres, valkey, nats, keto, kratos, opensearch, seaweedfs
+sunbeam ops compose ps          # Verify health
 ```
 
-The Rust server boots on `:8080` (internal); the Vite frontend dev server is `:47823` (proxied). Before the first run, seed the database:
+### Backend
 
 ```sh
-cd apps/kanban && cargo run --bin kanban-db-init
+# Dev server (listens on :8080)
+cargo run --bin kanban
+
+# Build release binary
+cargo build --release --bin kanban
+
+# Lint (deny warnings)
+cargo clippy -- -D warnings
+
+# Format
+cargo fmt
+
+# Run all tests (requires shared Postgres + Valkey + Keto)
+cargo test
+
+# Or with nextest (preferred)
+cargo nextest run
+
+# Verify Keto dispatch matrix covers all proto RPCs
+cargo run --bin keto-coverage
 ```
 
-## Architecture Sketch
+**Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.
 
-Request path (all transports are Connect-RPC over h2 or h2-compatible SSE fallback):
+### Frontend
 
-```
-┌─────────────┐
-│  Frontend   │
-│  React/TS   │
-└──────┬──────┘
-       │ Connect-Web (h2 or SSE)
-       │ + Bearer JWT (from authStore)
-       ▼
-┌──────────────────────┐
-│  kanban-server       │
-│  (Rust Axum)         │
-│  :8080               │
-└──────┬───────────────┘
-       │
-       ├─ JwtLayer: validate JWT from Hydra
-       │
-       ├─ keto_dispatch (DispatchEntry matrix)
-       │  · Extracts object ID from request
-       │  · Calls KetoClient::check_permission(namespace, object_id, relation, subject)
-       │  · 403 PermissionDenied if Keto rejects
-       │  · Inserts Extension<CheckedObjectId> on success
-       │
-       └─ Handler (in services/{rpc}.rs)
-          │
-          ├─ Reads checked object ID from Extension<CheckedObjectId>
-          │
-          ├─ Mutates: write to postgres → event_log → outbox dispatcher → NATS
-          │
-          ├─ Reads: post-filter via keto_expand_objects() for ListProjects, SearchCards
-          │
-          └─ Streams: subscribe handlers publish to local registry; NATS feeds live tail
-             and replay-from-resume-token (ephemeral pull consumer)
-       ▼
-┌──────────────────────────────┐
-│  Postgres                    │
-│  boards, cards, members, ... │
-│  event_log, outbox           │
-└──────────────────────────────┘
-       ▼
-┌──────────────────────────────┐
-│  NATS JetStream              │
-│  kanban.board.{id}.events    │
-│  stream: KANBAN_BOARD_EVENTS │
-└──────────────────────────────┘
-       ▼
-┌──────────────────────────────┐
-│  Pod-local registry          │
-│  (SubscribeBoardMap)         │
-└──────────────────────────────┘
-       │ (re-broadcast to all subscribers on this pod)
-       ▼
-   [All clients on this pod receive live events]
+```sh
+cd ui
+
+# Install deps & generate Panda CSS
+npm install
+npm run prepare   # panda codegen
+
+# Dev server (listens on http://localhost:47823)
+npm run dev
+
+# Type-check
+npm run typecheck
+
+# Unit tests (Vitest + jsdom)
+npm run test
+npm run test:watch
+
+# E2E tests (Playwright; requires backend running)
+npm run test:e2e
+npm run test:e2e:ui      # Interactive UI mode
+npm run test:e2e:headed  # Headed browser
+
+# Proto generation (run from ui/)
+npm run proto:gen
 ```
 
-## Add a New RPC: Recipe
+## Testing Strategy
+
+### Backend Tests
+
+Rust tests are **inline** inside `#[cfg(test)]` modules at the bottom of each source file. There are **no separate `*_tests.rs` files**.
+
+- **Unit tests:** No external dependencies (e.g., `matrix_covers_all_rpcs`, `hash_subject_prefix_is_stable`).
+- **Integration tests:** Require shared Postgres, Valkey, and Keto. They run against the real database using the seeders in `test_support.rs`. Each test uses fresh UUIDs so parallel `nextest` tasks do not collide.
+- **No `#[ignore]` attributes:** All tests run by default. If a test requires external infra, it fails clearly rather than being skipped.
+
+Key test modules:
+- `src/auth/keto_dispatch.rs` — Matrix shape tests + middleware behavior tests (mocked watermark/Keto) + integration tests (live Valkey + Keto).
+- `src/services/boards.rs`, `projects.rs`, `cards.rs` — Service handler integration tests (DB round-trips).
+- `src/realtime/outbox.rs` — Outbox dispatcher tests (event_log → NATS).
+- `src/realtime/registry.rs` — Broadcast fanout tests.
+
+### Frontend Tests
+
+- **Unit tests:** Colocated as `*.test.tsx` (or `*.test.ts`) next to the source file. Run with Vitest + jsdom.
+- **Mock transport:** `createMockTransport` from `@sunbeam/g2v/testing` wires in-process Connect-RPC handlers for hooks/components.
+- **E2E tests:** Playwright specs in `ui/e2e/`. Fixtures (`e2e/fixtures/seed.ts`) create real project/board/card data via the API before each test. Tests run against an already-deployed stack (no `webServer` in Playwright config).
+
+## Code Style Guidelines
+
+### Rust
+
+- **Formatting:** `cargo fmt` (enforced in CI).
+- **Clippy:** `cargo clippy -- -D warnings` (zero warnings policy).
+- **SQL style:** Dynamic `sqlx` API only — no compile-time macros. Parameters bound with `.bind()`.
+- **Error handling:** Use `anyhow::Result` in bootstrap / async tasks; use `tonic::Status` in gRPC handlers. Log errors with `tracing::error!` before returning `Status::internal(...)`.
+- **Doc comments:** Module-level `//!` comments explain stage/purpose. `// ── Section ──` dividers for visual grouping.
+- **Constants:** `SCREAMING_SNAKE_CASE` for module-level constants (e.g., `KETO_NS_BOARD`).
+- **Timestamp conversion:** Use `to_proto_ts` / `from_proto_ts` helpers (chrono ↔ prost_types).
+
+### TypeScript / React
+
+- **Formatting:** Implied by project conventions (no explicit formatter configured; rely on IDE defaults).
+- **Imports:** Grouped: React/external → `@sunbeam/*` internal → relative `./`.
+- **File naming:** `kebab-case.ts`, `kebab-case.tsx` for components.
+- **Component exports:** Named exports preferred over default exports.
+- **Styling:** Panda CSS utilities via `styled-system` imports. Do not write raw CSS except in `styles.css`.
+- **React hooks:** Colocated in `use-*.ts` files next to consumers. RPC hooks use `useRpcQuery` / `useRpcMutation` / `useRpcStream` from `@sunbeam/g2v/hooks`.
+- **Query keys:** Factory functions like `boardQueryKey(boardId)` to avoid magic strings.
+
+## Security Considerations
+
+### Authentication & Authorization
+
+- **Every RPC is gated.** There are no unguarded handlers. The middleware stack (outer → inner) is:
+  1. `TraceLayer` (OTel propagation)
+  2. `JwtLayer` (validates Bearer JWT from Hydra, inserts `Extension<AuthContext>`)
+  3. `keto_dispatch` (looks up RPC in `MATRIX`, checks Keto permission, inserts `Extension<CheckedObjectId>`)
+  4. Handler
+- **Object IDs come from headers, never the body.** The frontend sets `x-sunbeam-object-id: <id>` per RPC. Handlers must read `CheckedObjectId` from request extensions, not from the protobuf body. This prevents body-forgery bypasses on server-streaming RPCs.
+- **Logout watermark:** `SignalLogout` writes a timestamp to Valkey. `keto_dispatch` compares `iat_ms` against the watermark on every request. Revoked tokens get `401 Unauthorized`.
+- **Token revocation window:** After a Keto tuple is deleted, a user may retain access for up to 30 seconds until the next Keto recheck (or 15s on heartbeat). This is an accepted v1 property.
+
+### Data Integrity
+
+- **Mirror-table write order:** Keto FIRST, then SQL. If SQL fails after Keto succeeds, log a `mirror_drift` warning and let the hourly reconciler fix it. Keto is the source of truth; SQL is rewritten to match.
+- **Idempotency keys:** Mutations store idempotency keys in `idempotency_keys` table to guard against retries.
+- **Advisory locks:** Card ref allocation uses `pg_advisory_xact_lock(hashtext($project_id))` to prevent duplicate refs under concurrency.
+
+### Deployment Security
+
+- **Readiness probe:** `/healthz/ready` returns 200 only after the synthetic `_kanban_health` Keto tuple check passes. If Keto namespaces are broken, the pod fails readiness and is removed from load balancing.
+- **Rollback safety:** Schema migrations are one-way. Rolling back code to an older commit without downgrading the database will crash the service. For v1, there are no down scripts — contact on-call DBA if a rollback is needed.
+
+## Development Conventions
+
+### Adding a New RPC
+
+See the detailed recipe in **Architecture → Add a New RPC** below. In short:
+
+1. Define in `proto/sunbeam/kanban/v1/*.proto`.
+2. Generate code (`buf generate` for Rust + TypeScript).
+3. Add `DispatchEntry` to `src/auth/keto_dispatch.rs::MATRIX`.
+4. Run `cargo run --bin keto-coverage` (must exit 0).
+5. Implement handler in `src/services/{domain}.rs`.
+6. Wire in `src/services/mod.rs`.
+7. Write tests (authorized, unauthorized, persistence, events).
+8. Wire frontend hook in `ui/src/hooks` or local component file.
+
+### Database Migrations
+
+- Migration files live in `migrations/` and are applied by `sqlx::migrate!("./migrations")` at server boot.
+- **One-way only:** No down scripts are shipped. Plan schema changes carefully.
+- **Seeds:** `migrations/seeds/dev_fixtures.sql` provides idempotent dev data.
+
+### Proto Codegen
+
+- **Rust:** `tonic-prost-build` in `build.rs` compiles protos at Cargo build time. Protos are referenced from `../../proto/sunbeam/kanban/v1/`.
+- **TypeScript:** Run `npm run proto:gen` from `ui/`. Generated code is committed to `ui/src/gen/`.
+
+### Keto Namespace Evolution
+
+To add or rename a permission without downtime, follow the 3-step dual-write pattern documented in **Architecture → Keto Namespace Evolution Recipe** below.
+
+## Architecture
+
+### Request Path
+
+```
+Frontend (React/TS)
+  │ Connect-Web (h2 or SSE) + Bearer JWT
+  ▼
+kanban-server (Rust Axum) :8080
+  │
+  ├─ JwtLayer → validates JWT, inserts AuthContext
+  ├─ keto_dispatch → checks MATRIX, calls Keto, inserts CheckedObjectId
+  └─ Handler → reads checked ID, mutates Postgres, emits event_log
+       │
+       ├─ Mutates: SQL transaction → event_log INSERT → commit
+       ├─ Reads:  SQL + keto_expand_objects() post-filter
+       └─ Streams: BoardSubscriberRegistry fanout (local broadcast)
+            │
+            └─ NATS JetStream ← outbox dispatcher drains event_log
+```
+
+### Realtime Flow
+
+1. Handler mutates Postgres and inserts an `event_log` row in the same transaction.
+2. `OutboxDispatcher` polls undispatched rows every 250ms, publishes to `kanban.board.{id}.events`.
+3. `BoardSubscriberRegistry` maintains one ephemeral NATS push consumer per board per pod.
+4. Consumer pumps messages into a `tokio::sync::broadcast` channel (capacity 256).
+5. `SubscribeBoard` handler receives from the broadcast channel and yields `BoardEventEnvelope` to the client.
+6. Client-side `useBoardSubscription` applies events to the TanStack Query cache.
+
+### Key Invariants
+
+- `MATRIX` must contain exactly one entry per proto RPC. `keto-coverage` enforces this in CI.
+- `CheckedObjectId` must be used by handlers, never the request body ID.
+- `project_members` SQL table mirrors Keto tuples. Drift is reconciled hourly (Keto wins).
+- Event log is append-only; outbox marks `nats_seq` on success.
+
+---
+
+## Recipes
+
+### Add a New RPC
 
 Suppose you're adding `UpdateCardColor(card_id, color) -> Card`.
 
-### 1. Define the RPC in proto
+**1. Define the RPC in proto**
 
-```sh
-# Edit proto/sunbeam/kanban/v1/cards.proto
+```proto
+// proto/sunbeam/kanban/v1/cards.proto
 message UpdateCardColorRequest {
   string card_id = 1;
-  string color = 2;  // e.g., "gold", "purple"
+  string color   = 2;
 }
 
 service CardsService {
@@ -96,7 +355,7 @@ service CardsService {
 }
 ```
 
-### 2. Generate code
+**2. Generate code**
 
 ```sh
 cd /Users/sienna/Development/sunbeam
@@ -107,31 +366,29 @@ cd apps/kanban/ui
 npm run proto:gen  # TypeScript
 ```
 
-### 3. Add dispatch entry
+**3. Add dispatch entry**
 
-Edit `apps/kanban/src/auth/keto_dispatch.rs`. Find the `DISPATCH_MATRIX` const and add:
+Edit `src/auth/keto_dispatch.rs`. Find `MATRIX` and add:
 
 ```rust
 DispatchEntry {
     method: "/sunbeam.kanban.v1.CardsService/UpdateCardColor",
     namespace: "KanbanCard",
     relation: "edit",
-    object_id_source: ObjectIdSource::Header,  // Client sends `x-sunbeam-object-id: <card_id>`
+    object_id_source: ObjectIdSource::Header,
 },
 ```
 
-### 4. Verify coverage
+**4. Verify coverage**
 
 ```sh
-cd apps/kanban
 cargo run --bin keto-coverage
 # Must exit with code 0
-# If a proto method is missing from DISPATCH_MATRIX, it panics
 ```
 
-### 5. Implement handler
+**5. Implement handler**
 
-Create or edit `apps/kanban/src/services/cards.rs`:
+In `src/services/cards.rs`:
 
 ```rust
 pub async fn update_card_color(
@@ -139,9 +396,7 @@ pub async fn update_card_color(
     Extension(checked_id): Extension<CheckedObjectId>,
     req: UpdateCardColorRequest,
 ) -> Result<Card, ApiError> {
-    // The checked_id is the card_id that passed Keto Check on "edit"
-    // Always use the checked_id, never the request body's card_id
-    let card_id = checked_id.0;
+    let card_id = checked_id.0; // ALWAYS use checked_id, never req.card_id
 
     let card = sqlx::query_as::<_, Card>(
         "UPDATE cards SET color = $1, revision = revision + 1 WHERE id = $2 RETURNING *"
@@ -165,228 +420,136 @@ pub async fn update_card_color(
 }
 ```
 
-Wire it in `src/services/mod.rs`:
+Wire in `src/services/mod.rs` via Tonic `Routes::add_service`.
 
-```rust
-app.service(
-    web::scope("/sunbeam.kanban.v1.CardsService")
-        .route("/UpdateCardColor", web::post().to(update_card_color))
-);
-```
+**6. Write tests**
 
-### 6. Write integration tests
-
-Create `apps/kanban/src/services/cards_tests.rs` (or append to the existing test module). Test:
-- Authorized user can update their own card.
+Add `#[cfg(test)]` module at the bottom of `src/services/cards.rs`. Test:
+- Authorized user can update.
 - Unauthorized user gets 403.
-- Color field is persisted.
+- Color is persisted.
 - Event fires to NATS.
 
+Run all tests:
 ```sh
-cargo test --test '*' -- --include-ignored  # Run all IT tests
+cargo test
 ```
 
-No `#[ignore]` attributes — all tests run by default per `feedback_no_ignored_tests.md`.
-
-### 7. Wire FE consumer
-
-In `apps/kanban/ui/src/hooks`:
+**7. Wire frontend consumer**
 
 ```typescript
-import { useRpcMutation } from "@sunbeam/g2v";
-import { CardsService } from "@buf/sunbeam_kanban.connectrpc_es";
+import { useRpcMutation } from "@sunbeam/g2v/hooks";
+import { CardsService } from "../gen/sunbeam/kanban/v1/cards_pb";
 
 export const useUpdateCardColor = () => {
-  return useRpcMutation(CardsService.UpdateCardColor, {
+  return useRpcMutation(CardsService, "updateCardColor", {
     onSuccess: (card) => {
-      // Re-fetch or update local cache; the stream will also deliver the event
       queryClient.setQueryData(["card", card.id], card);
     },
   });
 };
 ```
 
-Usage in a component:
+### Keto Namespace Evolution Recipe (Zero-Downtime)
 
-```typescript
-const updateColor = useUpdateCardColor();
-<button onClick={() => updateColor.mutate({ cardId: "card-123", color: "gold" })}>
-  Change Color
-</button>
-```
+You want to add a new permission (e.g., rename `view` → `view_v2`) without locking anyone out.
 
-## Keto Namespace Evolution Recipe (MF-8 Scenario 5)
+**Step 1: Deploy new relation**
 
-You want to add a new permission (e.g., rename `view` → `view_v2` with different semantics) without locking anyone out during deploy.
+Edit `.integration/keto-namespaces.config.ts` to add the new relation alongside the old one. Deploy with `sunbeam apply kanban`.
 
-### Step 1: Deploy new relation
+**Step 2: Dual-write both relations**
 
-Edit `apps/kanban/.integration/keto-namespaces.config.ts`:
-
-```typescript
-const namespace = {
-  // ... existing ...
-  relations: {
-    view: { /* ... */ },
-    view_v2: { /* ... new definition ... */ },
-  },
-};
-```
-
-Deploy the namespace:
-
-```sh
-sunbeam apply kanban
-```
-
-Old code still uses `view` for permission checks. New tuples not written yet.
-
-### Step 2: Dual-write both relations
-
-Edit every handler that grants a relation. In `CreateCard`:
+In every handler that grants the relation:
 
 ```rust
-// After inserting the card row in SQL:
 keto.write_relation("KanbanCard", &card_id, "view", &user_subject).await?;
 keto.write_relation("KanbanCard", &card_id, "view_v2", &user_subject).await?;
 ```
 
-Deploy:
+Deploy again. Now old code (still running) checks `view`; new code writes both.
 
-```sh
-sunbeam apply kanban
-```
+**Step 3: Switch all checks to v2**
 
-Now permission checks accept both `view` and `view_v2`. Old tokens still validate on `view`. New tuples are written to both.
+Update `MATRIX` entries to use `relation: "view_v2"`. Run `cargo run --bin keto-coverage`. Deploy.
 
-### Step 3: Switch all checks to v2
+**Step 4: Drop old relation (later)**
 
-Edit `apps/kanban/src/auth/keto_dispatch.rs`. Update the dispatch matrix:
+Remove `view` from the namespace config and stop dual-writing. Deploy.
 
-```rust
-DispatchEntry {
-    method: "/sunbeam.kanban.v1.CardsService/GetCard",
-    namespace: "KanbanCard",
-    relation: "view_v2",  // Changed from "view"
-    object_id_source: ObjectIdSource::Header,
-},
-// ... repeat for all GetCard, SubscribeBoard, etc. ...
-```
+**Why three steps?** Old pods still running at Step 2 need `view` to exist. By Step 3, all pods check `view_v2` while both relations are still written, so there is no universal-deny window.
 
-Run `cargo run --bin keto-coverage` to verify.
-
-Deploy:
-
-```sh
-sunbeam apply kanban
-```
-
-All checks now use `view_v2`. The old `view` relation is still written but not checked.
-
-### Step 4: Drop old relation (v1 follow-up)
-
-Once you've verified no regressions:
-
-```typescript
-// apps/kanban/.integration/keto-namespaces.config.ts
-const namespace = {
-  relations: {
-    view_v2: { /* ... */ },
-    // view: removed
-  },
-};
-```
-
-Stop dual-writing `view` in handlers.
-
-**Why three steps?** Deploy at Step 2 allows old code (still running on old pods) to read/write `view` while new code writes both. At Step 3, all code accepts `view_v2` and the old relation stops being checked. The window where permission is checked on the old relation overlaps with the window where it's still written, so no universal-deny window appears.
-
-## Token Revocation Window
-
-When a user is removed from a project (their Keto tuple is deleted):
-
-1. **Immediate (≤0s):** The tuple is gone from Keto.
-2. **Per-yield JWT check (≤1ms):** The user's JWT is still valid (exp is far in future). Token check passes.
-3. **Keto recheck (≤30s):** Every 30 seconds (or on Heartbeat at 15s if events are flowing), the stream calls `KetoClient::check_permission` again. On the recheck, Keto says "deny" and the stream closes with `Unauthenticated`.
-4. **Known property:** Between tuple deletion and the next Keto recheck, a user can still read/write for ≤30 seconds. This is acceptable for v1.
-
-**Mitigation:** If you need faster revocation, reduce the 30s constant in `apps/kanban/src/auth/keto_dispatch.rs::RECHECK_INTERVAL_SECS`. The tradeoff is higher load on Keto.
-
-## Rollback Recipe
-
-To roll back the service to a previous image:
+### Rollback Recipe
 
 ```sh
 sunbeam apply kanban --image-tag <previous_sha>
+sunbeam ops compose ps kanban
+sunbeam ops logs kanban -f
 ```
 
-Example:
+**Schema migrations are one-way.** If the DB schema is newer than the rolled-back code, the service will fail to boot. For v1, contact the on-call DBA — there are no down scripts.
 
-```sh
-# Last deploy was abc123, current is def456, and def456 is broken
-sunbeam apply kanban --image-tag abc123
-sunbeam ops compose ps kanban  # Watch the rollback complete
-sunbeam ops logs kanban -f     # Tail logs for ≥30s
-```
+### Mirror Reconciliation
 
-**Schema migrations are one-way.** If you roll back the code to a commit that expects the old schema, but the database is already on the new schema, the service will fail to boot. In that case:
+The `project_members` table mirrors Keto tuples. Hourly reconciliation (CronJob) queries Keto and rewrites SQL to match. Keto is the source of truth.
 
-1. Identify which migration to undo (check `apps/kanban/migrations/` and the most recent `--down` script).
-2. Run the downgrade manually (your DBA or a `sunbeam ops db-migrate` command if one is available).
-3. Then roll back the code.
-
-**For v1:** No schema downgrade scripts are shipped. If a code rollback is needed, open an incident and let the on-call DBA handle it.
-
-## Mirror Reconciliation
-
-The `project_members` table in PostgreSQL mirrors Keto tuples. When a user is granted/revoked project access, the handler writes to both Keto and PostgreSQL. Rarely, the SQL write succeeds but the Keto write fails (transient Keto unavailability). The hourly reconciliation cron detects and fixes drift:
+**Drift metric:** `kanban_mirror_drift_ratio` — pages on-call if > 0.1% for ≥1 hour.
 
 ```sh
 sunbeam ops reconcile kanban-membership
 ```
 
-(This command will be registered in Stage 7a. Until then, the cron runs automatically in the kanban deployment as a CronJob.)
-
-**Drift metric:** `kanban_mirror_drift_ratio` — if it exceeds 0.1% for ≥1 hour, pages on-call.
-
-The reconciliation queries Keto via `keto_expand_objects(KanbanProject, viewers, *)` and compares the results to `project_members` table. If a row is missing from SQL but present in Keto, it's inserted. If it's in SQL but not in Keto (revoked), it's deleted. **Keto is the source of truth; SQL is rewritten to match.**
-
 ## Common Gotchas
 
 ### `node_modules/react` duplication
 
-When `@sunbeam/g2v-fe` is installed via `file:../libs/sunbeam-g2v-fe`, it brings its own `node_modules/react`. Vite's deduplication + alias should handle it, but sometimes it doesn't. Symptom: two React instances, component state inconsistencies.
+When `@sunbeam/g2v` is installed via JSR, it may bring its own `react`. Symptom: two React instances, broken hooks.
 
 **Fix:**
-
 ```sh
-cd apps/kanban/ui
-rm -rf node_modules/@sunbeam/g2v-fe/node_modules/react*
+cd ui
+rm -rf node_modules/@sunbeam/g2v/node_modules/react*
 npm install
 ```
 
-### `kanban-db-init` must run before kanban-server boots
+Vite and Vitest configs already dedupe `react`, `react-dom`, `@tanstack/react-query`, and `@legendapp/state`.
 
-The `kanban-db-init` binary runs migrations and seeds the database. The `kanban-server` binary expects the schema to exist. In compose, this is managed by `depends_on` + `condition: service_healthy`. In Kubernetes, the `kanban-db-init` job must complete before the `kanban-server` Deployment starts.
+### `kanban-db-init` must run before server boots
 
-Check `sunbeam.workspace.yaml::services.kanban-db-init` and `kustomize` overlays for the correct ordering.
+Migrations are embedded in the binary but the database must be initialized. In compose this is managed by `depends_on` + `condition: service_healthy`. In Kubernetes, the `kanban-db-init` Job must complete before the Deployment starts.
 
-### Keto namespace mount
+### Keto namespace mount failures
 
-Keto runs as a pod with a ConfigMap mount at `/etc/namespaces/`. The kanban namespace file is at `/etc/namespaces/kanban.config.ts` inside the pod. When you deploy a new namespace config, the ConfigMap is updated and Keto hot-reloads it. If the reload fails silently:
+Keto reads namespace configs from `/etc/namespaces/` (directory mode). If a deploy breaks the syntax, Keto fails to reload and the readiness probe (`_kanban_health` tuple check) fails, removing pods from service.
 
+**Fix:**
 ```sh
-sunbeam ops logs keto -f  # Check for errors
-sunbeam ops restart keto  # Force a restart
+sunbeam ops logs keto -f
+sunbeam ops restart keto
 ```
 
-The deploy gate at Stage 7e includes a synthetic check (`_kanban_health` tuple) that fails readiness if the namespace didn't load correctly.
+### Frontend streaming tests
+
+`useRpcStream` tests require a custom mock transport that yields async generators. See `ui/src/board/board-view.test.tsx` for the pattern using `makeTransport` from `@sunbeam/g2v/testing`.
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KANBAN_PORT` | `8080` | HTTP/gRPC listen port |
+| `DATABASE_URL` | *required* | Postgres connection string |
+| `NATS_URL` | `nats://localhost:4222` | NATS server |
+| `VALKEY_URL` | `redis://localhost:6379` | Valkey (logout watermarks) |
+| `KETO_READ_ADDR` | `http://localhost:4466` | Keto read endpoint |
+| `KETO_WRITE_ADDR` | `http://localhost:4467` | Keto write endpoint |
+| `JWT_SECRET` | `change-me` | JWT validation secret |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *unset* | OpenTelemetry OTLP endpoint |
+| `S3_ENDPOINT` | *unset* | S3-compatible endpoint |
+| `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
+| `POD_NAME` | random UUID | Pod identity for NATS consumer naming |
 
 ## Pointers
 
-- **v2 plan:** `/Users/sienna/Development/sunbeam/.worktrees/feat-kanban/.omc/plans/kanban-plan-v2.md` (§Stage 7d references this).
-- **Addendum 1 (vite port, streaming, git mv):** `/Users/sienna/Development/sunbeam/.worktrees/feat-kanban/.omc/plans/kanban-plan-v2-addendum-1.md`.
-- **Mockup (UI/UX ground truth):** `/tmp/kanban-mockup-extracted/src/` (from Stage 0a salvage).
-- **beam-ui:** `https://src.sunbeam.pt/sunbeam/beam-ui` (JSR `@sunbeam/beam-ui`).
-- **g2v (auth + NATS + OTel):** `https://src.sunbeam.pt/sunbeam/sunbeam-g2v` (Cargo + npm).
 - **Workspace rules:** `/Users/sienna/Development/sunbeam/CLAUDE.md` (git hosting, deploy gates, testing policy).
+- **beam-ui:** `https://src.sunbeam.pt/sunbeam/beam-ui` (JSR `@sunbeam/beam-ui`).
+- **g2v:** `https://src.sunbeam.pt/sunbeam/sunbeam-g2v` (Cargo + npm; auth, NATS, OTel primitives).

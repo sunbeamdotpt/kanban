@@ -1,0 +1,2 @@
+[registries.sunbeam]
+index = "sparse+https://src.sunbeam.pt/api/packages/studio/cargo/"

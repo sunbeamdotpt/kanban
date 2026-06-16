@@ -1,0 +1,147 @@
+// proto/sunbeam/kanban/v1/forgejo.proto
+//
+// ForgejoLinkService links Kanban cards to Forgejo issues and PRs.
+// The server proxies Forgejo API calls using the caller's session token
+// (extracted from the JWT sub → Forgejo impersonation token provisioned via
+// the existing PAT mechanism in libs/sunbeam-g2v). State sync is display-only
+// in v1; auto-status updates are a v2 follow-up.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are performed by
+// the kanban-local `keto_dispatch` middleware. Object-id source is card_id or
+// link_id via `x-sunbeam-object-id`; see keto_dispatch.rs for details.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// ----------------------------------------------------------------------------
+// Messages
+// ----------------------------------------------------------------------------
+
+// ForgejoLink is the compact value type embedded in Card.forgejo_links for
+// board renders. Cards import this file to get this type. Stored fields
+// mirror what the FE needs inline on a card tile without a round-trip.
+message ForgejoLink {
+  string id = 1;            // ULID.
+  string repo = 2;          // "owner/repo" combined string.
+  int32 number = 3;         // PR/issue number.
+  // "open" | "closed" | "merged" | "draft"
+  string state = 4;
+  bool merged = 5;
+  google.protobuf.Timestamp last_synced_at = 6;
+}
+
+// ForgejoLinkDetail is the full server-side representation returned by
+// ForgejoLinkService RPCs. It extends the compact ForgejoLink with fields
+// needed for the link management UI (card_id, repo decomposition, kind,
+// title, url).
+message ForgejoLinkDetail {
+  string id = 1;
+  string card_id = 2;
+  string repo_owner = 3;
+  string repo_name = 4;
+  int32 issue_or_pr_number = 5;
+  // "issue" or "pull_request"
+  string kind = 6;
+  string title = 7;
+  // "open" | "closed"
+  string state = 8;
+  // Direct URL to the issue or PR on the Forgejo instance.
+  string url = 9;
+  google.protobuf.Timestamp last_synced_at = 10;
+}
+
+// ForgejoIssueResult is a search hit returned by SearchForgejoIssues.
+message ForgejoIssueResult {
+  string repo_owner = 1;
+  string repo_name = 2;
+  int32 number = 3;
+  string kind = 4;
+  string title = 5;
+  string state = 6;
+  string url = 7;
+}
+
+// ----------------------------------------------------------------------------
+// Request / response messages
+// ----------------------------------------------------------------------------
+
+message LinkIssueRequest {
+  string card_id = 1;
+  string repo_owner = 2;
+  string repo_name = 3;
+  int32 number = 4;
+}
+
+message UnlinkIssueRequest {
+  string link_id = 1;
+}
+
+message ListLinksByCardRequest {
+  string card_id = 1;
+}
+
+message ListLinksByCardResponse {
+  repeated ForgejoLinkDetail links = 1;
+}
+
+// SearchForgejoIssuesRequest proxies a search to the Forgejo API.
+// If repo_name is empty the search spans all repos owned by repo_owner.
+// Auth for the upstream Forgejo call is derived from the caller's SSO subject
+// (server uses the subject's impersonation token from Forgejo).
+message SearchForgejoIssuesRequest {
+  string repo_owner = 1;
+  // Optional; empty means all repos under repo_owner.
+  string repo_name = 2;
+  string query = 3;
+  // Maximum results to return; default 20, max 50.
+  int32 limit = 4;
+}
+
+message SearchForgejoIssuesResponse {
+  repeated ForgejoIssueResult results = 1;
+}
+
+message ResyncLinkRequest {
+  string link_id = 1;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+// ForgejoLinkService manages links between Kanban cards and Forgejo issues/PRs.
+//
+// All Forgejo API calls are server-side proxied using the caller's impersonation
+// token; the FE never talks to Forgejo directly. State sync is on-demand (manual
+// ResyncLink or on link creation); automatic webhook-driven sync is a v2 item.
+//
+// Auth: every RPC requires a valid bearer token. Link/Unlink requires "edit"
+// on the card's board. List/Search/Resync requires "view". See keto_dispatch.rs.
+service ForgejoLinkService {
+  // LinkIssue creates a ForgejoLink between a card and a Forgejo issue/PR.
+  // Performs an initial sync of title/state from Forgejo on creation.
+  // Emits ForgejoLinkAddedEvent on the board stream.
+  rpc LinkIssue(LinkIssueRequest) returns (ForgejoLinkDetail);
+
+  // UnlinkIssue removes the link. Does not close or modify the Forgejo issue.
+  rpc UnlinkIssue(UnlinkIssueRequest) returns (google.protobuf.Empty);
+
+  // ListLinksByCard returns all links for a card.
+  rpc ListLinksByCard(ListLinksByCardRequest) returns (ListLinksByCardResponse);
+
+  // SearchForgejoIssues proxies a search query to the Forgejo API.
+  // Results are not persisted; this is a live search for the link picker UI.
+  rpc SearchForgejoIssues(SearchForgejoIssuesRequest) returns (SearchForgejoIssuesResponse);
+
+  // ResyncLink re-fetches title/state from Forgejo and updates the record.
+  // Emits ForgejoLinkRefreshedEvent on the board stream.
+  rpc ResyncLink(ResyncLinkRequest) returns (ForgejoLinkDetail);
+}

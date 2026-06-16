@@ -86,8 +86,10 @@ fn main() {
 /// workspace root (`apps/kanban` → `apps` → workspace root).
 fn workspace_root() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR is set by Cargo at build time to the package
-    // directory (apps/kanban).  Walk upward until we find a directory that
-    // contains sunbeam.workspace.yaml — that is the monorepo root.
+    // directory. In the monorepo this is apps/kanban; in the split repo it
+    // is the repo root. Walk upward until we find a directory that contains
+    // sunbeam.workspace.yaml — that is the monorepo root. If not found,
+    // fall back to CARGO_MANIFEST_DIR when the proto dir exists there.
     let manifest: std::path::PathBuf = env!("CARGO_MANIFEST_DIR").into();
     let mut candidate = manifest.as_path();
 
@@ -95,18 +97,18 @@ fn workspace_root() -> std::path::PathBuf {
         if candidate.join("sunbeam.workspace.yaml").exists() {
             return candidate.to_path_buf();
         }
+        // Split-repo fallback: protos live directly under the package root.
+        if manifest.join("proto/sunbeam/kanban/v1").exists() {
+            return manifest.clone();
+        }
         match candidate.parent() {
             Some(p) => candidate = p,
             None => {
                 eprintln!(
-                    "keto-coverage: could not locate sunbeam.workspace.yaml; \
-                     falling back to CARGO_MANIFEST_DIR/../.."
+                    "keto-coverage: could not locate sunbeam.workspace.yaml or \
+                     local proto dir; falling back to CARGO_MANIFEST_DIR"
                 );
-                return manifest
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(&manifest)
-                    .to_path_buf();
+                return manifest;
             }
         }
     }

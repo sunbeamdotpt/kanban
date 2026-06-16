@@ -1,0 +1,407 @@
+// Sunbeam Kanban — Realtime event envelope and variants.
+//
+// This file is the canonical wire format for everything streamed over
+// `BoardService.SubscribeBoard` and `ProjectService.SubscribeProject`
+// (defined in Stage 1c). The envelope is stable across clients and
+// server pods; new event variants are added to the oneof at the next
+// free tag without breaking existing consumers.
+//
+// Depends on: cards.proto (Card value type), boards.proto (Column value type).
+//
+// ─── Resume-token contract ────────────────────────────────────────────
+// Clients send `nats_seq` of the last envelope they saw as `resume_from`
+// in the SubscribeBoard request. The server replays from JetStream
+// starting at `nats_seq + 1`. If the client has never connected, it
+// sends `0`: the server emits a snapshot (see "Cutover protocol" below)
+// and then attaches the live tail.
+//
+// If `resume_from` is older than JetStream's first available sequence
+// (retention horizon: 24h or 1M messages), the server returns
+// `OutOfRange` and the client must clear its token and refetch via
+// `GetBoard` + `BatchGetCards` before re-subscribing.
+//
+// ─── Cutover protocol ─────────────────────────────────────────────────
+// On a fresh subscription (or any time the server needs to deliver a
+// full snapshot), the server emits the current board state as a series
+// of synthetic envelopes:
+//   1. `ColumnAdded` per column, in column order.
+//   2. `CardCreated` per card, grouped by column in position order.
+//   All snapshot envelopes carry `nats_seq = 0` (the "replay envelope"
+//   sentinel). Their `event_id` values are still ULIDs and are used by
+//   clients for dedupe — replaying a snapshot is idempotent.
+//   3. A single `Cutover` envelope marking the end of the snapshot;
+//      `Cutover.last_replay_nats_seq` is the JetStream sequence the
+//      snapshot was taken at.
+//   4. Live JetStream events resume at `last_replay_nats_seq + 1`,
+//      each carrying its real `nats_seq`. Clients dedupe by
+//      `event_id` against the snapshot they already applied.
+//
+// ─── Conflict-resolution policy ───────────────────────────────────────
+// The server is authoritative. Client optimistic mutations carry an
+// `idempotency_key` (ULID) on the mutating RPC. Each `CardUpdated` /
+// `CardMoved` / `CardDeleted` envelope echoes that key in its
+// `idempotency_key` field. The pending-mutation queue (Tension 7 /
+// Pre-mortem 3) reconciles as follows:
+//
+//   * If the stream event's `idempotency_key` matches a pending
+//     mutation's key → the FE drops the pending mutation; UI does not
+//     snap (the optimistic state is now confirmed).
+//   * If a stream event arrives for the same `card_id` with a
+//     `new_revision` strictly greater than the FE's `confirmed_revision`
+//     and a *different* `idempotency_key` → the FE rolls back its
+//     optimistic state (or any later pending mutation that has not yet
+//     been confirmed) and applies the server payload. UI surfaces a
+//     toast for the user whose mutation lost.
+//   * If a stream event has `new_revision` ≤ confirmed_revision →
+//     ignore (out-of-order replay; already applied).
+//
+// ─── Heartbeat ────────────────────────────────────────────────────────
+// On quiet streams the server emits a `Heartbeat` envelope every 15s.
+// The FE treats >30s of silence (no Heartbeat, no event) as a
+// connection failure and reconnects, passing its last `nats_seq` as
+// `resume_from`. Heartbeats are not persisted to JetStream — they are
+// per-stream pings — so they always carry `nats_seq = 0`.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "sunbeam/kanban/v1/cards.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// Top-level envelope. Every realtime event sent over
+// `BoardService.SubscribeBoard` and `ProjectService.SubscribeProject`
+// is wrapped in this. The wire format is stable across client and
+// server; new event variants extend the oneof.
+message BoardEventEnvelope {
+  // Board this envelope belongs to. Set even on project-scoped events
+  // when a board context is implied; empty on project-only events.
+  string board_id = 1;
+  // ULID, server-allocated. Stable per logical event; clients dedupe by it.
+  string event_id = 2;
+  // JetStream sequence; clients use this as the resume token. `0` for
+  // snapshot replay envelopes and Heartbeats — see file header.
+  uint64 nats_seq = 3;
+  // Monotonic per board; advances even when no card changes (e.g. on
+  // BoardRenamed, MembershipChanged). Used by FE board-level cache busting.
+  uint64 board_revision = 4;
+  // Server wall-clock at emit time.
+  google.protobuf.Timestamp emitted_at = 5;
+  // Pod identifier, for tracing. Never used for authz.
+  string emitter_pod_id = 6;
+  // Who caused the event; "system" for compactor/reconcile/snapshot.
+  string actor_subject = 7;
+
+  oneof payload {
+    // ── Card events (10-19) ─────────────────────────────────────────────────
+    CardCreated card_created = 10;
+    CardUpdated card_updated = 11;
+    CardMoved card_moved = 12;
+    CardDeleted card_deleted = 13;
+    // ── Column events (14-20 already taken; continue at 21) ─────────────────
+    ColumnAdded column_added = 14;
+    ColumnRenamed column_renamed = 15;
+    ColumnRemoved column_removed = 16;
+    ColumnUpdated column_updated = 28;
+    ColumnsReordered columns_reordered = 29;
+    // ── Board events ─────────────────────────────────────────────────────────
+    BoardRenamed board_renamed = 17;
+    BoardUpdated board_updated = 30;
+    // ── Membership ───────────────────────────────────────────────────────────
+    MembershipChanged membership_changed = 18;
+    MemberAdded member_added = 31;
+    MemberRemoved member_removed = 32;
+    MemberRoleChanged member_role_changed = 33;
+    // ── Project events ───────────────────────────────────────────────────────
+    BoardCreated board_created = 34;
+    BoardDeleted board_deleted = 35;
+    ProjectUpdated project_updated = 36;
+    // ── Card detail events ───────────────────────────────────────────────────
+    ChecklistUpdated checklist_updated = 37;
+    CommentAdded comment_added = 38;
+    CommentEdited comment_edited = 39;
+    CommentDeleted comment_deleted = 40;
+    AttachmentAdded attachment_added = 41;
+    AttachmentDeleted attachment_deleted = 42;
+    ForgejoLinkAdded forgejo_link_added = 43;
+    ForgejoLinkRefreshed forgejo_link_refreshed = 44;
+    // ── Stream control ───────────────────────────────────────────────────────
+    Heartbeat heartbeat = 19;
+    Cutover cutover = 20;
+  }
+}
+
+// Emitted on `CardService.CreateCard` success and during snapshot replay.
+// `card.column_id` and `position` are echoed at the envelope level for
+// reducer convenience (the FE often routes by column without unpacking
+// the Card proto).
+message CardCreated {
+  Card card = 1;
+  string column_id = 2;
+  int32 position = 3;
+  // Echoes the originating mutation's idempotency key (ULID). Empty on
+  // snapshot replay and on system-emitted cards.
+  string idempotency_key = 4;
+}
+
+// Emitted on any non-positional card mutation (title, description,
+// labels, assignees, checklist, priority, due, blocked, cover,
+// milestone, comments_count, attachments_count, forgejo_links).
+// Carries a sparse patch instead of the full Card to keep envelope
+// size small — clients merge into their cached Card by `card_id`.
+//
+// Per conflict-resolution policy: `prev_revision` is the revision the
+// server saw before the mutation; `new_revision` is the revision after.
+// Clients drop the event when `new_revision ≤ confirmed_revision`.
+//
+// `patch` is a `google.protobuf.Struct` whose top-level keys are Card
+// field names that changed. The key `revision` is always present and
+// equals `new_revision` (encoded as a JSON number for transport
+// uniformity). Unchanged fields are absent.
+message CardUpdated {
+  string card_id = 1;
+  uint64 prev_revision = 2;
+  uint64 new_revision = 3;
+  google.protobuf.Struct patch = 4;
+  string idempotency_key = 5;
+}
+
+// Emitted on `CardService.MoveCard`. Position changes within a column
+// are also `CardMoved` events with `from_column == to_column`.
+//
+// `to_position` is the authoritative server-resolved position after
+// the move. Optimistic UIs may have computed a different position
+// locally; clients reconcile by replacing their position with this one.
+message CardMoved {
+  string card_id = 1;
+  string from_column = 2;
+  string to_column = 3;
+  int32 to_position = 4;
+  uint64 prev_revision = 5;
+  uint64 new_revision = 6;
+  string idempotency_key = 7;
+}
+
+// Emitted on `CardService.DeleteCard`. Once delivered, clients drop the
+// card from all caches. The `prev_revision` is the last revision the
+// server knew about — clients can use it to discard any in-flight
+// optimistic mutation against the same card without rollback flicker.
+message CardDeleted {
+  string card_id = 1;
+  uint64 prev_revision = 2;
+  string idempotency_key = 3;
+}
+
+// ── Local value types (avoid circular import with boards.proto) ───────────────
+
+// Minimal column snapshot carried inside event envelopes. Mirrors the fields
+// of `boards.proto:Column` that clients need for rendering without creating
+// a circular import (events.proto ← boards.proto ← events.proto).
+message EventColumn {
+  string id = 1;
+  string board_id = 2;
+  string title = 3;
+  string accent = 4;
+  int32 wip_limit = 5;
+  int32 position = 6;
+}
+
+// Minimal board snapshot carried inside event envelopes. Mirrors
+// `boards.proto:Board` fields needed by the FE.
+message EventBoard {
+  string id = 1;
+  string project_id = 2;
+  string name = 3;
+  string description = 4;
+  string icon = 5;
+}
+
+// ── Column events ─────────────────────────────────────────────────────────────
+
+// Emitted on `BoardService.AddColumn` and during snapshot replay.
+message ColumnAdded {
+  EventColumn column = 1;
+  int32 position = 2;
+}
+
+// Emitted on `BoardService.RenameColumn`. Renames carry only the new
+// title; clients merge into their cached Column by `column_id`.
+message ColumnRenamed {
+  string column_id = 1;
+  string new_title = 2;
+}
+
+// Emitted on `BoardService.RemoveColumn`. Server policy is **never
+// destructive**: cards in the removed column are reflowed to
+// `move_cards_to_column` (always populated, always a sibling column
+// id). Clients should not need to issue follow-up `CardMoved` events
+// — the server emits one `CardMoved` per affected card *before* this
+// envelope, so the column is empty by the time the client sees the
+// removal.
+message ColumnRemoved {
+  string column_id = 1;
+  string move_cards_to_column = 2;
+}
+
+// Emitted on `BoardService.RenameBoard`. Carries only the new name;
+// clients merge by the envelope's `board_id`.
+message BoardRenamed {
+  string new_name = 1;
+}
+
+// Emitted when a Keto tuple mutation (grant or revoke) on the board's
+// project succeeds. `relation` is the Keto relation string
+// (e.g. "viewers", "editors", "admins", "owners"). Causes the FE to
+// re-evaluate visibility — denied subjects close their stream on the
+// next per-yield Keto recheck (Pre-mortem 4 / MF-2).
+message MembershipChanged {
+  string subject = 1;
+  string relation = 2;
+  bool granted = 3;
+}
+
+// Emitted every 15s on quiet streams. Carries server wall-clock so
+// clients can detect skew. Not persisted to JetStream;
+// `nats_seq == 0` for all heartbeats.
+message Heartbeat {
+  uint64 server_time_ms = 1;
+}
+
+// Marks the end of snapshot replay and the start of live tail. The FE
+// uses `last_replay_nats_seq` to set its initial resume token after a
+// fresh subscription. See file header "Cutover protocol".
+message Cutover {
+  uint64 last_replay_nats_seq = 1;
+}
+
+// ── Column variants (migrated from boards.proto BoardEvent) ──────────────────
+
+// Emitted when a column's title, accent, or wip_limit changes (non-positional).
+message ColumnUpdated {
+  EventColumn column = 1;
+}
+
+// Emitted when columns are reordered within a board (MoveColumn).
+// The full ordered list is sent so clients can replace their column order
+// without tracking diffs.
+message ColumnsReordered {
+  repeated EventColumn columns = 1;
+}
+
+// ── Board variants ────────────────────────────────────────────────────────────
+
+// Emitted when non-name board fields change (icon, description).
+// Distinct from BoardRenamed which carries only the new name.
+message BoardUpdated {
+  EventBoard board = 1;
+}
+
+// ── Membership variants (migrated from projects.proto ProjectEvent) ───────────
+
+// Emitted when a new member is added to a project. Fields mirror
+// ProjectMember to avoid a circular import with projects.proto.
+message MemberAdded {
+  string project_id = 1;
+  string subject = 2;
+  // Keto relation: "owner" | "administer" | "edit" | "view".
+  string relation = 3;
+  string display_name = 4;
+  string email = 5;
+}
+
+// Emitted when a member is removed from a project.
+message MemberRemoved {
+  string project_id = 1;
+  string subject = 2;
+}
+
+// Emitted when a member's role on a project changes.
+message MemberRoleChanged {
+  string project_id = 1;
+  string subject = 2;
+  string old_relation = 3;
+  string new_relation = 4;
+}
+
+// ── Project-level board lifecycle variants ────────────────────────────────────
+
+// Emitted on BoardService.CreateBoard success.
+message BoardCreated {
+  string project_id = 1;
+  string board_id = 2;
+  string name = 3;
+}
+
+// Emitted on BoardService.DeleteBoard success.
+message BoardDeleted {
+  string project_id = 1;
+  string board_id = 2;
+}
+
+// Emitted when non-streaming project fields change (name, prefix, description).
+// Fields mirror Project to avoid a circular import with projects.proto.
+message ProjectUpdated {
+  string project_id = 1;
+  string name = 2;
+  string prefix = 3;
+  string description = 4;
+}
+
+// ── Card detail variants (migrated from boards.proto BoardEvent) ──────────────
+
+// Emitted when a card's checklist completion changes.
+message ChecklistUpdated {
+  string card_id = 1;
+  int32 done = 2;
+  int32 total = 3;
+}
+
+// Emitted when a comment is added to a card.
+message CommentAdded {
+  string card_id = 1;
+  string comment_id = 2;
+  string author_sub = 3;
+}
+
+// Emitted when a comment body is edited.
+message CommentEdited {
+  string card_id = 1;
+  string comment_id = 2;
+}
+
+// Emitted when a comment is deleted.
+message CommentDeleted {
+  string card_id = 1;
+  string comment_id = 2;
+}
+
+// Emitted when an attachment is added to a card.
+message AttachmentAdded {
+  string card_id = 1;
+  string attachment_id = 2;
+  string filename = 3;
+}
+
+// Emitted when an attachment is deleted from a card.
+message AttachmentDeleted {
+  string card_id = 1;
+  string attachment_id = 2;
+}
+
+// Emitted when a Forgejo issue is linked to a card.
+message ForgejoLinkAdded {
+  string card_id = 1;
+  string link_id = 2;
+}
+
+// Emitted when a Forgejo issue link is refreshed (state change, title update).
+message ForgejoLinkRefreshed {
+  string card_id = 1;
+  string link_id = 2;
+  string new_state = 3;
+}

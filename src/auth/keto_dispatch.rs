@@ -950,7 +950,7 @@ mod tests {
     pub(crate) fn expected_methods_from_protos() -> HashSet<String> {
         let proto_dir = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../proto/sunbeam/kanban/v1"
+            "/proto/sunbeam/kanban/v1"
         );
 
         let mut methods = HashSet::new();

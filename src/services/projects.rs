@@ -500,10 +500,13 @@ impl ProjectService for ProjectServiceImpl {
 
         // Delete Keto tuple for the known relation.
         if let Some(ref relation) = existing_role {
-            if let Err(e) = self
-                .keto
-                .delete_relation_tuples(KETO_NS, Some(relation.as_str()), Some(&req.subject))
-                .await
+            if let Err(e) = crate::auth::keto_compat::delete_relation_tuples(
+                &self.keto,
+                KETO_NS,
+                Some(relation.as_str()),
+                Some(&req.subject),
+            )
+            .await
             {
                 warn!(
                     error = %e,
@@ -657,9 +660,13 @@ mod tests {
     /// Clean up Keto tuples seeded for a test subject across all relations.
     async fn cleanup_keto_for_subject(keto: &KetoClient, subject: &str) {
         for relation in &["owner", "view", "edit", "manage", "administer"] {
-            let _ = keto
-                .delete_relation_tuples(KETO_NS, Some(relation), Some(subject))
-                .await;
+            let _ = crate::auth::keto_compat::delete_relation_tuples(
+                keto,
+                KETO_NS,
+                Some(relation),
+                Some(subject),
+            )
+            .await;
         }
     }
 

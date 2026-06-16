@@ -514,9 +514,14 @@ mod tests {
 
         // Teardown
         os.delete_index(&index).await.ok();
-        keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject))
-            .await
-            .ok();
+        crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject),
+        )
+        .await
+        .ok();
     }
 
     // ── Test: filter by project_id ────────────────────────────────────────────
@@ -685,9 +690,14 @@ mod tests {
 
         // Teardown
         os.delete_index(&index).await.ok();
-        keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject))
-            .await
-            .ok();
+        crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject),
+        )
+        .await
+        .ok();
     }
 
     // ── Test: pagination via search_after cursor ──────────────────────────────

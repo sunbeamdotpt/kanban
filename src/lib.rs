@@ -1,7 +1,9 @@
 //! Kanban service library.
+#![recursion_limit = "512"]
 
 pub mod auth;
 pub mod integrations;
+pub mod keto_proto;
 pub mod pb;
 pub mod realtime;
 pub mod server;

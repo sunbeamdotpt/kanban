@@ -1,0 +1,131 @@
+// proto/sunbeam/kanban/v1/attachments.proto
+//
+// AttachmentService brokers SeaweedFS presigned URLs for card file uploads
+// and downloads. The server generates pre-signed S3-compatible URLs using
+// SigV4 (pure-Rust, ported from apps/kanban-old/server/s3-presign.ts).
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are performed
+// by the kanban-local `keto_dispatch` middleware defined in
+// `apps/kanban/src/auth/keto_dispatch.rs`. Object-id source is card_id via
+// the `x-sunbeam-object-id` header; see the dispatch matrix for details.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// ----------------------------------------------------------------------------
+// Messages
+// ----------------------------------------------------------------------------
+
+// Attachment records metadata for a file uploaded to SeaweedFS.
+message Attachment {
+  string id = 1;
+  string card_id = 2;
+  // SeaweedFS object key, e.g. "kanban/cards/{card_id}/{attachment_id}/{filename}".
+  string s3_key = 3;
+  string filename = 4;
+  string mime_type = 5;
+  int64 size_bytes = 6;
+  // SSO subject of the uploader.
+  string uploaded_by = 7;
+  google.protobuf.Timestamp uploaded_at = 8;
+}
+
+// ----------------------------------------------------------------------------
+// Request / response messages
+// ----------------------------------------------------------------------------
+
+// RequestPresignedUploadRequest initiates a client-side upload.
+// The server validates the card exists and the caller has "edit" permission,
+// then mints a SigV4-signed PUT URL targeting SeaweedFS.
+message RequestPresignedUploadRequest {
+  string card_id = 1;
+  string filename = 2;
+  string mime_type = 3;
+  // Size in bytes; used for Content-Length validation.
+  int64 size_bytes = 4;
+}
+
+message RequestPresignedUploadResponse {
+  // SigV4-signed PUT URL. Valid for 15 minutes.
+  string presigned_url = 1;
+  string s3_key = 2;
+  // Attachment record created in "pending" state; confirmed via ConfirmUpload.
+  string attachment_id = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// ConfirmUploadRequest transitions an attachment from "pending" to "confirmed"
+// after the client has successfully PUT the file to the presigned URL.
+// The server verifies the object exists in SeaweedFS (HEAD request) before
+// confirming.
+message ConfirmUploadRequest {
+  string attachment_id = 1;
+}
+
+// RequestPresignedDownloadRequest mints a time-limited GET URL.
+message RequestPresignedDownloadRequest {
+  string attachment_id = 1;
+}
+
+message RequestPresignedDownloadResponse {
+  // SigV4-signed GET URL.
+  string presigned_url = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+message DeleteAttachmentRequest {
+  string attachment_id = 1;
+}
+
+message ListAttachmentsByCardRequest {
+  string card_id = 1;
+}
+
+message ListAttachmentsByCardResponse {
+  repeated Attachment attachments = 1;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+// AttachmentService manages file attachments on cards via SeaweedFS presigned
+// URLs.
+//
+// Upload flow:
+//   1. Client calls RequestPresignedUpload → receives presigned_url + attachment_id.
+//   2. Client PUTs the file to presigned_url directly (browser → SeaweedFS).
+//   3. Client calls ConfirmUpload(attachment_id) → server verifies HEAD + marks confirmed.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks use the card's
+// parent KanbanBoard object. Download requires "view"; upload/delete requires
+// "edit". See keto_dispatch.rs for the full matrix.
+service AttachmentService {
+  // RequestPresignedUpload creates a pending attachment record and returns a
+  // SigV4-signed PUT URL valid for 15 minutes. Requires "edit" on the card's
+  // board.
+  rpc RequestPresignedUpload(RequestPresignedUploadRequest) returns (RequestPresignedUploadResponse);
+
+  // ConfirmUpload transitions the attachment to confirmed state after the
+  // client PUT succeeds. Emits AttachmentAddedEvent on the board stream.
+  rpc ConfirmUpload(ConfirmUploadRequest) returns (Attachment);
+
+  // RequestPresignedDownload mints a time-limited GET URL. Requires "view".
+  rpc RequestPresignedDownload(RequestPresignedDownloadRequest) returns (RequestPresignedDownloadResponse);
+
+  // DeleteAttachment removes the attachment record and the SeaweedFS object.
+  // Requires "edit" on the card's board.
+  rpc DeleteAttachment(DeleteAttachmentRequest) returns (google.protobuf.Empty);
+
+  // ListAttachmentsByCard returns all confirmed attachments for a card.
+  // Requires "view" on the card's board.
+  rpc ListAttachmentsByCard(ListAttachmentsByCardRequest) returns (ListAttachmentsByCardResponse);
+}

@@ -1,0 +1,191 @@
+// proto/sunbeam/kanban/v1/boards.proto
+//
+// Auth: every RPC in BoardService requires a valid bearer token. Keto checks
+// are performed by the kanban-local `keto_dispatch` middleware defined in
+// `apps/kanban/src/auth/keto_dispatch.rs`. The per-RPC Keto object is sourced
+// from the `x-sunbeam-object-id` request header for body-bearing RPCs and from
+// the `board_id` query param for streaming RPCs; see the dispatch matrix for
+// the authoritative mapping.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "sunbeam/kanban/v1/events.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// ----------------------------------------------------------------------------
+// Messages
+// ----------------------------------------------------------------------------
+
+// Column is a vertical swim-lane within a board.
+// Stage 1b authors the canonical Card and Column messages in cards.proto.
+// This file defines Column locally for BoardService until cards.proto lands.
+// TODO(1b): once cards.proto is merged, remove this definition and import
+//           cards.proto instead; update BoardService to use that Column.
+message Column {
+  string id = 1;
+  string board_id = 2;
+  string title = 3;
+  // CSS color token for the column header accent, e.g. "orange" | "rust".
+  string accent = 4;
+  // WIP limit; 0 means no limit.
+  int32 wip_limit = 5;
+  // 1-based position within the board.
+  int32 position = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// Board groups columns and cards within a project.
+message Board {
+  string id = 1;
+  string project_id = 2;
+  string name = 3;
+  string description = 4;
+  // Icon identifier from the Sunbeam icon set.
+  string icon = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  // Denormalized counts for list views; exact data via GetBoard.
+  int32 columns_count = 8;
+  int32 cards_count = 9;
+}
+
+// BoardDetail includes the full column list.
+message BoardDetail {
+  Board board = 1;
+  repeated Column columns = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Request / response messages
+// ----------------------------------------------------------------------------
+
+message CreateBoardRequest {
+  string project_id = 1;
+  string name = 2;
+  string description = 3;
+  string icon = 4;
+  // ULID for idempotency.
+  string idempotency_key = 5;
+}
+
+message GetBoardRequest {
+  string board_id = 1;
+}
+
+message ListBoardsRequest {
+  string project_id = 1;
+}
+
+message ListBoardsResponse {
+  repeated Board boards = 1;
+}
+
+message UpdateBoardRequest {
+  string board_id = 1;
+  Board board = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message DeleteBoardRequest {
+  string board_id = 1;
+}
+
+message AddColumnRequest {
+  string board_id = 1;
+  string title = 2;
+  string accent = 3;
+  int32 wip_limit = 4;
+  // Position to insert at; 0 means append.
+  int32 position = 5;
+  string idempotency_key = 6;
+}
+
+message UpdateColumnRequest {
+  string board_id = 1;
+  string column_id = 2;
+  Column column = 3;
+  google.protobuf.FieldMask update_mask = 4;
+}
+
+message RemoveColumnRequest {
+  string board_id = 1;
+  string column_id = 2;
+}
+
+// MoveColumnRequest reorders a column within the board.
+// The server recalculates gap-filled positions for all columns.
+message MoveColumnRequest {
+  string board_id = 1;
+  string column_id = 2;
+  // 1-based target position.
+  int32 to_position = 3;
+}
+
+message MoveColumnResponse {
+  // Full updated column list in final order.
+  repeated Column columns = 1;
+}
+
+// SubscribeBoardRequest streams board-level events. since_seq is a JetStream
+// sequence number resume token; omit for live-tail. If since_seq refers to a
+// position that has been evicted from JetStream retention, the server returns
+// OutOfRange and the client must refetch via GetBoard + BatchGetCards.
+message SubscribeBoardRequest {
+  string board_id = 1;
+  // Optional JetStream sequence number to resume from (MF-6 resume protocol).
+  uint64 since_seq = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+// BoardService manages Kanban boards, columns, and board-level streaming.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are performed
+// by `keto_dispatch` middleware. Object-id sources are documented in the
+// dispatch matrix at `apps/kanban/src/auth/keto_dispatch.rs`.
+service BoardService {
+  // ListBoards returns boards in the given project the caller can view.
+  rpc ListBoards(ListBoardsRequest) returns (ListBoardsResponse);
+
+  // GetBoard returns the board with its full column list but without card
+  // bodies — use BatchGetCards (CardService) to hydrate cards.
+  rpc GetBoard(GetBoardRequest) returns (BoardDetail);
+
+  // CreateBoard requires "edit" on the parent project.
+  rpc CreateBoard(CreateBoardRequest) returns (Board);
+
+  // UpdateBoard requires "edit" on the board (KanbanBoard namespace).
+  rpc UpdateBoard(UpdateBoardRequest) returns (Board);
+
+  // DeleteBoard requires "administer" on the board.
+  rpc DeleteBoard(DeleteBoardRequest) returns (google.protobuf.Empty);
+
+  // AddColumn requires "edit" on the board.
+  rpc AddColumn(AddColumnRequest) returns (Column);
+
+  // UpdateColumn requires "edit" on the board.
+  rpc UpdateColumn(UpdateColumnRequest) returns (Column);
+
+  // RemoveColumn requires "administer" on the board.
+  rpc RemoveColumn(RemoveColumnRequest) returns (google.protobuf.Empty);
+
+  // MoveColumn reorders a column within its board. Requires "edit".
+  rpc MoveColumn(MoveColumnRequest) returns (MoveColumnResponse);
+
+  // SubscribeBoard streams board events over a server-streaming ConnectRPC
+  // call. JWT checked per-yield; Keto rechecked every 30s or on Heartbeat
+  // (whichever sooner). Per the MF-6 resume protocol, since_seq=0 means
+  // live-tail; non-zero triggers JetStream replay from that sequence.
+  rpc SubscribeBoard(SubscribeBoardRequest) returns (stream BoardEventEnvelope);
+}

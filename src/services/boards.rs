@@ -1109,7 +1109,13 @@ mod tests {
         }
 
         // Cleanup Keto tuple.
-        let _ = keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject_str)).await;
+        let _ = crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject_str),
+        )
+        .await;
     }
 
     /// After subscribing, a live JetStream event published for the board must
@@ -1189,7 +1195,13 @@ mod tests {
 
         assert_eq!(received.event_id, live_event_id);
 
-        let _ = keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject_str)).await;
+        let _ = crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject_str),
+        )
+        .await;
     }
 
     /// An event whose event_id was emitted during replay must be deduped when
@@ -1261,7 +1273,13 @@ mod tests {
             other => panic!("expected Heartbeat, got {other:?}"),
         }
 
-        let _ = keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject_str)).await;
+        let _ = crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject_str),
+        )
+        .await;
     }
 
     /// When the subject's logout watermark is signalled, the stream must close
@@ -1342,7 +1360,13 @@ mod tests {
             "expected Unauthenticated when token revoked, got {err:?}"
         );
 
-        let _ = keto.delete_relation_tuples("KanbanBoard", Some("view"), Some(&subject_str)).await;
+        let _ = crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject_str),
+        )
+        .await;
     }
 
     /// When Keto revokes the subject's view permission mid-stream, the stream
@@ -1401,9 +1425,13 @@ mod tests {
         // Revoke the Keto tuple after 200ms.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = keto_clone
-                .delete_relation_tuples("KanbanBoard", Some("view"), Some(&sub_clone))
-                .await;
+            let _ = crate::auth::keto_compat::delete_relation_tuples(
+                &keto_clone,
+                "KanbanBoard",
+                Some("view"),
+                Some(&sub_clone),
+            )
+            .await;
         });
 
         // The stream should close with PermissionDenied within 3s (recheck fires at 1s).
@@ -1425,9 +1453,13 @@ mod tests {
             "expected PermissionDenied when Keto revokes, got {err:?}"
         );
 
-        let _ = keto
-            .delete_relation_tuples("KanbanBoard", Some("view"), Some(&board_id_clone))
-            .await;
+        let _ = crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&board_id_clone),
+        )
+        .await;
     }
 
     // ── Test env config ──────────────────────────────────────────────────────

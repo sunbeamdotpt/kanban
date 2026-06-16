@@ -1,0 +1,165 @@
+// proto/sunbeam/kanban/v1/projects.proto
+//
+// Auth: every RPC in ProjectService except WhoAmI (which lives in AuthService)
+// requires a valid bearer token. Keto checks are performed by the kanban-local
+// `keto_dispatch` middleware defined in
+// `apps/kanban/src/auth/keto_dispatch.rs`. The per-RPC Keto object is sourced
+// from the `x-sunbeam-object-id` request header for body-bearing RPCs and from
+// the `project_id` path/query param for streaming RPCs; see the dispatch matrix
+// in `keto_dispatch.rs` for the authoritative mapping.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "sunbeam/kanban/v1/events.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// ----------------------------------------------------------------------------
+// Messages
+// ----------------------------------------------------------------------------
+
+// Project is a top-level workspace for boards, cards, and members.
+message Project {
+  // Immutable ULID assigned at creation.
+  string id = 1;
+  string name = 2;
+  // Short uppercase prefix used for card refs, e.g. "BEAM", "SOL".
+  string prefix = 3;
+  // Icon identifier from the Sunbeam icon set.
+  string icon = 4;
+  // CSS color token or hex string for the project accent.
+  string color = 5;
+  string description = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  // Denormalized count — exact value via ListMembers.
+  int32 member_count = 9;
+}
+
+// ProjectMember pairs an SSO subject with a relation on the project.
+message ProjectMember {
+  string project_id = 1;
+  // Hydra/Kratos subject string (e.g. "user:abc123").
+  string subject = 2;
+  // Keto relation name: "owner" | "administer" | "edit" | "view" | "blocked".
+  string relation = 3;
+  string display_name = 4;
+  string email = 5;
+  google.protobuf.Timestamp added_at = 6;
+}
+
+// ----------------------------------------------------------------------------
+// Request / response messages
+// ----------------------------------------------------------------------------
+
+message CreateProjectRequest {
+  string name = 1;
+  string prefix = 2;
+  string icon = 3;
+  string color = 4;
+  string description = 5;
+  // ULID for idempotency.
+  string idempotency_key = 6;
+}
+
+message GetProjectRequest {
+  string project_id = 1;
+}
+
+// ListProjectsRequest has no fields: the server derives the subject from the
+// JWT and calls keto_expand_objects(KanbanProject, view, subject) to return
+// only projects the caller can see. One Keto round-trip, not N.
+message ListProjectsRequest {}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+}
+
+message UpdateProjectRequest {
+  string project_id = 1;
+  // Partial update; only fields named in update_mask are applied.
+  Project project = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message DeleteProjectRequest {
+  string project_id = 1;
+}
+
+message ListMembersRequest {
+  string project_id = 1;
+}
+
+message ListMembersResponse {
+  repeated ProjectMember members = 1;
+}
+
+// AddMemberRequest — caller must hold "administer" on the project (enforced by
+// keto_dispatch). Writes a Keto tuple KanbanProject:{project_id}#{relation}@User:{subject}.
+message AddMemberRequest {
+  string project_id = 1;
+  string subject = 2;
+  // Keto relation to grant: "administer" | "edit" | "view".
+  string relation = 3;
+}
+
+message RemoveMemberRequest {
+  string project_id = 1;
+  string subject = 2;
+}
+
+// SubscribeProjectRequest — streams project-level events (membership changes,
+// board list changes). since_seq is a JetStream sequence number resume token;
+// omit for live-tail only.
+message SubscribeProjectRequest {
+  string project_id = 1;
+  // Optional JetStream sequence number to resume from.
+  uint64 since_seq = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+// ProjectService manages Kanban projects and their membership.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are
+// performed by `keto_dispatch` middleware. The object-id source for each
+// RPC is documented in the dispatch matrix at
+// `apps/kanban/src/auth/keto_dispatch.rs`.
+service ProjectService {
+  // ListProjects returns only projects the caller can view, using
+  // keto_expand_objects(KanbanProject, view, subject) — one Keto round-trip.
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+
+  rpc GetProject(GetProjectRequest) returns (Project);
+
+  // CreateProject requires no prior Keto object (the caller becomes owner).
+  rpc CreateProject(CreateProjectRequest) returns (Project);
+
+  // UpdateProject requires "administer" on the project.
+  rpc UpdateProject(UpdateProjectRequest) returns (Project);
+
+  // DeleteProject requires "owner" relation on the project.
+  rpc DeleteProject(DeleteProjectRequest) returns (google.protobuf.Empty);
+
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+
+  // AddMember requires "administer" relation. Writes Keto tuple atomically
+  // with the project_member_view mirror row.
+  rpc AddMember(AddMemberRequest) returns (google.protobuf.Empty);
+
+  // RemoveMember requires "administer" relation. Removes Keto tuple.
+  rpc RemoveMember(RemoveMemberRequest) returns (google.protobuf.Empty);
+
+  // SubscribeProject streams project-level events. Cadence: JWT checked
+  // per-yield; Keto rechecked every 30s or on Heartbeat (whichever sooner).
+  rpc SubscribeProject(SubscribeProjectRequest) returns (stream BoardEventEnvelope);
+}

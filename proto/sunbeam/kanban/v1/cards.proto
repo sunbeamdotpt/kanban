@@ -1,0 +1,348 @@
+// Sunbeam Kanban — Card value type and supporting enums/messages.
+//
+// This file defines the structural shapes carried by realtime events
+// (`events.proto`) and CRUD RPCs (`CardService`, authored in Stage 1c).
+// The canonical `Column` message lives in `boards.proto` (authored in
+// Stage 1c); events.proto imports Column from there. cards.proto owns
+// Card and Card-only value types (Label, Assignee, ChecklistItem,
+// MilestoneRef, ForgejoLink).
+//
+// Field-numbering policy: every field is reserved for life. Add new fields
+// at the next free tag. Never reuse a tag. Never change a type.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "sunbeam/kanban/v1/forgejo.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// Priority is a small fixed enum. The mockup wires four levels.
+enum CardPriority {
+  CARD_PRIORITY_UNSPECIFIED = 0;
+  CARD_PRIORITY_LOW = 1;
+  CARD_PRIORITY_MEDIUM = 2;
+  CARD_PRIORITY_HIGH = 3;
+  CARD_PRIORITY_URGENT = 4;
+}
+
+// Label catalog entry, scoped to a project. Stored in `labels` table.
+message Label {
+  string id = 1;            // ULID.
+  string project_id = 2;    // ULID.
+  string name = 3;
+  // Style token name, resolved client-side against beam-ui dark tokens.
+  // Free-form string; never a hex code (per feedback_dark_palette_beam_ui_only).
+  string style = 4;
+}
+
+// Assignee is a Hydra subject (sub claim) plus a presentational hint.
+// The hint is best-effort cache from Kratos; clients refetch on stale.
+message Assignee {
+  string subject = 1;       // OIDC sub.
+  string display_name = 2;  // optional cache; may be empty.
+  string avatar_url = 3;    // optional cache; may be empty.
+}
+
+// ForgejoLink lives in forgejo.proto (Stage 1c) — imported above.
+
+// One checklist item on a card.
+message ChecklistItem {
+  string id = 1;            // ULID, stable across edits.
+  string text = 2;
+  bool done = 3;
+  // Position within the checklist; stable, fractional indexing not used —
+  // server reorders by reissuing the whole array.
+  int32 position = 4;
+}
+
+// Milestone reference. The mockup shows the title only; full metadata
+// (due, completion %) is fetched separately via MilestoneService.
+message MilestoneRef {
+  string id = 1;            // ULID.
+  string title = 2;
+  google.protobuf.Timestamp due = 3;  // optional; zero when unset.
+}
+
+// Card — the core unit of work.
+//
+// `revision` is the optimistic-concurrency token (Tension 7 / Pre-mortem 3).
+// Bumped server-side on every UPDATE. The pending-mutation queue on the FE
+// matches stream events to in-flight mutations by `revision` + idempotency
+// key; the FE never trusts a payload whose `revision` is ≤ confirmed.
+message Card {
+  string id = 1;                  // ULID.
+  string project_id = 2;          // ULID.
+  string board_id = 3;            // ULID.
+  string column_id = 4;           // ULID. Echoes current placement; CardMoved is the source of truth on motion.
+  // Human-facing reference (e.g. "BEAM-204"). Immutable for life of the card.
+  // Allocated via project_ref_counter (v2 §478). Stage 1c CardService.CreateCard owns this.
+  string ref = 5;
+  string title = 6;
+  string description = 7;          // markdown.
+  CardPriority priority = 8;
+  google.protobuf.Timestamp due = 9;        // optional.
+  google.protobuf.Timestamp completed_at = 10;  // null while open.
+  bool blocked = 11;
+  // Cover is a beam-ui gradient/asset token (e.g. "gradient.amber",
+  // "image:s3://...") — resolved client-side. Never a raw hex.
+  string cover = 12;
+  string milestone_id = 13;        // optional ULID; resolved separately.
+  // Position within column. Server uses fractional ordering internally;
+  // exposed to clients as int32 with the understanding that CardMoved
+  // events carry the authoritative new position.
+  int32 position = 14;
+  // Repeated value types embedded for one-shot board renders.
+  repeated Label labels = 15;
+  repeated Assignee assignees = 16;
+  repeated ChecklistItem checklist = 17;
+  repeated ForgejoLink forgejo_links = 18;
+  // Counts only; full lists fetched on demand.
+  int32 comments_count = 19;
+  int32 attachments_count = 20;
+  // Optimistic-concurrency revision (MF-3 / Tension 7). Monotonic per card.
+  uint64 revision = 21;
+  google.protobuf.Timestamp created_at = 22;
+  google.protobuf.Timestamp updated_at = 23;
+}
+
+// Column lives in boards.proto (Stage 1c) — see file header.
+
+// Comment on a card. Stored in the `card_comments` table.
+message Comment {
+  string id = 1;            // ULID.
+  string card_id = 2;       // ULID.
+  string author_sub = 3;    // OIDC subject.
+  string body = 4;          // markdown.
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// ============================================================================
+// Request / response messages — CardService (Stage 1c)
+// ============================================================================
+
+message GetCardRequest {
+  string card_id = 1;
+}
+
+message BatchGetCardsRequest {
+  string board_id = 1;
+  repeated string card_ids = 2;
+}
+
+message BatchGetCardsResponse {
+  repeated Card cards = 1;
+}
+
+message ListCardsByBoardRequest {
+  string board_id = 1;
+  // Optional column filter; empty means all columns.
+  string column_id = 2;
+  // Opaque pagination cursor; empty for first page.
+  string cursor = 3;
+  // Max cards per page; default 50, max 200.
+  int32 limit = 4;
+}
+
+message ListCardsByBoardResponse {
+  repeated Card cards = 1;
+  string next_cursor = 2;
+}
+
+message CreateCardRequest {
+  string board_id = 1;
+  string column_id = 2;
+  string title = 3;
+  string description = 4;     // markdown; optional.
+  CardPriority priority = 5;
+  google.protobuf.Timestamp due = 6;
+  string milestone_id = 7;    // optional ULID.
+  // 1-based target position within the column; 0 means append.
+  int32 position = 8;
+  // ULID — required. Server stores for 24h idempotency.
+  string idempotency_key = 9;
+}
+
+message UpdateCardRequest {
+  string card_id = 1;
+  // Sparse patch — only fields named in update_mask are applied.
+  Card card = 2;
+  google.protobuf.FieldMask update_mask = 3;
+  // ULID — required. Server stores for 24h idempotency.
+  string idempotency_key = 4;
+}
+
+// MoveCardRequest — same-project moves only. Cross-project moves return
+// Unimplemented (MF-3: card refs are immutable and project-scoped).
+message MoveCardRequest {
+  string card_id = 1;
+  string to_column_id = 2;
+  // 1-based target position within the destination column.
+  int32 to_position = 3;
+  // ULID — optional on the wire but strongly recommended.
+  // Echoed in the CardMoved stream event for optimistic-UI deduplication
+  // (Tension 7 / Pre-mortem 3 pending-mutation queue).
+  string idempotency_key = 4;
+}
+
+message DeleteCardRequest {
+  string card_id = 1;
+}
+
+// BulkUpdateCardLabelsRequest replaces the full label set on each named card.
+// Empty label_ids removes all labels. Applied per-card; partial failure
+// returns the first error without rolling back already-updated cards.
+message BulkUpdateCardLabelsRequest {
+  repeated string card_ids = 1;
+  // Full replacement label ULID list.
+  repeated string label_ids = 2;
+  // ULID — required.
+  string idempotency_key = 3;
+}
+
+message BulkUpdateCardLabelsResponse {
+  repeated Card cards = 1;
+}
+
+message AssignCardRequest {
+  string card_id = 1;
+  // OIDC subject to assign.
+  string subject = 2;
+}
+
+message UnassignCardRequest {
+  string card_id = 1;
+  string subject = 2;
+}
+
+message AddChecklistItemRequest {
+  string card_id = 1;
+  string text = 2;
+  // 1-based position; 0 means append.
+  int32 position = 3;
+  string idempotency_key = 4;
+}
+
+message UpdateChecklistItemRequest {
+  string card_id = 1;
+  string item_id = 2;
+  ChecklistItem item = 3;
+  google.protobuf.FieldMask update_mask = 4;
+}
+
+message RemoveChecklistItemRequest {
+  string card_id = 1;
+  string item_id = 2;
+}
+
+message AddCommentRequest {
+  string card_id = 1;
+  string body = 2;           // markdown.
+  // ULID — required.
+  string idempotency_key = 3;
+}
+
+message EditCommentRequest {
+  string card_id = 1;
+  string comment_id = 2;
+  string body = 3;
+}
+
+message DeleteCommentRequest {
+  string card_id = 1;
+  string comment_id = 2;
+}
+
+message ListCommentsRequest {
+  string card_id = 1;
+  string cursor = 2;
+  int32 limit = 3;
+}
+
+message ListCommentsResponse {
+  repeated Comment comments = 1;
+  string next_cursor = 2;
+}
+
+// ============================================================================
+// Service — CardService (Stage 1c)
+// ============================================================================
+
+// CardService manages cards, checklists, assignments, and comments.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are performed
+// by the kanban-local `keto_dispatch` middleware defined in
+// `apps/kanban/src/auth/keto_dispatch.rs`. The Keto object for each RPC is
+// the card's parent KanbanBoard; the object id is provided via the
+// `x-sunbeam-object-id` request header. See the dispatch matrix for the
+// authoritative relation per RPC.
+service CardService {
+  // GetCard requires "view" on the card's parent KanbanBoard.
+  rpc GetCard(GetCardRequest) returns (Card);
+
+  // BatchGetCards hydrates multiple cards for a board in one call.
+  // Use after GetBoard (BoardService) to populate initial board state.
+  // Requires "view" on the board.
+  rpc BatchGetCards(BatchGetCardsRequest) returns (BatchGetCardsResponse);
+
+  // ListCardsByBoard returns paginated cards for a board or column.
+  // Requires "view" on the board.
+  rpc ListCardsByBoard(ListCardsByBoardRequest) returns (ListCardsByBoardResponse);
+
+  // CreateCard requires "edit" on the parent KanbanBoard. idempotency_key
+  // is required. Allocates a card ref via project_ref_counter (MF-3).
+  rpc CreateCard(CreateCardRequest) returns (Card);
+
+  // UpdateCard applies a sparse patch to the card. Requires "edit" on the
+  // board. idempotency_key is required.
+  rpc UpdateCard(UpdateCardRequest) returns (Card);
+
+  // MoveCard repositions a card within or between columns on the same board.
+  // Cross-project moves return Unimplemented (MF-3). idempotency_key is
+  // strongly recommended; echoed in the CardMoved stream event for
+  // optimistic-UI deduplication (Tension 7 / Pre-mortem 3).
+  rpc MoveCard(MoveCardRequest) returns (Card);
+
+  // DeleteCard requires "edit" on the board. Emits CardDeleted stream event.
+  rpc DeleteCard(DeleteCardRequest) returns (google.protobuf.Empty);
+
+  // BulkUpdateCardLabels replaces the label set on multiple cards.
+  // Requires "edit" on the board for each card.
+  rpc BulkUpdateCardLabels(BulkUpdateCardLabelsRequest) returns (BulkUpdateCardLabelsResponse);
+
+  // AssignCard adds an assignee to a card. Requires "edit" on the board.
+  rpc AssignCard(AssignCardRequest) returns (Card);
+
+  // UnassignCard removes an assignee from a card. Requires "edit".
+  rpc UnassignCard(UnassignCardRequest) returns (Card);
+
+  // AddChecklistItem appends or inserts a checklist item. Requires "edit".
+  rpc AddChecklistItem(AddChecklistItemRequest) returns (Card);
+
+  // UpdateChecklistItem edits text or done status. Requires "edit".
+  rpc UpdateChecklistItem(UpdateChecklistItemRequest) returns (Card);
+
+  // RemoveChecklistItem deletes a checklist item. Requires "edit".
+  rpc RemoveChecklistItem(RemoveChecklistItemRequest) returns (google.protobuf.Empty);
+
+  // AddComment posts a new comment on a card.
+  // Requires at minimum "view" relation (viewers may comment).
+  rpc AddComment(AddCommentRequest) returns (Comment);
+
+  // EditComment updates a comment body. Only the original author or an
+  // admin may edit.
+  rpc EditComment(EditCommentRequest) returns (Comment);
+
+  // DeleteComment removes a comment. Only the author or an admin may delete.
+  rpc DeleteComment(DeleteCommentRequest) returns (google.protobuf.Empty);
+
+  // ListComments returns paginated comments for a card. Requires "view".
+  rpc ListComments(ListCommentsRequest) returns (ListCommentsResponse);
+}
