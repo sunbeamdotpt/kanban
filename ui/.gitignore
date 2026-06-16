@@ -1,7 +1,0 @@
-node_modules
-dist
-.vite
-playwright-report
-test-results
-styled-system
-*.tsbuildinfo
