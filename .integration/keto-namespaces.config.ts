@@ -142,6 +142,42 @@ class KanbanCard implements Namespace {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// KanbanAggregatedBoard — a meta board spanning an explicit list of source
+// boards. Explicit owner/admin/editor/viewer grants are checked first; if none
+// match, access is derived from the contained KanbanBoard relations. This lets
+// a user view an aggregate whenever they can view any of its source boards.
+// ─────────────────────────────────────────────────────────────────────────────
+class KanbanAggregatedBoard implements Namespace {
+  related: {
+    owner: User[]
+    admin: User[]
+    editor: User[]
+    viewer: User[]
+    source_board: KanbanBoard[]
+  }
+
+  permits = {
+    view: (ctx: Context): boolean =>
+      this.related.owner.includes(ctx.subject) ||
+      this.related.admin.includes(ctx.subject) ||
+      this.related.editor.includes(ctx.subject) ||
+      this.related.viewer.includes(ctx.subject) ||
+      this.related.source_board.traverse((b) => b.permits.view(ctx)),
+
+    edit: (ctx: Context): boolean =>
+      this.related.owner.includes(ctx.subject) ||
+      this.related.admin.includes(ctx.subject) ||
+      this.related.editor.includes(ctx.subject) ||
+      this.related.source_board.traverse((b) => b.permits.edit(ctx)),
+
+    manage: (ctx: Context): boolean =>
+      this.related.owner.includes(ctx.subject) ||
+      this.related.admin.includes(ctx.subject) ||
+      this.related.source_board.traverse((b) => b.permits.manage(ctx)),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // _kanban_health — synthetic namespace for the startup readiness gate
 // (Pre-mortem 1, AC-3). The kanban service writes a known tuple at boot —
 //

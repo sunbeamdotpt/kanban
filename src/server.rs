@@ -19,48 +19,36 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
-    http::StatusCode,
-    middleware,
-    response::IntoResponse,
-    routing::get,
-    Router,
+    Router, extract::State, http::StatusCode, middleware, response::IntoResponse, routing::get,
 };
-use prometheus::{
-    CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
-    TextEncoder,
-};
+use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
 use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use uuid::Uuid;
 use sunbeam_g2v::config::AuthConfig;
+use sunbeam_g2v::config::NatsConfig;
 use sunbeam_g2v::middleware::auth::jwt::{JwtLayer, JwtValidator};
 use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
 use sunbeam_g2v::mq::NatsClient;
-use sunbeam_g2v::config::NatsConfig;
 
-use crate::auth::keto_dispatch::{dispatch, DispatchState};
+use crate::auth::keto_dispatch::{DispatchState, dispatch};
 use crate::auth::logout_watermark::LogoutWatermark;
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
-    attachment_service_server::AttachmentServiceServer,
-    auth_service_server::AuthServiceServer,
-    board_service_server::BoardServiceServer,
-    card_service_server::CardServiceServer,
-    forgejo_link_service_server::ForgejoLinkServiceServer,
-    project_service_server::ProjectServiceServer,
-    search_service_server::SearchServiceServer,
+    aggregated_board_service_server::AggregatedBoardServiceServer,
+    attachment_service_server::AttachmentServiceServer, auth_service_server::AuthServiceServer,
+    board_service_server::BoardServiceServer, card_service_server::CardServiceServer,
+    github_link_service_server::GithubLinkServiceServer,
+    project_service_server::ProjectServiceServer, search_service_server::SearchServiceServer,
 };
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
-    attachments::AttachmentServiceImpl, auth::AuthServiceImpl,
-    boards::BoardServiceImpl, cards::CardServiceImpl,
-    forgejo::ForgejoServiceImpl, projects::ProjectServiceImpl,
-    search::SearchServiceImpl,
+    aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
+    auth::AuthServiceImpl, boards::BoardServiceImpl, cards::CardServiceImpl,
+    github::GitHubServiceImpl, projects::ProjectServiceImpl, search::SearchServiceImpl,
 };
 
 // ── JetStream stream name & config ──────────────────────────────────────────
@@ -131,13 +119,18 @@ impl KanbanMetrics {
                 "kanban_rpc_duration_seconds",
                 "gRPC handler duration in seconds",
             )
-            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ]),
             &["service", "method"],
         )?;
         registry.register(Box::new(rpc_duration_seconds.clone()))?;
 
         let rpc_total = CounterVec::new(
-            Opts::new("kanban_rpc_total", "Total gRPC requests by service/method/status"),
+            Opts::new(
+                "kanban_rpc_total",
+                "Total gRPC requests by service/method/status",
+            ),
             &["service", "method", "status"],
         )?;
         registry.register(Box::new(rpc_total.clone()))?;
@@ -174,7 +167,12 @@ async fn healthz_live() -> impl IntoResponse {
 async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
     match state
         .keto
-        .check_permission("_kanban_health", "probe", "health", "user:_kanban_startup_probe")
+        .check_permission(
+            "_kanban_health",
+            "probe",
+            "health",
+            "user:_kanban_startup_probe",
+        )
         .await
     {
         Ok(true) => StatusCode::OK,
@@ -212,23 +210,20 @@ pub async fn run() -> Result<()> {
         .context("KANBAN_PORT must be a valid port number")?;
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
 
-    let jwt_secret = std::env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "change-me".into());
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "change-me".into());
 
-    let database_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL is required")?;
+    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
 
-    let nats_url = std::env::var("NATS_URL")
-        .unwrap_or_else(|_| "nats://localhost:4222".into());
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
 
-    let valkey_url = std::env::var("VALKEY_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
+    let valkey_url =
+        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
 
-    let keto_read_addr = std::env::var("KETO_READ_ADDR")
-        .unwrap_or_else(|_| "http://localhost:4466".into());
+    let keto_read_addr =
+        std::env::var("KETO_READ_ADDR").unwrap_or_else(|_| "http://localhost:4466".into());
 
-    let keto_write_addr = std::env::var("KETO_WRITE_ADDR")
-        .unwrap_or_else(|_| "http://localhost:4467".into());
+    let keto_write_addr =
+        std::env::var("KETO_WRITE_ADDR").unwrap_or_else(|_| "http://localhost:4467".into());
 
     // ── 2. OTel tracing init ────────────────────────────────────────────────
     init_otel_tracing()?;
@@ -277,26 +272,21 @@ pub async fn run() -> Result<()> {
     // Drains undispatched event_log rows to NATS JetStream at 250ms poll
     // cadence. Hold the handle so the task is not immediately dropped.
     // TODO: graceful shutdown — plumb a CancellationToken and abort on SIGTERM.
-    let _outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
-        pg_pool.clone(),
-        Arc::clone(&nats),
-    )
-    .spawn();
+    let _outbox_handle =
+        crate::realtime::outbox::OutboxDispatcher::new(pg_pool.clone(), Arc::clone(&nats)).spawn();
 
     info!("outbox dispatcher spawned");
 
     // ── 4c. BoardSubscriberRegistry — per-pod NATS push consumer fanout ────
-    let pod_id = std::env::var("POD_NAME")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+    let pod_id =
+        std::env::var("POD_NAME").unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
     let board_registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), pod_id));
 
     info!("BoardSubscriberRegistry constructed");
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
-    let watermark = Arc::new(
-        LogoutWatermark::new(&valkey_url)
-            .context("failed to construct LogoutWatermark")?,
-    );
+    let watermark =
+        Arc::new(LogoutWatermark::new(&valkey_url).context("failed to construct LogoutWatermark")?);
 
     info!("Valkey client initialised");
 
@@ -317,42 +307,56 @@ pub async fn run() -> Result<()> {
 
     // ── 8. S3 client for AttachmentService ─────────────────────────────────
     let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
-    info!("S3 client initialised (endpoint={})", std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "<default>".into()));
+    info!(
+        "S3 client initialised (endpoint={})",
+        std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "<default>".into())
+    );
 
     // ── 8b. OpenSearch client for SearchService ─────────────────────────────
     let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()));
-    info!("OpenSearch client initialised (url={})", std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into()));
+    info!(
+        "OpenSearch client initialised (url={})",
+        std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into())
+    );
 
     // ── Build tonic gRPC router ─────────────────────────────────────────────
     let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl {
         watermark: Arc::clone(&watermark),
     }))
-        .add_service(AttachmentServiceServer::new(AttachmentServiceImpl {
-            pool: pg_pool.clone(),
-            s3: Arc::clone(&s3_client),
-        }))
-        .add_service(BoardServiceServer::new(BoardServiceImpl {
+    .add_service(AttachmentServiceServer::new(AttachmentServiceImpl {
+        pool: pg_pool.clone(),
+        s3: Arc::clone(&s3_client),
+    }))
+    .add_service(BoardServiceServer::new(BoardServiceImpl {
+        pool: pg_pool.clone(),
+        keto: Arc::clone(&keto),
+        registry: Arc::clone(&board_registry),
+        watermark: Arc::clone(&watermark),
+    }))
+    .add_service(CardServiceServer::new(CardServiceImpl {
+        pool: pg_pool.clone(),
+        keto: Arc::clone(&keto),
+    }))
+    .add_service(GithubLinkServiceServer::new(GitHubServiceImpl))
+    .add_service(AggregatedBoardServiceServer::new(
+        AggregatedBoardServiceImpl {
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
             registry: Arc::clone(&board_registry),
             watermark: Arc::clone(&watermark),
-        }))
-        .add_service(CardServiceServer::new(CardServiceImpl {
-            pool: pg_pool.clone(),
-            keto: Arc::clone(&keto),
-        }))
-        .add_service(ForgejoLinkServiceServer::new(ForgejoServiceImpl))
-        .add_service(ProjectServiceServer::new(ProjectServiceImpl {
-            pool: pg_pool.clone(),
-            keto: Arc::clone(&keto),
-            registry: Arc::clone(&board_registry),
-            watermark: Arc::clone(&watermark),
-        }))
-        .add_service(SearchServiceServer::new(SearchServiceImpl {
-            keto: Arc::clone(&keto),
-            opensearch: Arc::clone(&opensearch_client),
-        }))
-        .into_axum_router();
+        },
+    ))
+    .add_service(ProjectServiceServer::new(ProjectServiceImpl {
+        pool: pg_pool.clone(),
+        keto: Arc::clone(&keto),
+        registry: Arc::clone(&board_registry),
+        watermark: Arc::clone(&watermark),
+    }))
+    .add_service(SearchServiceServer::new(SearchServiceImpl {
+        keto: Arc::clone(&keto),
+        opensearch: Arc::clone(&opensearch_client),
+    }))
+    .into_axum_router();
 
     // ── 9. Middleware stack (outer → inner) + axum Router ───────────────────
     //
@@ -390,10 +394,7 @@ pub async fn run() -> Result<()> {
     let app = aux_router
         .merge(grpc_axum)
         // keto_dispatch (innermost applied = innermost executed)
-        .layer(middleware::from_fn_with_state(
-            dispatch_state,
-            dispatch,
-        ))
+        .layer(middleware::from_fn_with_state(dispatch_state, dispatch))
         // JwtLayer — validates Bearer, inserts Extension<AuthContext>
         .layer(JwtLayer::new(jwt_validator))
         // Prometheus metrics wrapper (records duration + status) — placeholder
@@ -425,7 +426,7 @@ fn init_otel_tracing() -> Result<()> {
     use opentelemetry::global;
     use opentelemetry_otlp::WithExportConfig;
     use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
 
@@ -470,7 +471,12 @@ fn init_otel_tracing() -> Result<()> {
 /// (which panics the service — correct per the plan's fatal-on-failure policy).
 async fn ensure_keto_health_tuple(keto: &KetoClient) -> Result<()> {
     let present = keto
-        .check_permission("_kanban_health", "probe", "health", "user:_kanban_startup_probe")
+        .check_permission(
+            "_kanban_health",
+            "probe",
+            "health",
+            "user:_kanban_startup_probe",
+        )
         .await
         .context("Keto health-tuple check failed at boot")?;
 

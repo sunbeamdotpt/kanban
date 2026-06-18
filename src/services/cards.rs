@@ -28,13 +28,11 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::pb::card_service_server::CardService;
 use crate::pb::{
-    AddChecklistItemRequest, AddCommentRequest, AssignCardRequest,
-    BatchGetCardsRequest, BatchGetCardsResponse, BulkUpdateCardLabelsRequest,
-    BulkUpdateCardLabelsResponse, Card, ChecklistItem, Comment,
-    CreateCardRequest, DeleteCardRequest, DeleteCommentRequest,
-    EditCommentRequest, GetCardRequest, Label, Assignee,
-    ListCardsByBoardRequest, ListCardsByBoardResponse, ListCommentsRequest,
-    ListCommentsResponse, MoveCardRequest, RemoveChecklistItemRequest,
+    AddChecklistItemRequest, AddCommentRequest, AssignCardRequest, Assignee, BatchGetCardsRequest,
+    BatchGetCardsResponse, BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card,
+    ChecklistItem, Comment, CreateCardRequest, DeleteCardRequest, DeleteCommentRequest,
+    EditCommentRequest, GetCardRequest, Label, ListCardsByBoardRequest, ListCardsByBoardResponse,
+    ListCommentsRequest, ListCommentsResponse, MoveCardRequest, RemoveChecklistItemRequest,
     UnassignCardRequest, UpdateCardRequest, UpdateChecklistItemRequest,
 };
 
@@ -52,14 +50,14 @@ pub struct CardServiceImpl {
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
 
-fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
+pub(crate) fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
     }
 }
 
-fn opt_to_proto_ts(dt: Option<DateTime<Utc>>) -> Option<Timestamp> {
+pub(crate) fn opt_to_proto_ts(dt: Option<DateTime<Utc>>) -> Option<Timestamp> {
     dt.map(to_proto_ts)
 }
 
@@ -88,7 +86,7 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
 
 // ── Priority mapping ──────────────────────────────────────────────────────────
 
-fn priority_to_i32(s: &str) -> i32 {
+pub(crate) fn priority_to_i32(s: &str) -> i32 {
     match s {
         "low" => 1,
         "medium" => 2,
@@ -110,7 +108,7 @@ fn priority_from_i32(v: i32) -> &'static str {
 
 // ── Row → proto helpers ───────────────────────────────────────────────────────
 
-fn card_from_row(
+pub(crate) fn card_from_row(
     row: &sqlx::postgres::PgRow,
     labels: Vec<Label>,
     assignees: Vec<Assignee>,
@@ -154,7 +152,7 @@ fn card_from_row(
         labels,
         assignees,
         checklist,
-        forgejo_links: vec![],
+        github_links: vec![],
         comments_count,
         attachments_count,
         revision: revision as u64,
@@ -196,7 +194,7 @@ fn checklist_item_from_row(row: &sqlx::postgres::PgRow) -> ChecklistItem {
 
 // ── Fetch helpers for embedded sub-entities ───────────────────────────────────
 
-async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
+pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
     sqlx::query(
         "SELECT l.id, l.project_id, l.name, l.style \
          FROM labels l \
@@ -222,7 +220,7 @@ async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
     .collect()
 }
 
-async fn fetch_assignees(pool: &PgPool, card_id: Uuid) -> Vec<Assignee> {
+pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Uuid) -> Vec<Assignee> {
     sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 ORDER BY assigned_at")
         .bind(card_id)
         .fetch_all(pool)
@@ -237,7 +235,7 @@ async fn fetch_assignees(pool: &PgPool, card_id: Uuid) -> Vec<Assignee> {
         .collect()
 }
 
-async fn fetch_checklist(pool: &PgPool, card_id: Uuid) -> Vec<ChecklistItem> {
+pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Uuid) -> Vec<ChecklistItem> {
     sqlx::query(
         "SELECT id, text, done, position FROM checklist_items \
          WHERE card_id = $1 ORDER BY position ASC",
@@ -251,21 +249,27 @@ async fn fetch_checklist(pool: &PgPool, card_id: Uuid) -> Vec<ChecklistItem> {
     .collect()
 }
 
-async fn fetch_comments_count(pool: &PgPool, card_id: Uuid) -> i32 {
+pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Uuid) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM comments WHERE card_id = $1")
         .bind(card_id)
         .fetch_one(pool)
         .await
-        .map(|r| { let c: i64 = r.get("cnt"); c as i32 })
+        .map(|r| {
+            let c: i64 = r.get("cnt");
+            c as i32
+        })
         .unwrap_or(0)
 }
 
-async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32 {
+pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM card_attachments WHERE card_id = $1")
         .bind(card_id)
         .fetch_one(pool)
         .await
-        .map(|r| { let c: i64 = r.get("cnt"); c as i32 })
+        .map(|r| {
+            let c: i64 = r.get("cnt");
+            c as i32
+        })
         .unwrap_or(0)
 }
 
@@ -289,7 +293,14 @@ async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
     let comments_count = fetch_comments_count(pool, card_id).await;
     let attachments_count = fetch_attachments_count(pool, card_id).await;
 
-    Ok(card_from_row(&row, labels, assignees, checklist, comments_count, attachments_count))
+    Ok(card_from_row(
+        &row,
+        labels,
+        assignees,
+        checklist,
+        comments_count,
+        attachments_count,
+    ))
 }
 
 // ── Card-ref allocator (MF-3) ─────────────────────────────────────────────────
@@ -330,8 +341,12 @@ async fn allocate_card_ref(
     .await
     .map_err(|e| internal("failed to allocate card ref", e))?;
 
-    let prefix: String = row.try_get("prefix").map_err(|e| internal("ref prefix missing", e))?;
-    let seq: i32 = row.try_get("allocated_seq").map_err(|e| internal("ref seq missing", e))?;
+    let prefix: String = row
+        .try_get("prefix")
+        .map_err(|e| internal("ref prefix missing", e))?;
+    let seq: i32 = row
+        .try_get("allocated_seq")
+        .map_err(|e| internal("ref seq missing", e))?;
     Ok(format!("{prefix}-{seq:03}"))
 }
 
@@ -368,20 +383,15 @@ async fn insert_event_log(
 /// entity by id.
 ///
 /// Returns `Ok(Some(card_id))` when the key was seen before, `Ok(None)` when new.
-async fn check_idempotency_card(
-    pool: &PgPool,
-    key: &str,
-) -> Result<Option<Uuid>, Status> {
+async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Uuid>, Status> {
     if key.is_empty() {
         return Ok(None);
     }
-    let row = sqlx::query(
-        "SELECT response_card_id FROM idempotency_keys WHERE key = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| internal("idempotency key lookup failed", e))?;
+    let row = sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| internal("idempotency key lookup failed", e))?;
 
     match row {
         None => Ok(None),
@@ -415,15 +425,12 @@ impl CardService for CardServiceImpl {
     // ── GetCard ───────────────────────────────────────────────────────────────
     //
     // CheckedObjectId = card_id (KanbanCard + view, per matrix).
-    // Hydrates labels, assignees, checklist, forgejo_links, counts.
+    // Hydrates labels, assignees, checklist, github_links, counts.
 
-    async fn get_card(
-        &self,
-        request: Request<GetCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    async fn get_card(&self, request: Request<GetCardRequest>) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
         Ok(Response::new(card))
@@ -478,7 +485,14 @@ impl CardService for CardServiceImpl {
             let checklist = fetch_checklist(&self.pool, cid).await;
             let comments_count = fetch_comments_count(&self.pool, cid).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid).await;
-            cards.push(card_from_row(row, labels, assignees, checklist, comments_count, attachments_count));
+            cards.push(card_from_row(
+                row,
+                labels,
+                assignees,
+                checklist,
+                comments_count,
+                attachments_count,
+            ));
         }
 
         Ok(Response::new(BatchGetCardsResponse { cards }))
@@ -499,20 +513,28 @@ impl CardService for CardServiceImpl {
 
         let req = request.into_inner();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
-        let limit = if limit == 0 { DEFAULT_PAGE_LIMIT } else { limit };
+        let limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else {
+            limit
+        };
 
         let col_filter: Option<Uuid> = if req.column_id.is_empty() {
             None
         } else {
-            Some(Uuid::parse_str(&req.column_id)
-                .map_err(|_| Status::invalid_argument("invalid column_id"))?)
+            Some(
+                Uuid::parse_str(&req.column_id)
+                    .map_err(|_| Status::invalid_argument("invalid column_id"))?,
+            )
         };
 
         let cursor_id: Option<Uuid> = if req.cursor.is_empty() {
             None
         } else {
-            Some(Uuid::parse_str(&req.cursor)
-                .map_err(|_| Status::invalid_argument("invalid cursor"))?)
+            Some(
+                Uuid::parse_str(&req.cursor)
+                    .map_err(|_| Status::invalid_argument("invalid cursor"))?,
+            )
         };
 
         // Build query dynamically to avoid runtime SQL errors.
@@ -527,8 +549,12 @@ impl CardService for CardServiceImpl {
                      ORDER BY column_id, position \
                      LIMIT $4",
                 )
-                .bind(board_id).bind(col_id).bind(after).bind(limit + 1)
-                .fetch_all(&self.pool).await
+                .bind(board_id)
+                .bind(col_id)
+                .bind(after)
+                .bind(limit + 1)
+                .fetch_all(&self.pool)
+                .await
             } else {
                 sqlx::query(
                     "SELECT id, project_id, board_id, column_id, ref, title, description, \
@@ -537,8 +563,11 @@ impl CardService for CardServiceImpl {
                      FROM cards WHERE board_id = $1 AND column_id = $2 \
                      ORDER BY column_id, position LIMIT $3",
                 )
-                .bind(board_id).bind(col_id).bind(limit + 1)
-                .fetch_all(&self.pool).await
+                .bind(board_id)
+                .bind(col_id)
+                .bind(limit + 1)
+                .fetch_all(&self.pool)
+                .await
             }
         } else if let Some(after) = cursor_id {
             sqlx::query(
@@ -548,8 +577,11 @@ impl CardService for CardServiceImpl {
                  FROM cards WHERE board_id = $1 AND id > $2 \
                  ORDER BY column_id, position LIMIT $3",
             )
-            .bind(board_id).bind(after).bind(limit + 1)
-            .fetch_all(&self.pool).await
+            .bind(board_id)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&self.pool)
+            .await
         } else {
             sqlx::query(
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
@@ -558,17 +590,26 @@ impl CardService for CardServiceImpl {
                  FROM cards WHERE board_id = $1 \
                  ORDER BY column_id, position LIMIT $2",
             )
-            .bind(board_id).bind(limit + 1)
-            .fetch_all(&self.pool).await
+            .bind(board_id)
+            .bind(limit + 1)
+            .fetch_all(&self.pool)
+            .await
         }
         .map_err(|e| internal("failed to list cards", e))?;
 
         let has_more = rows.len() > limit as usize;
-        let rows = if has_more { &rows[..limit as usize] } else { &rows[..] };
+        let rows = if has_more {
+            &rows[..limit as usize]
+        } else {
+            &rows[..]
+        };
 
         let next_cursor = if has_more {
             rows.last()
-                .map(|r| { let id: Uuid = r.get("id"); id.to_string() })
+                .map(|r| {
+                    let id: Uuid = r.get("id");
+                    id.to_string()
+                })
                 .unwrap_or_default()
         } else {
             String::new()
@@ -582,10 +623,20 @@ impl CardService for CardServiceImpl {
             let checklist = fetch_checklist(&self.pool, cid).await;
             let comments_count = fetch_comments_count(&self.pool, cid).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid).await;
-            cards.push(card_from_row(row, labels, assignees, checklist, comments_count, attachments_count));
+            cards.push(card_from_row(
+                row,
+                labels,
+                assignees,
+                checklist,
+                comments_count,
+                attachments_count,
+            ));
         }
 
-        Ok(Response::new(ListCardsByBoardResponse { cards, next_cursor }))
+        Ok(Response::new(ListCardsByBoardResponse {
+            cards,
+            next_cursor,
+        }))
     }
 
     // ── CreateCard ────────────────────────────────────────────────────────────
@@ -611,18 +662,18 @@ impl CardService for CardServiceImpl {
 
         // Idempotency check.
         if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, existing_id).await.map(Response::new);
+            return fetch_full_card(&self.pool, existing_id)
+                .await
+                .map(Response::new);
         }
 
         // Verify board exists and get project_id.
-        let board_row = sqlx::query(
-            "SELECT project_id FROM boards WHERE id = $1",
-        )
-        .bind(board_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch board", e))?
-        .ok_or_else(|| Status::not_found("board not found"))?;
+        let board_row = sqlx::query("SELECT project_id FROM boards WHERE id = $1")
+            .bind(board_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch board", e))?
+            .ok_or_else(|| Status::not_found("board not found"))?;
 
         let project_id: Uuid = board_row.get("project_id");
 
@@ -630,19 +681,21 @@ impl CardService for CardServiceImpl {
         let col_id = Uuid::parse_str(&req.column_id)
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
-        let col_row = sqlx::query(
-            "SELECT id FROM columns WHERE id = $1 AND board_id = $2",
-        )
-        .bind(col_id)
-        .bind(board_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to verify column", e))?
-        .ok_or_else(|| Status::not_found("column not found on this board"))?;
+        let col_row = sqlx::query("SELECT id FROM columns WHERE id = $1 AND board_id = $2")
+            .bind(col_id)
+            .bind(board_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to verify column", e))?
+            .ok_or_else(|| Status::not_found("column not found on this board"))?;
         let _ = col_row;
 
         // Begin transaction.
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         // Allocate card ref (advisory lock inside).
         let card_ref = allocate_card_ref(&mut tx, project_id).await?;
@@ -675,9 +728,9 @@ impl CardService for CardServiceImpl {
 
         // Parse optional fields.
         let priority_str = priority_from_i32(req.priority);
-        let due_date: Option<DateTime<Utc>> = req.due.and_then(|ts| {
-            chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
-        });
+        let due_date: Option<DateTime<Utc>> = req
+            .due
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
         let milestone_id: Option<Uuid> = if req.milestone_id.is_empty() {
             None
         } else {
@@ -695,7 +748,11 @@ impl CardService for CardServiceImpl {
         .bind(col_id)
         .bind(&card_ref)
         .bind(&req.title)
-        .bind(if req.description.is_empty() { None } else { Some(req.description.clone()) })
+        .bind(if req.description.is_empty() {
+            None
+        } else {
+            Some(req.description.clone())
+        })
         .bind(position)
         .bind(priority_str)
         .bind(due_date)
@@ -717,7 +774,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardCreated", payload, 0).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         // Store idempotency.
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
@@ -736,26 +795,26 @@ impl CardService for CardServiceImpl {
         request: Request<UpdateCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let patch = req.card.unwrap_or_default();
 
         // Idempotency check.
         if let Some(_existing) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, card_id).await.map(Response::new);
+            return fetch_full_card(&self.pool, card_id)
+                .await
+                .map(Response::new);
         }
 
         // Fetch current card for board_id + revision.
-        let cur = sqlx::query(
-            "SELECT board_id, revision FROM cards WHERE id = $1",
-        )
-        .bind(card_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch card", e))?
-        .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
+            .bind(card_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch card", e))?
+            .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -766,9 +825,9 @@ impl CardService for CardServiceImpl {
             None
         };
 
-        let due_date: Option<DateTime<Utc>> = patch.due.and_then(|ts| {
-            chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
-        });
+        let due_date: Option<DateTime<Utc>> = patch
+            .due
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
 
         let milestone_id: Option<Uuid> = if patch.milestone_id.is_empty() {
             None
@@ -820,9 +879,15 @@ impl CardService for CardServiceImpl {
             }
         });
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
@@ -837,21 +902,23 @@ impl CardService for CardServiceImpl {
     // Same-board cross-column: shift source gap, shift target at insert point.
     // event_log: CardMoved.
 
-    async fn move_card(
-        &self,
-        request: Request<MoveCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    async fn move_card(&self, request: Request<MoveCardRequest>) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let to_col_id = Uuid::parse_str(&req.to_column_id)
             .map_err(|_| Status::invalid_argument("invalid to_column_id"))?;
 
         // Idempotency check.
-        if let Some(_) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, card_id).await.map(Response::new);
+        if check_idempotency_card(&self.pool, &req.idempotency_key)
+            .await?
+            .is_some()
+        {
+            return fetch_full_card(&self.pool, card_id)
+                .await
+                .map(Response::new);
         }
 
         // Fetch card's current state.
@@ -871,26 +938,22 @@ impl CardService for CardServiceImpl {
         let card_project_id: Uuid = card_row.get("project_id");
 
         // Fetch target column's board_id.
-        let target_col_row = sqlx::query(
-            "SELECT board_id FROM columns WHERE id = $1",
-        )
-        .bind(to_col_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch target column", e))?
-        .ok_or_else(|| Status::not_found("target column not found"))?;
+        let target_col_row = sqlx::query("SELECT board_id FROM columns WHERE id = $1")
+            .bind(to_col_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch target column", e))?
+            .ok_or_else(|| Status::not_found("target column not found"))?;
 
         let target_board_id: Uuid = target_col_row.get("board_id");
 
         // Fetch target board's project_id to verify no cross-project move.
-        let target_board_row = sqlx::query(
-            "SELECT project_id FROM boards WHERE id = $1",
-        )
-        .bind(target_board_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch target board", e))?
-        .ok_or_else(|| Status::not_found("target board not found"))?;
+        let target_board_row = sqlx::query("SELECT project_id FROM boards WHERE id = $1")
+            .bind(target_board_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch target board", e))?
+            .ok_or_else(|| Status::not_found("target board not found"))?;
 
         let target_project_id: Uuid = target_board_row.get("project_id");
 
@@ -900,9 +963,17 @@ impl CardService for CardServiceImpl {
             ));
         }
 
-        let to_pos = if req.to_position < 1 { 0 } else { req.to_position - 1 };
+        let to_pos = if req.to_position < 1 {
+            0
+        } else {
+            req.to_position - 1
+        };
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         if from_col_id == to_col_id {
             // Same-column reorder.
@@ -912,16 +983,22 @@ impl CardService for CardServiceImpl {
                         "UPDATE cards SET position = position - 1, updated_at = now() \
                          WHERE column_id = $1 AND position > $2 AND position <= $3",
                     )
-                    .bind(from_col_id).bind(from_pos).bind(to_pos)
-                    .execute(&mut *tx).await
+                    .bind(from_col_id)
+                    .bind(from_pos)
+                    .bind(to_pos)
+                    .execute(&mut *tx)
+                    .await
                     .map_err(|e| internal("failed to shift (same-col forward)", e))?;
                 } else {
                     sqlx::query(
                         "UPDATE cards SET position = position + 1, updated_at = now() \
                          WHERE column_id = $1 AND position >= $2 AND position < $3",
                     )
-                    .bind(from_col_id).bind(to_pos).bind(from_pos)
-                    .execute(&mut *tx).await
+                    .bind(from_col_id)
+                    .bind(to_pos)
+                    .bind(from_pos)
+                    .execute(&mut *tx)
+                    .await
                     .map_err(|e| internal("failed to shift (same-col backward)", e))?;
                 }
             }
@@ -931,16 +1008,20 @@ impl CardService for CardServiceImpl {
                 "UPDATE cards SET position = position - 1, updated_at = now() \
                  WHERE column_id = $1 AND position > $2",
             )
-            .bind(from_col_id).bind(from_pos)
-            .execute(&mut *tx).await
+            .bind(from_col_id)
+            .bind(from_pos)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to close source gap", e))?;
 
             sqlx::query(
                 "UPDATE cards SET position = position + 1, updated_at = now() \
                  WHERE column_id = $1 AND position >= $2",
             )
-            .bind(to_col_id).bind(to_pos)
-            .execute(&mut *tx).await
+            .bind(to_col_id)
+            .bind(to_pos)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to open target slot", e))?;
         }
 
@@ -950,8 +1031,11 @@ impl CardService for CardServiceImpl {
                               updated_at = now() \
              WHERE id = $1 RETURNING revision",
         )
-        .bind(card_id).bind(to_col_id).bind(to_pos)
-        .fetch_one(&mut *tx).await
+        .bind(card_id)
+        .bind(to_col_id)
+        .bind(to_pos)
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to place card at new position", e))?;
 
         let new_revision: i64 = new_revision_row.get("revision");
@@ -968,7 +1052,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardMoved", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
@@ -987,23 +1073,25 @@ impl CardService for CardServiceImpl {
         request: Request<DeleteCardRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         // Fetch board_id + revision before deleting.
-        let cur = sqlx::query(
-            "SELECT board_id, revision FROM cards WHERE id = $1",
-        )
-        .bind(card_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch card", e))?
-        .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
+            .bind(card_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch card", e))?
+            .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let result = sqlx::query("DELETE FROM cards WHERE id = $1")
             .bind(card_id)
@@ -1023,7 +1111,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardDeleted", payload, prev_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(()))
     }
@@ -1046,19 +1136,28 @@ impl CardService for CardServiceImpl {
         let req = request.into_inner();
 
         if req.card_ids.is_empty() {
-            return Ok(Response::new(BulkUpdateCardLabelsResponse { cards: vec![] }));
+            return Ok(Response::new(BulkUpdateCardLabelsResponse {
+                cards: vec![],
+            }));
         }
 
-        let card_ids: Vec<Uuid> = req.card_ids.iter()
+        let card_ids: Vec<Uuid> = req
+            .card_ids
+            .iter()
             .filter_map(|s| Uuid::parse_str(s).ok())
             .collect();
 
-        let label_ids: Vec<Uuid> = req.label_ids.iter()
+        let label_ids: Vec<Uuid> = req
+            .label_ids
+            .iter()
             .filter_map(|s| Uuid::parse_str(s).ok())
             .collect();
 
         // Idempotency.
-        if let Some(_) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
+        if check_idempotency_card(&self.pool, &req.idempotency_key)
+            .await?
+            .is_some()
+        {
             // Re-fetch all cards and return.
             let mut cards = vec![];
             for &cid in &card_ids {
@@ -1069,19 +1168,24 @@ impl CardService for CardServiceImpl {
             return Ok(Response::new(BulkUpdateCardLabelsResponse { cards }));
         }
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let mut updated_card_ids: Vec<Uuid> = vec![];
 
         for &cid in &card_ids {
             // Verify this card belongs to the board.
-            let exists: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1 AND board_id = $2)",
-            )
-            .bind(cid).bind(board_id)
-            .fetch_one(&mut *tx).await
-            .map_err(|e| internal("failed to verify card ownership", e))
-            .map(|r| r.get::<bool, _>(0))?;
+            let exists: bool =
+                sqlx::query("SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1 AND board_id = $2)")
+                    .bind(cid)
+                    .bind(board_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| internal("failed to verify card ownership", e))
+                    .map(|r| r.get::<bool, _>(0))?;
 
             if !exists {
                 return Err(Status::invalid_argument(format!(
@@ -1093,7 +1197,8 @@ impl CardService for CardServiceImpl {
             // Delete existing labels, replace with new set.
             sqlx::query("DELETE FROM card_labels WHERE card_id = $1")
                 .bind(cid)
-                .execute(&mut *tx).await
+                .execute(&mut *tx)
+                .await
                 .map_err(|e| internal("failed to clear card labels", e))?;
 
             for &lid in &label_ids {
@@ -1111,7 +1216,8 @@ impl CardService for CardServiceImpl {
                  WHERE id = $1 RETURNING revision",
             )
             .bind(cid)
-            .fetch_one(&mut *tx).await
+            .fetch_one(&mut *tx)
+            .await
             .map_err(|e| internal("failed to bump card revision", e))?;
 
             let new_rev: i64 = rev_row.get("revision");
@@ -1129,12 +1235,14 @@ impl CardService for CardServiceImpl {
             updated_card_ids.push(cid);
         }
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
-        if !req.idempotency_key.is_empty() {
-            if let Some(&first) = updated_card_ids.first() {
-                store_idempotency_card(&self.pool, &req.idempotency_key, first).await;
-            }
+        if !req.idempotency_key.is_empty()
+            && let Some(&first) = updated_card_ids.first()
+        {
+            store_idempotency_card(&self.pool, &req.idempotency_key, first).await;
         }
 
         let mut cards = vec![];
@@ -1156,8 +1264,8 @@ impl CardService for CardServiceImpl {
         request: Request<AssignCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         if req.subject.is_empty() {
@@ -1174,13 +1282,19 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         sqlx::query(
             "INSERT INTO card_assignees (card_id, subject) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
-        .bind(card_id).bind(&req.subject)
-        .execute(&mut *tx).await
+        .bind(card_id)
+        .bind(&req.subject)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| internal("failed to assign card", e))?;
 
         let rev_row = sqlx::query(
@@ -1188,7 +1302,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1201,9 +1316,13 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id).await.map(Response::new)
+        fetch_full_card(&self.pool, card_id)
+            .await
+            .map(Response::new)
     }
 
     // ── UnassignCard ──────────────────────────────────────────────────────────
@@ -1216,8 +1335,8 @@ impl CardService for CardServiceImpl {
         request: Request<UnassignCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
 
@@ -1231,11 +1350,17 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         sqlx::query("DELETE FROM card_assignees WHERE card_id = $1 AND subject = $2")
-            .bind(card_id).bind(&req.subject)
-            .execute(&mut *tx).await
+            .bind(card_id)
+            .bind(&req.subject)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to unassign card", e))?;
 
         let rev_row = sqlx::query(
@@ -1243,7 +1368,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1256,9 +1382,13 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id).await.map(Response::new)
+        fetch_full_card(&self.pool, card_id)
+            .await
+            .map(Response::new)
     }
 
     // ── AddChecklistItem ──────────────────────────────────────────────────────
@@ -1272,8 +1402,8 @@ impl CardService for CardServiceImpl {
         request: Request<AddChecklistItemRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         if req.text.is_empty() {
@@ -1290,7 +1420,11 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let item_id = Uuid::new_v4();
 
@@ -1301,8 +1435,11 @@ impl CardService for CardServiceImpl {
                  SELECT $1, $2, $3, COALESCE(MAX(position), -1) + 1 \
                  FROM checklist_items WHERE card_id = $2",
             )
-            .bind(item_id).bind(card_id).bind(&req.text)
-            .execute(&mut *tx).await
+            .bind(item_id)
+            .bind(card_id)
+            .bind(&req.text)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to insert checklist item", e))?;
         } else {
             // Shift and insert.
@@ -1310,15 +1447,21 @@ impl CardService for CardServiceImpl {
                 "UPDATE checklist_items SET position = position + 1, updated_at = now() \
                  WHERE card_id = $1 AND position >= $2",
             )
-            .bind(card_id).bind(req.position)
-            .execute(&mut *tx).await
+            .bind(card_id)
+            .bind(req.position)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to shift checklist items", e))?;
 
             sqlx::query(
                 "INSERT INTO checklist_items (id, card_id, text, position) VALUES ($1, $2, $3, $4)",
             )
-            .bind(item_id).bind(card_id).bind(&req.text).bind(req.position)
-            .execute(&mut *tx).await
+            .bind(item_id)
+            .bind(card_id)
+            .bind(&req.text)
+            .bind(req.position)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| internal("failed to insert checklist item at position", e))?;
         }
 
@@ -1327,7 +1470,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1340,9 +1484,13 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id).await.map(Response::new)
+        fetch_full_card(&self.pool, card_id)
+            .await
+            .map(Response::new)
     }
 
     // ── UpdateChecklistItem ───────────────────────────────────────────────────
@@ -1356,8 +1504,8 @@ impl CardService for CardServiceImpl {
         request: Request<UpdateChecklistItemRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let item_id = Uuid::parse_str(&req.item_id)
@@ -1374,7 +1522,11 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let result = sqlx::query(
             "UPDATE checklist_items SET
@@ -1383,8 +1535,12 @@ impl CardService for CardServiceImpl {
                 updated_at = now()
              WHERE id = $1 AND card_id = $2",
         )
-        .bind(item_id).bind(card_id).bind(&patch.text).bind(patch.done)
-        .execute(&mut *tx).await
+        .bind(item_id)
+        .bind(card_id)
+        .bind(&patch.text)
+        .bind(patch.done)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| internal("failed to update checklist item", e))?;
 
         if result.rows_affected() == 0 {
@@ -1396,7 +1552,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1409,9 +1566,13 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id).await.map(Response::new)
+        fetch_full_card(&self.pool, card_id)
+            .await
+            .map(Response::new)
     }
 
     // ── RemoveChecklistItem ───────────────────────────────────────────────────
@@ -1424,8 +1585,8 @@ impl CardService for CardServiceImpl {
         request: Request<RemoveChecklistItemRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let item_id = Uuid::parse_str(&req.item_id)
@@ -1441,14 +1602,18 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
-        let result = sqlx::query(
-            "DELETE FROM checklist_items WHERE id = $1 AND card_id = $2",
-        )
-        .bind(item_id).bind(card_id)
-        .execute(&mut *tx).await
-        .map_err(|e| internal("failed to remove checklist item", e))?;
+        let result = sqlx::query("DELETE FROM checklist_items WHERE id = $1 AND card_id = $2")
+            .bind(item_id)
+            .bind(card_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to remove checklist item", e))?;
 
         if result.rows_affected() == 0 {
             return Err(Status::not_found("checklist item not found on this card"));
@@ -1459,7 +1624,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1472,7 +1638,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(()))
     }
@@ -1487,8 +1655,8 @@ impl CardService for CardServiceImpl {
         request: Request<AddCommentRequest>,
     ) -> Result<Response<Comment>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
@@ -1499,31 +1667,28 @@ impl CardService for CardServiceImpl {
 
         // Idempotency.
         if !req.idempotency_key.is_empty() {
-            let row = sqlx::query(
-                "SELECT response_payload FROM idempotency_keys WHERE key = $1",
-            )
-            .bind(&req.idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("idempotency key lookup failed", e))?;
+            let row = sqlx::query("SELECT response_payload FROM idempotency_keys WHERE key = $1")
+                .bind(&req.idempotency_key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("idempotency key lookup failed", e))?;
 
             if let Some(r) = row {
                 let payload: Option<serde_json::Value> = r.get("response_payload");
-                if let Some(v) = payload {
-                    if let Some(comment_id_str) = v.get("comment_id").and_then(|x| x.as_str()) {
-                        if let Ok(comment_id) = Uuid::parse_str(comment_id_str) {
-                            let comment_row = sqlx::query(
-                                "SELECT id, card_id, author_sub, body, created_at, updated_at \
+                if let Some(v) = payload
+                    && let Some(comment_id_str) = v.get("comment_id").and_then(|x| x.as_str())
+                    && let Ok(comment_id) = Uuid::parse_str(comment_id_str)
+                {
+                    let comment_row = sqlx::query(
+                        "SELECT id, card_id, author_sub, body, created_at, updated_at \
                                  FROM comments WHERE id = $1",
-                            )
-                            .bind(comment_id)
-                            .fetch_optional(&self.pool)
-                            .await
-                            .map_err(|e| internal("failed to fetch cached comment", e))?;
-                            if let Some(r) = comment_row {
-                                return Ok(Response::new(comment_from_row(&r)));
-                            }
-                        }
+                    )
+                    .bind(comment_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| internal("failed to fetch cached comment", e))?;
+                    if let Some(r) = comment_row {
+                        return Ok(Response::new(comment_from_row(&r)));
                     }
                 }
             }
@@ -1539,7 +1704,11 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let comment_id = Uuid::new_v4();
 
@@ -1548,8 +1717,12 @@ impl CardService for CardServiceImpl {
              VALUES ($1, $2, $3, $4) \
              RETURNING id, card_id, author_sub, body, created_at, updated_at",
         )
-        .bind(comment_id).bind(card_id).bind(&subject).bind(&req.body)
-        .fetch_one(&mut *tx).await
+        .bind(comment_id)
+        .bind(card_id)
+        .bind(&subject)
+        .bind(&req.body)
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to insert comment", e))?;
 
         let rev_row = sqlx::query(
@@ -1557,7 +1730,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1571,7 +1745,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         // Store idempotency with comment_id in payload.
         if !req.idempotency_key.is_empty() {
@@ -1602,8 +1778,8 @@ impl CardService for CardServiceImpl {
         request: Request<EditCommentRequest>,
     ) -> Result<Response<Comment>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
@@ -1624,15 +1800,23 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         let comment_row = sqlx::query(
             "UPDATE comments SET body = $3, updated_at = now() \
              WHERE id = $1 AND card_id = $2 AND author_sub = $4 \
              RETURNING id, card_id, author_sub, body, created_at, updated_at",
         )
-        .bind(comment_id).bind(card_id).bind(&req.body).bind(&subject)
-        .fetch_optional(&mut *tx).await
+        .bind(comment_id)
+        .bind(card_id)
+        .bind(&req.body)
+        .bind(&subject)
+        .fetch_optional(&mut *tx)
+        .await
         .map_err(|e| internal("failed to edit comment", e))?
         .ok_or_else(|| Status::permission_denied("comment not found or not authored by you"))?;
 
@@ -1641,7 +1825,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1654,7 +1839,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(comment_from_row(&comment_row)))
     }
@@ -1673,8 +1860,8 @@ impl CardService for CardServiceImpl {
         request: Request<DeleteCommentRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
@@ -1691,25 +1878,31 @@ impl CardService for CardServiceImpl {
         let board_id: Uuid = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let mut tx = self.pool.begin().await.map_err(|e| internal("begin tx failed", e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
 
         // Try author-only delete first.
-        let result = sqlx::query(
-            "DELETE FROM comments WHERE id = $1 AND card_id = $2 AND author_sub = $3",
-        )
-        .bind(comment_id).bind(card_id).bind(&subject)
-        .execute(&mut *tx).await
-        .map_err(|e| internal("failed to delete comment (author path)", e))?;
+        let result =
+            sqlx::query("DELETE FROM comments WHERE id = $1 AND card_id = $2 AND author_sub = $3")
+                .bind(comment_id)
+                .bind(card_id)
+                .bind(&subject)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| internal("failed to delete comment (author path)", e))?;
 
         if result.rows_affected() == 0 {
             // Caller is not the author; Keto already confirmed `edit` relation
             // (admin/owner), so delete unconditionally by id+card_id.
-            let result2 = sqlx::query(
-                "DELETE FROM comments WHERE id = $1 AND card_id = $2",
-            )
-            .bind(comment_id).bind(card_id)
-            .execute(&mut *tx).await
-            .map_err(|e| internal("failed to delete comment (admin path)", e))?;
+            let result2 = sqlx::query("DELETE FROM comments WHERE id = $1 AND card_id = $2")
+                .bind(comment_id)
+                .bind(card_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| internal("failed to delete comment (admin path)", e))?;
 
             if result2.rows_affected() == 0 {
                 return Err(Status::not_found("comment not found on this card"));
@@ -1721,7 +1914,8 @@ impl CardService for CardServiceImpl {
              WHERE id = $1 RETURNING revision",
         )
         .bind(card_id)
-        .fetch_one(&mut *tx).await
+        .fetch_one(&mut *tx)
+        .await
         .map_err(|e| internal("failed to bump revision", e))?;
 
         let new_revision: i64 = rev_row.get("revision");
@@ -1734,7 +1928,9 @@ impl CardService for CardServiceImpl {
         });
         insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
 
-        tx.commit().await.map_err(|e| internal("commit failed", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(()))
     }
@@ -1749,18 +1945,24 @@ impl CardService for CardServiceImpl {
         request: Request<ListCommentsRequest>,
     ) -> Result<Response<ListCommentsResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&object_id)
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id =
+            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
-        let limit = if limit == 0 { DEFAULT_PAGE_LIMIT } else { limit };
+        let limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else {
+            limit
+        };
 
         let cursor_id: Option<Uuid> = if req.cursor.is_empty() {
             None
         } else {
-            Some(Uuid::parse_str(&req.cursor)
-                .map_err(|_| Status::invalid_argument("invalid cursor"))?)
+            Some(
+                Uuid::parse_str(&req.cursor)
+                    .map_err(|_| Status::invalid_argument("invalid cursor"))?,
+            )
         };
 
         // Verify card exists.
@@ -1780,25 +1982,37 @@ impl CardService for CardServiceImpl {
                  FROM comments WHERE card_id = $1 AND id > $2 \
                  ORDER BY created_at ASC LIMIT $3",
             )
-            .bind(card_id).bind(after).bind(limit + 1)
-            .fetch_all(&self.pool).await
+            .bind(card_id)
+            .bind(after)
+            .bind(limit + 1)
+            .fetch_all(&self.pool)
+            .await
         } else {
             sqlx::query(
                 "SELECT id, card_id, author_sub, body, created_at, updated_at \
                  FROM comments WHERE card_id = $1 \
                  ORDER BY created_at ASC LIMIT $2",
             )
-            .bind(card_id).bind(limit + 1)
-            .fetch_all(&self.pool).await
+            .bind(card_id)
+            .bind(limit + 1)
+            .fetch_all(&self.pool)
+            .await
         }
         .map_err(|e| internal("failed to list comments", e))?;
 
         let has_more = rows.len() > limit as usize;
-        let rows = if has_more { &rows[..limit as usize] } else { &rows[..] };
+        let rows = if has_more {
+            &rows[..limit as usize]
+        } else {
+            &rows[..]
+        };
 
         let next_cursor = if has_more {
             rows.last()
-                .map(|r| { let id: Uuid = r.get("id"); id.to_string() })
+                .map(|r| {
+                    let id: Uuid = r.get("id");
+                    id.to_string()
+                })
                 .unwrap_or_default()
         } else {
             String::new()
@@ -1806,7 +2020,10 @@ impl CardService for CardServiceImpl {
 
         let comments = rows.iter().map(comment_from_row).collect();
 
-        Ok(Response::new(ListCommentsResponse { comments, next_cursor }))
+        Ok(Response::new(ListCommentsResponse {
+            comments,
+            next_cursor,
+        }))
     }
 }
 
@@ -1829,13 +2046,11 @@ mod tests {
     }
 
     fn keto_read_url() -> String {
-        std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string())
+        std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string())
     }
 
     fn keto_write_url() -> String {
-        std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string())
+        std::env::var("KETO_WRITE_GRPC_URL").unwrap_or_else(|_| "http://localhost:4467".to_string())
     }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
@@ -1850,10 +2065,12 @@ mod tests {
     }
 
     fn setup_keto() -> Arc<KetoClient> {
-        Arc::new(KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
-            grpc_endpoint: keto_read_url(),
-            write_grpc_endpoint: keto_write_url(),
-        }))
+        Arc::new(KetoClient::new(
+            sunbeam_g2v::middleware::auth::keto::KetoConfig {
+                grpc_endpoint: keto_read_url(),
+                write_grpc_endpoint: keto_write_url(),
+            },
+        ))
     }
 
     fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> CardServiceImpl {
@@ -1898,25 +2115,26 @@ mod tests {
     async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
         let bid = Uuid::new_v4();
         let slug = format!("b-{}", &bid.to_string()[..8]);
-        sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(bid).bind(project_id).bind(format!("Board {bid}")).bind(slug)
-        .execute(pool)
-        .await
-        .expect("seed board failed");
+        sqlx::query("INSERT INTO boards (id, project_id, name, slug) VALUES ($1, $2, $3, $4)")
+            .bind(bid)
+            .bind(project_id)
+            .bind(format!("Board {bid}"))
+            .bind(slug)
+            .execute(pool)
+            .await
+            .expect("seed board failed");
         bid
     }
 
     async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
         let cid = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, $3, 0)",
-        )
-        .bind(cid).bind(board_id).bind("To Do")
-        .execute(pool)
-        .await
-        .expect("seed column failed");
+        sqlx::query("INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, $3, 0)")
+            .bind(cid)
+            .bind(board_id)
+            .bind("To Do")
+            .execute(pool)
+            .await
+            .expect("seed column failed");
         cid
     }
 
@@ -1926,14 +2144,19 @@ mod tests {
             "INSERT INTO labels (id, project_id, name, style) VALUES ($1, $2, $3, 'amber') \
              ON CONFLICT (project_id, name) DO NOTHING",
         )
-        .bind(lid).bind(project_id).bind(name)
+        .bind(lid)
+        .bind(project_id)
+        .bind(name)
         .execute(pool)
         .await
         .expect("seed label failed");
         // Re-fetch the actual id (might differ if conflict).
         let row = sqlx::query("SELECT id FROM labels WHERE project_id = $1 AND name = $2")
-            .bind(project_id).bind(name)
-            .fetch_one(pool).await.expect("fetch label id failed");
+            .bind(project_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .expect("fetch label id failed");
         row.get("id")
     }
 
@@ -1959,38 +2182,53 @@ mod tests {
 
         let ikey = |n: u8| format!("ikey-{}-{}", Uuid::new_v4(), n);
 
-        let c1 = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: cid.to_string(),
-                title: "Card One".to_string(),
-                idempotency_key: ikey(1),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create 1 failed").into_inner();
+        let c1 = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Card One".to_string(),
+                    idempotency_key: ikey(1),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create 1 failed")
+            .into_inner();
 
-        let c2 = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: cid.to_string(),
-                title: "Card Two".to_string(),
-                idempotency_key: ikey(2),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create 2 failed").into_inner();
+        let c2 = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Card Two".to_string(),
+                    idempotency_key: ikey(2),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create 2 failed")
+            .into_inner();
 
-        let c3 = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: cid.to_string(),
-                title: "Card Three".to_string(),
-                idempotency_key: ikey(3),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create 3 failed").into_inner();
+        let c3 = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Card Three".to_string(),
+                    idempotency_key: ikey(3),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create 3 failed")
+            .into_inner();
 
         assert_eq!(c1.r#ref, "REF-001", "first card ref");
         assert_eq!(c2.r#ref, "REF-002", "second card ref");
@@ -2013,30 +2251,43 @@ mod tests {
         let col_a = seed_column(&pool, bid_a).await;
         let col_b = seed_column(&pool, bid_b).await;
 
-        let ca = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid_a.to_string(),
-                column_id: col_a.to_string(),
-                title: "Alpha card".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid_a.to_string(),
-        )).await.expect("create alpha failed").into_inner();
+        let ca = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid_a.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Alpha card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid_a.to_string(),
+            ))
+            .await
+            .expect("create alpha failed")
+            .into_inner();
 
-        let cb = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid_b.to_string(),
-                column_id: col_b.to_string(),
-                title: "Beta card".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid_b.to_string(),
-        )).await.expect("create beta failed").into_inner();
+        let cb = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid_b.to_string(),
+                    column_id: col_b.to_string(),
+                    title: "Beta card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid_b.to_string(),
+            ))
+            .await
+            .expect("create beta failed")
+            .into_inner();
 
         assert_eq!(ca.r#ref, "ALPHA-001");
-        assert_eq!(cb.r#ref, "BETA-001", "beta project counter must be independent");
+        assert_eq!(
+            cb.r#ref, "BETA-001",
+            "beta project counter must be independent"
+        );
 
         cleanup_project(&pool, pid_a).await;
         cleanup_project(&pool, pid_b).await;
@@ -2053,32 +2304,51 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let col_a = seed_column(&pool, bid).await;
         let col_b_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'In Progress', 1)")
-            .bind(col_b_id).bind(bid)
-            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'In Progress', 1)",
+        )
+        .bind(col_b_id)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: col_a.to_string(),
-                title: "Moving card".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Moving card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
-        let moved = svc.move_card(authed_request_with_object(
-            MoveCardRequest {
-                card_id: card.id.clone(),
-                to_column_id: col_b_id.to_string(),
-                to_position: 1,
-                idempotency_key: Uuid::new_v4().to_string(),
-            },
-            &subject, &card.id,
-        )).await.expect("move failed").into_inner();
+        let moved = svc
+            .move_card(authed_request_with_object(
+                MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_b_id.to_string(),
+                    to_position: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("move failed")
+            .into_inner();
 
-        assert_eq!(moved.column_id, col_b_id.to_string(), "card should be in new column");
+        assert_eq!(
+            moved.column_id,
+            col_b_id.to_string(),
+            "card should be in new column"
+        );
         assert!(moved.revision > card.revision, "revision must bump on move");
 
         cleanup_project(&pool, pid).await;
@@ -2098,30 +2368,41 @@ mod tests {
         let col_a = seed_column(&pool, bid_a).await;
         let col_b = seed_column(&pool, bid_b).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid_a.to_string(),
-                column_id: col_a.to_string(),
-                title: "Cross-project card".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid_a.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid_a.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Cross-project card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid_a.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
-        let result = svc.move_card(authed_request_with_object(
-            MoveCardRequest {
-                card_id: card.id.clone(),
-                to_column_id: col_b.to_string(),
-                to_position: 1,
-                idempotency_key: Uuid::new_v4().to_string(),
-            },
-            &subject, &card.id,
-        )).await;
+        let result = svc
+            .move_card(authed_request_with_object(
+                MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_b.to_string(),
+                    to_position: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await;
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument,
-            "cross-project move must return InvalidArgument");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "cross-project move must return InvalidArgument"
+        );
 
         cleanup_project(&pool, pid_a).await;
         cleanup_project(&pool, pid_b).await;
@@ -2138,42 +2419,66 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let col_a = seed_column(&pool, bid).await;
         let col_b_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'Done', 1)")
-            .bind(col_b_id).bind(bid).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'Done', 1)",
+        )
+        .bind(col_b_id)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: col_a.to_string(),
-                title: "Idempotent move".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Idempotent move".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
         let move_key = Uuid::new_v4().to_string();
-        let first = svc.move_card(authed_request_with_object(
-            MoveCardRequest {
-                card_id: card.id.clone(),
-                to_column_id: col_b_id.to_string(),
-                to_position: 1,
-                idempotency_key: move_key.clone(),
-            },
-            &subject, &card.id,
-        )).await.expect("first move failed").into_inner();
+        let first = svc
+            .move_card(authed_request_with_object(
+                MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_b_id.to_string(),
+                    to_position: 1,
+                    idempotency_key: move_key.clone(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("first move failed")
+            .into_inner();
 
-        let second = svc.move_card(authed_request_with_object(
-            MoveCardRequest {
-                card_id: card.id.clone(),
-                to_column_id: col_b_id.to_string(),
-                to_position: 1,
-                idempotency_key: move_key.clone(),
-            },
-            &subject, &card.id,
-        )).await.expect("second move (replay) failed").into_inner();
+        let second = svc
+            .move_card(authed_request_with_object(
+                MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_b_id.to_string(),
+                    to_position: 1,
+                    idempotency_key: move_key.clone(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("second move (replay) failed")
+            .into_inner();
 
-        assert_eq!(first.revision, second.revision, "idempotent replay must return same revision");
+        assert_eq!(
+            first.revision, second.revision,
+            "idempotent replay must return same revision"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -2189,31 +2494,41 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: cid.to_string(),
-                title: "Original".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Original".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
         let card_uuid = Uuid::parse_str(&card.id).unwrap();
 
-        let updated = svc.update_card(authed_request_with_object(
-            UpdateCardRequest {
-                card_id: card.id.clone(),
-                card: Some(Card {
-                    title: "Updated Title".to_string(),
-                    ..Default::default()
-                }),
-                update_mask: None,
-                idempotency_key: Uuid::new_v4().to_string(),
-            },
-            &subject, &card.id,
-        )).await.expect("update failed").into_inner();
+        let updated = svc
+            .update_card(authed_request_with_object(
+                UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card {
+                        title: "Updated Title".to_string(),
+                        ..Default::default()
+                    }),
+                    update_mask: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("update failed")
+            .into_inner();
 
         assert_eq!(updated.title, "Updated Title");
         assert!(updated.revision > card.revision, "revision must bump");
@@ -2223,7 +2538,10 @@ mod tests {
             "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardUpdated'",
         )
         .bind(bid)
-        .fetch_one(&pool).await.unwrap().get(0);
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
         assert!(event_count >= 1, "at least one CardUpdated event_log row");
 
         cleanup_project(&pool, pid).await;
@@ -2242,44 +2560,77 @@ mod tests {
         let cid = seed_column(&pool, bid).await;
         let label_id = seed_label(&pool, pid, "bug").await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(),
-                column_id: cid.to_string(),
-                title: "To Delete".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "To Delete".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
         let card_uuid = Uuid::parse_str(&card.id).unwrap();
 
         // Add assignee, label, checklist item, comment.
         svc.assign_card(authed_request_with_object(
-            AssignCardRequest { card_id: card.id.clone(), subject: subject.clone() },
-            &subject, &card.id,
-        )).await.expect("assign failed");
+            AssignCardRequest {
+                card_id: card.id.clone(),
+                subject: subject.clone(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("assign failed");
 
         sqlx::query("INSERT INTO card_labels (card_id, label_id) VALUES ($1, $2)")
-            .bind(card_uuid).bind(label_id)
-            .execute(&pool).await.unwrap();
+            .bind(card_uuid)
+            .bind(label_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         svc.add_checklist_item(authed_request_with_object(
-            AddChecklistItemRequest { card_id: card.id.clone(), text: "step 1".to_string(), ..Default::default() },
-            &subject, &card.id,
-        )).await.expect("add checklist failed");
+            AddChecklistItemRequest {
+                card_id: card.id.clone(),
+                text: "step 1".to_string(),
+                ..Default::default()
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("add checklist failed");
 
         svc.add_comment(authed_request_with_object(
-            AddCommentRequest { card_id: card.id.clone(), body: "hello".to_string(), idempotency_key: Uuid::new_v4().to_string() },
-            &subject, &card.id,
-        )).await.expect("add comment failed");
+            AddCommentRequest {
+                card_id: card.id.clone(),
+                body: "hello".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("add comment failed");
 
         // Delete.
         svc.delete_card(authed_request_with_object(
-            DeleteCardRequest { card_id: card.id.clone() },
-            &subject, &card.id,
-        )).await.expect("delete failed");
+            DeleteCardRequest {
+                card_id: card.id.clone(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("delete failed");
 
         // Verify cascade.
         let count = |table: &'static str| {
@@ -2287,7 +2638,10 @@ mod tests {
             async move {
                 sqlx::query(&format!("SELECT COUNT(*) FROM {table} WHERE card_id = $1"))
                     .bind(card_uuid)
-                    .fetch_one(&pool).await.unwrap().get::<i64, _>(0)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get::<i64, _>(0)
             }
         };
 
@@ -2311,32 +2665,51 @@ mod tests {
         let cid = seed_column(&pool, bid).await;
         let label_id = seed_label(&pool, pid, "feature").await;
 
-        let card1 = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "C1".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("c1 create failed").into_inner();
+        let card1 = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "C1".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("c1 create failed")
+            .into_inner();
 
-        let card2 = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "C2".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("c2 create failed").into_inner();
+        let card2 = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "C2".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("c2 create failed")
+            .into_inner();
 
-        let resp = svc.bulk_update_card_labels(authed_request_with_object(
-            BulkUpdateCardLabelsRequest {
-                card_ids: vec![card1.id.clone(), card2.id.clone()],
-                label_ids: vec![label_id.to_string()],
-                idempotency_key: Uuid::new_v4().to_string(),
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("bulk update failed").into_inner();
+        let resp = svc
+            .bulk_update_card_labels(authed_request_with_object(
+                BulkUpdateCardLabelsRequest {
+                    card_ids: vec![card1.id.clone(), card2.id.clone()],
+                    label_ids: vec![label_id.to_string()],
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("bulk update failed")
+            .into_inner();
 
         assert_eq!(resp.cards.len(), 2, "two cards returned");
         for c in &resp.cards {
@@ -2347,8 +2720,15 @@ mod tests {
         let update_count: i64 = sqlx::query(
             "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardUpdated'",
         )
-        .bind(bid).fetch_one(&pool).await.unwrap().get(0);
-        assert!(update_count >= 2, "at least 2 CardUpdated events (one per card in bulk)");
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+        assert!(
+            update_count >= 2,
+            "at least 2 CardUpdated events (one per card in bulk)"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -2364,27 +2744,48 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "Assign me".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Assign me".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
         // Assign twice — should not duplicate.
         svc.assign_card(authed_request_with_object(
-            AssignCardRequest { card_id: card.id.clone(), subject: subject.clone() },
-            &subject, &card.id,
-        )).await.expect("assign 1 failed");
+            AssignCardRequest {
+                card_id: card.id.clone(),
+                subject: subject.clone(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("assign 1 failed");
 
         svc.assign_card(authed_request_with_object(
-            AssignCardRequest { card_id: card.id.clone(), subject: subject.clone() },
-            &subject, &card.id,
-        )).await.expect("assign 2 failed");
+            AssignCardRequest {
+                card_id: card.id.clone(),
+                subject: subject.clone(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .expect("assign 2 failed");
 
-        let c = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap()).await.unwrap();
+        let c = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap())
+            .await
+            .unwrap();
         assert_eq!(c.assignees.len(), 1, "duplicate assign must be idempotent");
 
         cleanup_project(&pool, pid).await;
@@ -2401,30 +2802,50 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "Checklist card".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Checklist card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
         for text in &["Step A", "Step B", "Step C"] {
             svc.add_checklist_item(authed_request_with_object(
-                AddChecklistItemRequest { card_id: card.id.clone(), text: text.to_string(), position: 0, idempotency_key: String::new() },
-                &subject, &card.id,
-            )).await.expect("add checklist failed");
+                AddChecklistItemRequest {
+                    card_id: card.id.clone(),
+                    text: text.to_string(),
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("add checklist failed");
         }
 
-        let updated = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap()).await.unwrap();
+        let updated = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap())
+            .await
+            .unwrap();
         assert_eq!(updated.checklist.len(), 3);
 
         let positions: Vec<i32> = updated.checklist.iter().map(|i| i.position).collect();
         // Positions should be 0, 1, 2 in order (COALESCE(MAX,-1)+1 chain).
         let mut sorted = positions.clone();
         sorted.sort();
-        assert_eq!(positions, sorted, "checklist items should be in position order");
+        assert_eq!(
+            positions, sorted,
+            "checklist items should be in position order"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -2440,30 +2861,51 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "Comment card".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &subject, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Comment card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
-        let comment = svc.add_comment(authed_request_with_object(
-            AddCommentRequest { card_id: card.id.clone(), body: "original body".to_string(), idempotency_key: Uuid::new_v4().to_string() },
-            &subject, &card.id,
-        )).await.expect("add comment failed").into_inner();
+        let comment = svc
+            .add_comment(authed_request_with_object(
+                AddCommentRequest {
+                    card_id: card.id.clone(),
+                    body: "original body".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("add comment failed")
+            .into_inner();
 
         assert_eq!(comment.body, "original body");
 
-        let edited = svc.edit_comment(authed_request_with_object(
-            EditCommentRequest {
-                card_id: card.id.clone(),
-                comment_id: comment.id.clone(),
-                body: "edited body".to_string(),
-            },
-            &subject, &card.id,
-        )).await.expect("edit comment failed").into_inner();
+        let edited = svc
+            .edit_comment(authed_request_with_object(
+                EditCommentRequest {
+                    card_id: card.id.clone(),
+                    comment_id: comment.id.clone(),
+                    body: "edited body".to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("edit comment failed")
+            .into_inner();
 
         assert_eq!(edited.body, "edited body");
         assert_eq!(edited.id, comment.id);
@@ -2472,8 +2914,15 @@ mod tests {
         let update_count: i64 = sqlx::query(
             "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardUpdated'",
         )
-        .bind(bid).fetch_one(&pool).await.unwrap().get(0);
-        assert!(update_count >= 1, "CardUpdated event_log row for comment edit");
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+        assert!(
+            update_count >= 1,
+            "CardUpdated event_log row for comment edit"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -2491,19 +2940,35 @@ mod tests {
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let card = svc.create_card(authed_request_with_object(
-            CreateCardRequest {
-                board_id: bid.to_string(), column_id: cid.to_string(),
-                title: "Auth card".to_string(), idempotency_key: Uuid::new_v4().to_string(),
-                ..Default::default()
-            },
-            &author, &bid.to_string(),
-        )).await.expect("create failed").into_inner();
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Auth card".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &author,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
 
-        let comment = svc.add_comment(authed_request_with_object(
-            AddCommentRequest { card_id: card.id.clone(), body: "author comment".to_string(), idempotency_key: Uuid::new_v4().to_string() },
-            &author, &card.id,
-        )).await.expect("add comment failed").into_inner();
+        let comment = svc
+            .add_comment(authed_request_with_object(
+                AddCommentRequest {
+                    card_id: card.id.clone(),
+                    body: "author comment".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &author,
+                &card.id,
+            ))
+            .await
+            .expect("add comment failed")
+            .into_inner();
 
         // `other` tries to delete — they are not author AND Keto (already checked by middleware)
         // granted them `edit` (that's what the matrix says). Since `edit` is confirmed in
@@ -2517,18 +2982,30 @@ mod tests {
         //
         // Pure non-admin rejection is enforced at the Keto layer (before this handler);
         // that path is tested in keto_dispatch tests. Here we verify the SQL behaviour:
-        let result = svc.delete_comment(authed_request_with_object(
-            DeleteCommentRequest { card_id: card.id.clone(), comment_id: comment.id.clone() },
-            &other, &card.id,
-        )).await;
+        let result = svc
+            .delete_comment(authed_request_with_object(
+                DeleteCommentRequest {
+                    card_id: card.id.clone(),
+                    comment_id: comment.id.clone(),
+                },
+                &other,
+                &card.id,
+            ))
+            .await;
 
         // With edit relation granted (CheckedObjectId present), the admin fallback deletes.
-        assert!(result.is_ok(), "admin path (edit relation confirmed) should succeed");
+        assert!(
+            result.is_ok(),
+            "admin path (edit relation confirmed) should succeed"
+        );
 
         // Verify comment is gone.
         let count: i64 = sqlx::query("SELECT COUNT(*) FROM comments WHERE id = $1")
             .bind(Uuid::parse_str(&comment.id).unwrap())
-            .fetch_one(&pool).await.unwrap().get(0);
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
         assert_eq!(count, 0, "comment should be deleted via admin path");
 
         cleanup_project(&pool, pid).await;

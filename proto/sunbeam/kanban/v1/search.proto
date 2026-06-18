@@ -2,7 +2,7 @@
 //
 // SearchService provides full-text card search backed by OpenSearch.
 // The index is populated by the kanban service on every card mutation
-// (title, description, labels, assignees, forgejo_links — matching the
+// (title, description, labels, assignees, github_links — matching the
 // field set in apps/kanban-old/server/opensearch.ts).
 //
 // Results are post-filtered through keto_expand_objects per Open Question 8:
@@ -85,7 +85,7 @@ message SearchCardsResponse {
 
 // SearchService provides full-text and faceted search over Kanban cards.
 //
-// Index fields: title, description, labels, assignees, forgejo_links
+// Index fields: title, description, labels, assignees, github_links
 // (matching apps/kanban-old/server/opensearch.ts field set).
 //
 // Auth: SearchCards requires a valid bearer token. Post-filtering via

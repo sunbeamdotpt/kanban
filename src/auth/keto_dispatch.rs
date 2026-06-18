@@ -25,18 +25,9 @@
 //! do *not* use seconds in the watermark path — the conversion happens once,
 //! here, and is documented by name.
 
-use std::{
-    fmt,
-    sync::Arc,
-};
+use std::{fmt, sync::Arc};
 
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-    Extension,
-};
+use axum::{Extension, extract::Request, http::StatusCode, middleware::Next, response::Response};
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
@@ -115,7 +106,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 49] = [
+static MATRIX: [DispatchEntry; 58] = [
     // ── AuthService (2) ─────────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AuthService/WhoAmI",
@@ -380,36 +371,92 @@ static MATRIX: [DispatchEntry; 49] = [
         relation: "view",
         object_id_source: ObjectIdSource::Header,
     },
-    // ── ForgejoLinkService (5) ──────────────────────────────────────────────
-    // object_id is the card_id throughout; Forgejo link IDs are not Keto objects.
+    // ── GithubLinkService (5) ───────────────────────────────────────────────
+    // object_id is the card_id throughout; GitHub link IDs are not Keto objects.
     DispatchEntry {
-        method: "/sunbeam.kanban.v1.ForgejoLinkService/LinkIssue",
+        method: "/sunbeam.kanban.v1.GithubLinkService/LinkIssue",
         namespace: "KanbanCard",
         relation: "edit",
         object_id_source: ObjectIdSource::Header,
     },
     DispatchEntry {
-        method: "/sunbeam.kanban.v1.ForgejoLinkService/UnlinkIssue",
+        method: "/sunbeam.kanban.v1.GithubLinkService/UnlinkIssue",
         namespace: "KanbanCard",
         relation: "edit",
         object_id_source: ObjectIdSource::Header,
     },
     DispatchEntry {
-        method: "/sunbeam.kanban.v1.ForgejoLinkService/ListLinksByCard",
+        method: "/sunbeam.kanban.v1.GithubLinkService/ListLinksByCard",
         namespace: "KanbanCard",
         relation: "view",
         object_id_source: ObjectIdSource::Header,
     },
     DispatchEntry {
-        method: "/sunbeam.kanban.v1.ForgejoLinkService/SearchForgejoIssues",
+        method: "/sunbeam.kanban.v1.GithubLinkService/SearchGithubIssues",
         namespace: "KanbanCard",
         relation: "view",
         object_id_source: ObjectIdSource::Header,
     },
     DispatchEntry {
-        method: "/sunbeam.kanban.v1.ForgejoLinkService/ResyncLink",
+        method: "/sunbeam.kanban.v1.GithubLinkService/ResyncLink",
         namespace: "KanbanCard",
         relation: "edit",
+        object_id_source: ObjectIdSource::Header,
+    },
+    // ── AggregatedBoardService (9) ──────────────────────────────────────────
+    // object_id is the aggregated_board_id.
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/CreateAggregatedBoard",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/GetAggregatedBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "view",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/UpdateAggregatedBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "edit",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/DeleteAggregatedBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "manage",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/ListAggregatedBoards",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // post-filter via keto_expand
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/AddSourceBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "manage",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/RemoveSourceBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "manage",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/MoveSourceBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "manage",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.AggregatedBoardService/SubscribeAggregatedBoard",
+        namespace: "KanbanAggregatedBoard",
+        relation: "view",
         object_id_source: ObjectIdSource::Header,
     },
     // ── SearchService (1) ───────────────────────────────────────────────────
@@ -433,7 +480,10 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     subject.hash(&mut h);
     // Format as 016x so the field width is stable in log output.
-    format!("{:016x}", <std::collections::hash_map::DefaultHasher as Hasher>::finish(&h))
+    format!(
+        "{:016x}",
+        <std::collections::hash_map::DefaultHasher as Hasher>::finish(&h)
+    )
 }
 
 // ============================================================================
@@ -514,10 +564,7 @@ pub(crate) async fn dispatch_check(
                 subject_hash = %hash_subject_prefix(subject),
                 "keto_dispatch: token revoked by logout watermark"
             );
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "token revoked".to_string(),
-            ));
+            return Err((StatusCode::UNAUTHORIZED, "token revoked".to_string()));
         }
         Err(e) => {
             tracing::error!(method, error = %e, "keto_dispatch: logout watermark unavailable");
@@ -544,10 +591,7 @@ pub(crate) async fn dispatch_check(
             let object_id = match object_id {
                 Some(id) if !id.is_empty() => id,
                 _ => {
-                    tracing::warn!(
-                        method,
-                        "keto_dispatch: missing x-sunbeam-object-id header"
-                    );
+                    tracing::warn!(method, "keto_dispatch: missing x-sunbeam-object-id header");
                     return Err((
                         StatusCode::BAD_REQUEST,
                         "x-sunbeam-object-id header is required for this RPC".to_string(),
@@ -614,8 +658,14 @@ mod tests {
         let expected = expected_methods_from_protos();
         let actual: HashSet<&str> = MATRIX.iter().map(|e| e.method).collect();
 
-        let missing: Vec<_> = expected.iter().filter(|m| !actual.contains(m.as_str())).collect();
-        let extra: Vec<_> = actual.iter().filter(|m| !expected.iter().any(|e| e.as_str() == **m)).collect();
+        let missing: Vec<_> = expected
+            .iter()
+            .filter(|m| !actual.contains(m.as_str()))
+            .collect();
+        let extra: Vec<_> = actual
+            .iter()
+            .filter(|m| !expected.iter().any(|e| e.as_str() == **m))
+            .collect();
 
         assert!(
             missing.is_empty() && extra.is_empty(),
@@ -637,7 +687,14 @@ mod tests {
     /// Namespace must be one of the known values (or empty for None-source entries).
     #[test]
     fn matrix_uses_only_known_namespaces() {
-        let known = ["KanbanProject", "KanbanBoard", "KanbanCard", "_kanban_health", ""];
+        let known = [
+            "KanbanProject",
+            "KanbanBoard",
+            "KanbanCard",
+            "KanbanAggregatedBoard",
+            "_kanban_health",
+            "",
+        ];
         for entry in &MATRIX {
             assert!(
                 known.contains(&entry.namespace),
@@ -717,7 +774,11 @@ mod tests {
         req.extensions_mut().insert(state);
 
         let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::UNAUTHORIZED, "unauthenticated request must be rejected");
+        assert_eq!(
+            result,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated request must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -727,9 +788,7 @@ mod tests {
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/GetBoard", auth.clone());
 
         let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let watermark = Arc::new(
-            LogoutWatermark::new("redis://127.0.0.1:6379").unwrap(),
-        );
+        let watermark = Arc::new(LogoutWatermark::new("redis://127.0.0.1:6379").unwrap());
         let state = Arc::new(DispatchState {
             keto: dummy_keto,
             watermark,
@@ -786,6 +845,8 @@ mod tests {
                     "/sunbeam.kanban.v1.AuthService/SignalLogout",
                     "/sunbeam.kanban.v1.ProjectService/ListProjects",
                     "/sunbeam.kanban.v1.ProjectService/CreateProject",
+                    "/sunbeam.kanban.v1.AggregatedBoardService/CreateAggregatedBoard",
+                    "/sunbeam.kanban.v1.AggregatedBoardService/ListAggregatedBoards",
                     "/sunbeam.kanban.v1.SearchService/SearchCards",
                 ];
                 assert!(
@@ -798,8 +859,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_49() {
-        assert_eq!(MATRIX.len(), 49, "matrix must contain exactly 49 entries");
+    fn matrix_size_is_58() {
+        assert_eq!(MATRIX.len(), 58, "matrix must contain exactly 58 entries");
     }
 
     #[test]
@@ -836,7 +897,10 @@ mod tests {
             grpc_endpoint: keto_url,
             write_grpc_endpoint: keto_write_url,
         }));
-        let state = Arc::new(DispatchState { keto, watermark: watermark.clone() });
+        let state = Arc::new(DispatchState {
+            keto,
+            watermark: watermark.clone(),
+        });
 
         let subject = "user:test-revoke";
         // Write a watermark at t=1000ms (i.e. token iat must be >= 1000ms).
@@ -872,7 +936,11 @@ mod tests {
         req.extensions_mut().insert(state);
 
         let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::UNAUTHORIZED, "revoked token must be rejected");
+        assert_eq!(
+            result,
+            StatusCode::UNAUTHORIZED,
+            "revoked token must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -883,8 +951,8 @@ mod tests {
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
         use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
         let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
         let keto = Arc::new(KetoClient::new(KetoConfig {
@@ -948,10 +1016,7 @@ mod tests {
     /// The proto package is `sunbeam.kanban.v1`; service names and RPC names
     /// are extracted with a simple line-oriented regex (no codegen dependency).
     pub(crate) fn expected_methods_from_protos() -> HashSet<String> {
-        let proto_dir = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/proto/sunbeam/kanban/v1"
-        );
+        let proto_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/proto/sunbeam/kanban/v1");
 
         let mut methods = HashSet::new();
         let dir = std::fs::read_dir(proto_dir)
@@ -962,8 +1027,8 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("proto") {
                 continue;
             }
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("cannot read {path:?}"));
+            let content =
+                std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("cannot read {path:?}"));
 
             let mut current_service: Option<String> = None;
 
@@ -995,16 +1060,9 @@ mod tests {
                 // Detect rpc declarations.
                 if let Some(svc) = &current_service {
                     if let Some(rest) = trimmed.strip_prefix("rpc ") {
-                        let rpc_name = rest
-                            .split('(')
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
+                        let rpc_name = rest.split('(').next().unwrap_or("").trim().to_string();
                         if !rpc_name.is_empty() {
-                            let method = format!(
-                                "/sunbeam.kanban.v1.{svc}/{rpc_name}"
-                            );
+                            let method = format!("/sunbeam.kanban.v1.{svc}/{rpc_name}");
                             methods.insert(method);
                         }
                     }

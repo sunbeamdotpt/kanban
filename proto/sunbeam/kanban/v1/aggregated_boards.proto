@@ -1,0 +1,182 @@
+// Sunbeam Kanban — AggregatedBoard (meta board).
+//
+// An AggregatedBoard is a view spanning an explicit list of source boards,
+// typically from different projects. It does not own cards; mutations are
+// delegated to the existing BoardService / CardService RPCs against the
+// source board carried in each card/column.
+//
+// Auth: every RPC requires a valid bearer token. Keto checks are performed by
+// the kanban-local `keto_dispatch` middleware. Object IDs come from the
+// `x-sunbeam-object-id` header; see `keto_dispatch.rs` for the mapping.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "sunbeam/kanban/v1/boards.proto";
+import "sunbeam/kanban/v1/cards.proto";
+import "sunbeam/kanban/v1/events.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// ----------------------------------------------------------------------------
+// Messages
+// ----------------------------------------------------------------------------
+
+// AggregatedBoard is the metadata for a meta board.
+message AggregatedBoard {
+  string id = 1;            // ULID.
+  string name = 2;
+  string description = 3;
+  string icon = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// SourceBoardRef identifies a board included in an aggregate.
+message SourceBoardRef {
+  string board_id = 1;
+  string project_id = 2;
+  string name = 3;
+  string icon = 4;
+  int32 position = 5;       // Display order within the aggregate.
+}
+
+// AggregatedColumn is a virtual lane shown in the aggregate. In v1 each column
+// maps 1:1 to a source board; future versions may allow user-defined lanes.
+message AggregatedColumn {
+  string id = 1;            // Stable synthetic id derived from the source board.
+  string title = 2;
+  string accent = 3;
+  int32 wip_limit = 4;      // 0 means no limit.
+  int32 position = 5;
+  string source_board_id = 6;
+}
+
+// AggregatedCardBatch carries a chunk of cards emitted by GetAggregatedBoard.
+message AggregatedCardBatch {
+  repeated Card cards = 1;
+}
+
+// AggregatedBoardChunk is the server-streaming payload for GetAggregatedBoard.
+// The server emits exactly one metadata chunk first, then all source boards,
+// then all columns, then zero or more card batches.
+message AggregatedBoardChunk {
+  oneof payload {
+    AggregatedBoard metadata = 1;
+    SourceBoardRef source_board = 2;
+    AggregatedColumn column = 3;
+    AggregatedCardBatch card_batch = 4;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Request / response messages
+// ----------------------------------------------------------------------------
+
+message CreateAggregatedBoardRequest {
+  string name = 1;
+  string description = 2;
+  string icon = 3;
+  // Initial source boards; may be empty.
+  repeated string source_board_ids = 4;
+  // ULID for idempotency.
+  string idempotency_key = 5;
+}
+
+message GetAggregatedBoardRequest {
+  string aggregated_board_id = 1;
+}
+
+message UpdateAggregatedBoardRequest {
+  string aggregated_board_id = 1;
+  AggregatedBoard aggregated_board = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message DeleteAggregatedBoardRequest {
+  string aggregated_board_id = 1;
+}
+
+message ListAggregatedBoardsRequest {}
+
+message ListAggregatedBoardsResponse {
+  repeated AggregatedBoard aggregated_boards = 1;
+}
+
+message AddSourceBoardRequest {
+  string aggregated_board_id = 1;
+  string board_id = 2;
+  // 0 means append.
+  int32 position = 3;
+}
+
+message RemoveSourceBoardRequest {
+  string aggregated_board_id = 1;
+  string board_id = 2;
+}
+
+message MoveSourceBoardRequest {
+  string aggregated_board_id = 1;
+  string board_id = 2;
+  int32 to_position = 3;
+}
+
+// SubscribeAggregatedBoardRequest streams events from all source boards plus
+// aggregate-level metadata changes. since_seq is a JetStream resume token;
+// omit for live-tail only.
+message SubscribeAggregatedBoardRequest {
+  string aggregated_board_id = 1;
+  uint64 since_seq = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+// AggregatedBoardService manages meta boards and their source-board membership.
+//
+// GetAggregatedBoard is server-streaming and yields chunks so large aggregates
+// never require pagination. Card/column mutations are not exposed here; clients
+// call BoardService / CardService using the source board_id carried in each
+// card/column.
+service AggregatedBoardService {
+  // CreateAggregatedBoard requires a valid bearer token; no prior Keto object.
+  rpc CreateAggregatedBoard(CreateAggregatedBoardRequest) returns (AggregatedBoard);
+
+  // GetAggregatedBoard streams metadata, source boards, columns, and card
+  // batches. Requires "view" on the aggregated board.
+  rpc GetAggregatedBoard(GetAggregatedBoardRequest) returns (stream AggregatedBoardChunk);
+
+  // UpdateAggregatedBoard applies a sparse patch to metadata.
+  // Requires "edit" on the aggregated board.
+  rpc UpdateAggregatedBoard(UpdateAggregatedBoardRequest) returns (AggregatedBoard);
+
+  // DeleteAggregatedBoard requires "manage" on the aggregated board.
+  rpc DeleteAggregatedBoard(DeleteAggregatedBoardRequest) returns (google.protobuf.Empty);
+
+  // ListAggregatedBoards returns aggregates the caller can view, post-filtered
+  // via keto_expand_objects(KanbanAggregatedBoard, view, subject).
+  rpc ListAggregatedBoards(ListAggregatedBoardsRequest) returns (ListAggregatedBoardsResponse);
+
+  // AddSourceBoard includes a board in the aggregate.
+  // Requires "manage" on the aggregated board and "view" on the source board.
+  rpc AddSourceBoard(AddSourceBoardRequest) returns (AggregatedBoard);
+
+  // RemoveSourceBoard removes a board from the aggregate.
+  // Requires "manage" on the aggregated board.
+  rpc RemoveSourceBoard(RemoveSourceBoardRequest) returns (AggregatedBoard);
+
+  // MoveSourceBoard reorders a source board within the aggregate.
+  // Requires "manage" on the aggregated board.
+  rpc MoveSourceBoard(MoveSourceBoardRequest) returns (AggregatedBoard);
+
+  // SubscribeAggregatedBoard merges live event streams from all source boards.
+  // Requires "view" on the aggregated board.
+  rpc SubscribeAggregatedBoard(SubscribeAggregatedBoardRequest) returns (stream BoardEventEnvelope);
+}

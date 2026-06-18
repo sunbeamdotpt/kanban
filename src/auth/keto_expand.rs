@@ -58,10 +58,7 @@ pub async fn expand_objects(
     loop {
         // Guard: refuse to fetch the next page if we're already at the ceiling.
         if objects.len() >= max_results {
-            return Err(anyhow!(
-                "expand exceeded max_results: {}",
-                objects.len()
-            ));
+            return Err(anyhow!("expand exceeded max_results: {}", objects.len()));
         }
 
         let (tuples, next_token) = crate::auth::keto_compat::list_relation_tuples(
@@ -88,10 +85,7 @@ pub async fn expand_objects(
         for tuple in tuples {
             objects.insert(tuple.object);
             if objects.len() > max_results {
-                return Err(anyhow!(
-                    "expand exceeded max_results: {}",
-                    objects.len()
-                ));
+                return Err(anyhow!("expand exceeded max_results: {}", objects.len()));
             }
         }
 
@@ -127,8 +121,8 @@ mod tests {
     /// message if unreachable so tests skip gracefully (no panic on CI when
     /// the compose stack is down).
     async fn probe() -> Option<KetoCtx> {
-        let grpc_endpoint = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let grpc_endpoint =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let write_grpc_endpoint = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 

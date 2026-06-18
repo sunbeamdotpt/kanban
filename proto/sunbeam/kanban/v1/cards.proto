@@ -5,7 +5,7 @@
 // The canonical `Column` message lives in `boards.proto` (authored in
 // Stage 1c); events.proto imports Column from there. cards.proto owns
 // Card and Card-only value types (Label, Assignee, ChecklistItem,
-// MilestoneRef, ForgejoLink).
+// MilestoneRef, GitHubLink).
 //
 // Field-numbering policy: every field is reserved for life. Add new fields
 // at the next free tag. Never reuse a tag. Never change a type.
@@ -17,7 +17,7 @@ package sunbeam.kanban.v1;
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
-import "sunbeam/kanban/v1/forgejo.proto";
+import "sunbeam/kanban/v1/github.proto";
 
 option java_package = "pt.sunbeam.kanban.v1";
 option java_multiple_files = true;
@@ -50,7 +50,7 @@ message Assignee {
   string avatar_url = 3;    // optional cache; may be empty.
 }
 
-// ForgejoLink lives in forgejo.proto (Stage 1c) — imported above.
+// GitHubLink lives in github.proto (Stage 1c) — imported above.
 
 // One checklist item on a card.
 message ChecklistItem {
@@ -102,7 +102,7 @@ message Card {
   repeated Label labels = 15;
   repeated Assignee assignees = 16;
   repeated ChecklistItem checklist = 17;
-  repeated ForgejoLink forgejo_links = 18;
+  repeated GitHubLink github_links = 18;
   // Counts only; full lists fetched on demand.
   int32 comments_count = 19;
   int32 attachments_count = 20;

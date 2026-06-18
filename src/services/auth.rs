@@ -20,10 +20,7 @@ pub struct AuthServiceImpl {
 
 #[tonic::async_trait]
 impl AuthService for AuthServiceImpl {
-    async fn who_am_i(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<WhoAmIResponse>, Status> {
+    async fn who_am_i(&self, request: Request<()>) -> Result<Response<WhoAmIResponse>, Status> {
         let auth = request
             .extensions()
             .get::<AuthContext>()
@@ -182,12 +179,14 @@ mod tests {
         // We still need an Arc<LogoutWatermark> for construction; use a dummy URL
         // that will never be dialled in this test.
         let wm = Arc::new(
-            LogoutWatermark::new("redis://127.0.0.1:6399")
-                .expect("client construction is lazy"),
+            LogoutWatermark::new("redis://127.0.0.1:6399").expect("client construction is lazy"),
         );
         let svc = make_service(wm);
 
-        let auth = AuthContext::authenticated("user:test-whoami", Some(minimal_claims("user:test-whoami")));
+        let auth = AuthContext::authenticated(
+            "user:test-whoami",
+            Some(minimal_claims("user:test-whoami")),
+        );
         let req = request_with_auth((), auth);
 
         let resp = svc.who_am_i(req).await.expect("WhoAmI should succeed");
@@ -241,7 +240,10 @@ mod tests {
         let auth = AuthContext::unauthenticated();
         let req = request_with_auth((), auth);
 
-        let err = svc.who_am_i(req).await.expect_err("should be unauthenticated");
+        let err = svc
+            .who_am_i(req)
+            .await
+            .expect_err("should be unauthenticated");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -254,20 +256,32 @@ mod tests {
         let svc = make_service(Arc::clone(&wm));
 
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let subject = format!("user:test-sl-write-{ts}");
 
         let auth = AuthContext::authenticated(&subject, Some(minimal_claims(&subject)));
         let req = request_with_auth((), auth);
 
-        let resp = svc.signal_logout(req).await.expect("SignalLogout should succeed");
+        let resp = svc
+            .signal_logout(req)
+            .await
+            .expect("SignalLogout should succeed");
         let returned_wm = resp.get_ref().watermark_ms;
         assert_eq!(resp.get_ref().subject, subject);
         assert!(returned_wm > 0, "watermark_ms must be positive");
 
         // Confirm persisted in Valkey by reading it back directly.
-        let stored = wm.watermark_for(&subject).await.expect("watermark_for failed");
-        assert_eq!(stored as i64, returned_wm, "stored watermark must match returned value");
+        let stored = wm
+            .watermark_for(&subject)
+            .await
+            .expect("watermark_for failed");
+        assert_eq!(
+            stored as i64, returned_wm,
+            "stored watermark must match returned value"
+        );
     }
 
     #[tokio::test]
@@ -277,20 +291,32 @@ mod tests {
         let svc = make_service(Arc::clone(&wm));
 
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let subject = format!("user:test-sl-seq-{ts}");
 
         let auth1 = AuthContext::authenticated(&subject, Some(minimal_claims(&subject)));
-        let resp1 = svc.signal_logout(request_with_auth((), auth1)).await.expect("first SignalLogout");
+        let resp1 = svc
+            .signal_logout(request_with_auth((), auth1))
+            .await
+            .expect("first SignalLogout");
         let wm1 = resp1.get_ref().watermark_ms;
 
         // Small delay to guarantee clock advances.
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 
         let auth2 = AuthContext::authenticated(&subject, Some(minimal_claims(&subject)));
-        let resp2 = svc.signal_logout(request_with_auth((), auth2)).await.expect("second SignalLogout");
+        let resp2 = svc
+            .signal_logout(request_with_auth((), auth2))
+            .await
+            .expect("second SignalLogout");
         let wm2 = resp2.get_ref().watermark_ms;
 
-        assert!(wm2 > wm1, "second watermark ({wm2}) must exceed first ({wm1})");
+        assert!(
+            wm2 > wm1,
+            "second watermark ({wm2}) must exceed first ({wm1})"
+        );
     }
 }

@@ -60,10 +60,10 @@ impl BoundedSet {
         if self.set.contains(id) {
             return false;
         }
-        if self.queue.len() >= self.capacity {
-            if let Some(oldest) = self.queue.pop_front() {
-                self.set.remove(&oldest);
-            }
+        if self.queue.len() >= self.capacity
+            && let Some(oldest) = self.queue.pop_front()
+        {
+            self.set.remove(&oldest);
         }
         self.queue.push_back(id.to_string());
         self.set.insert(id.to_string());
@@ -188,10 +188,10 @@ impl CutoverTracker {
         }
 
         // Guard: seq must be strictly greater than the last seen live seq.
-        if let Some(last_seq) = self.last_live_seq {
-            if nats_seq <= last_seq {
-                return Outcome::OutOfOrder;
-            }
+        if let Some(last_seq) = self.last_live_seq
+            && nats_seq <= last_seq
+        {
+            return Outcome::OutOfOrder;
         }
 
         // Dedupe by event_id across phases.

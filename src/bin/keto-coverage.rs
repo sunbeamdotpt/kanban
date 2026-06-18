@@ -33,10 +33,7 @@ fn main() {
         v
     };
     let extra: Vec<_> = {
-        let mut v: Vec<_> = actual
-            .iter()
-            .filter(|m| !expected.contains(**m))
-            .collect();
+        let mut v: Vec<_> = actual.iter().filter(|m| !expected.contains(**m)).collect();
         v.sort();
         v
     };
@@ -58,14 +55,20 @@ fn main() {
     if extra.is_empty() {
         println!("keto-coverage: no extra entries");
     } else {
-        println!("\nEXTRA in matrix ({}) (no matching proto RPC):", extra.len());
+        println!(
+            "\nEXTRA in matrix ({}) (no matching proto RPC):",
+            extra.len()
+        );
         for m in &extra {
             println!("  + {m}");
         }
     }
 
     if ok {
-        println!("\nketo-coverage: OK — matrix covers all {} RPCs", expected.len());
+        println!(
+            "\nketo-coverage: OK — matrix covers all {} RPCs",
+            expected.len()
+        );
         process::exit(0);
     } else {
         eprintln!(
@@ -165,17 +168,12 @@ fn scan_proto_methods(dir: &Path) -> HashSet<String> {
                 continue;
             }
 
-            if let Some(svc) = &current_service {
-                if let Some(rest) = trimmed.strip_prefix("rpc ") {
-                    let rpc_name = rest
-                        .split('(')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if !rpc_name.is_empty() {
-                        methods.insert(format!("/sunbeam.kanban.v1.{svc}/{rpc_name}"));
-                    }
+            if let Some(svc) = &current_service
+                && let Some(rest) = trimmed.strip_prefix("rpc ")
+            {
+                let rpc_name = rest.split('(').next().unwrap_or("").trim().to_string();
+                if !rpc_name.is_empty() {
+                    methods.insert(format!("/sunbeam.kanban.v1.{svc}/{rpc_name}"));
                 }
             }
         }

@@ -68,11 +68,11 @@ use uuid::Uuid;
 
 use sunbeam_g2v::mq::NatsClient;
 
-use crate::pb::{
-    board_event_envelope::Payload, BoardEventEnvelope, CardCreated, CardDeleted,
-    CardMoved, CardUpdated,
-};
 use super::jetstream_bootstrap::board_subject;
+use crate::pb::{
+    BoardEventEnvelope, CardCreated, CardDeleted, CardMoved, CardUpdated,
+    board_event_envelope::Payload,
+};
 
 // ── OutboxDispatcher ──────────────────────────────────────────────────────────
 
@@ -139,8 +139,11 @@ impl OutboxDispatcher {
     /// drain in-flight rows before SIGTERM.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            info!("outbox dispatcher started (poll_interval={}ms, batch_size={})",
-                self.poll_interval.as_millis(), self.batch_size);
+            info!(
+                "outbox dispatcher started (poll_interval={}ms, batch_size={})",
+                self.poll_interval.as_millis(),
+                self.batch_size
+            );
             loop {
                 match self.drain_once().await {
                     Ok(n) if n > 0 => {
@@ -173,9 +176,10 @@ impl OutboxDispatcher {
         let board_filter: Option<Uuid> = None;
 
         let rows = sqlx::query(
-            "SELECT id, board_id, event_type, payload, created_at \
+            "SELECT id, board_id, aggregated_board_id, event_type, payload, created_at \
              FROM event_log \
-             WHERE nats_seq IS NULL AND ($2::uuid IS NULL OR board_id = $2) \
+             WHERE nats_seq IS NULL \
+               AND ($2::uuid IS NULL OR board_id = $2 OR aggregated_board_id = $2) \
              ORDER BY id \
              LIMIT $1",
         )
@@ -189,31 +193,29 @@ impl OutboxDispatcher {
 
         for row in &rows {
             let row_id: Uuid = row.get("id");
-            let board_id: Uuid = row.get("board_id");
+            let object_id: Uuid = row
+                .get::<Option<Uuid>, _>("aggregated_board_id")
+                .or_else(|| row.get::<Option<Uuid>, _>("board_id"))
+                .expect("event_log row has neither board_id nor aggregated_board_id");
             let event_type: String = row.get("event_type");
             let payload_json: JsonValue = row.get("payload");
             let created_at: DateTime<Utc> = row.get("created_at");
 
             // Step 2: build BoardEventEnvelope.
-            let envelope = build_envelope(
-                row_id,
-                board_id,
-                &event_type,
-                &payload_json,
-                created_at,
-            );
+            let envelope =
+                build_envelope(row_id, object_id, &event_type, &payload_json, created_at);
 
             // Step 3: encode to bytes.
             let encoded = Bytes::from(envelope.encode_to_vec());
 
             // Step 4: publish via JetStream.
-            let subject = board_subject(&board_id.to_string());
+            let subject = board_subject(&object_id.to_string());
             let ack_future = match self.nats.publish_jetstream(&subject, encoded).await {
                 Ok(f) => f,
                 Err(e) => {
                     warn!(
                         row_id = %row_id,
-                        board_id = %board_id,
+                        object_id = %object_id,
                         event_type = %event_type,
                         error = %e,
                         "outbox: publish failed — row left undispatched for retry"
@@ -346,10 +348,7 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                position: json
-                    .get("position")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32,
+                position: json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 idempotency_key,
             }))
         }
@@ -389,10 +388,7 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let to_position = json
-                .get("position")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
+            let to_position = json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             Some(Payload::CardMoved(CardMoved {
                 card_id,
                 from_column,
@@ -434,8 +430,7 @@ mod tests {
     use sunbeam_g2v::config::NatsConfig;
 
     use crate::test_support::{
-        database_url, nats_url, seed_card_chain, seed_event_log,
-        seed_event_log_dispatched,
+        database_url, nats_url, seed_card_chain, seed_event_log, seed_event_log_dispatched,
     };
 
     // ── Test helpers ──────────────────────────────────────────────────────────
@@ -578,7 +573,10 @@ mod tests {
         let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
         let n = dispatcher.drain_once().await.expect("drain_once failed");
 
-        assert_eq!(n, 0, "expected 0 dispatched — already-dispatched row must be skipped");
+        assert_eq!(
+            n, 0,
+            "expected 0 dispatched — already-dispatched row must be skipped"
+        );
 
         cleanup(&pool, board_id, project_id).await;
     }
@@ -603,17 +601,32 @@ mod tests {
         let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
 
         // First call dispatches the row.
-        let n1 = dispatcher.drain_once().await.expect("first drain_once failed");
+        let n1 = dispatcher
+            .drain_once()
+            .await
+            .expect("first drain_once failed");
         assert_eq!(n1, 1, "expected 1 dispatched on first call");
 
         // Second call — same instance, row now has nats_seq set.
-        let n2 = dispatcher.drain_once().await.expect("second drain_once failed");
-        assert_eq!(n2, 0, "expected 0 dispatched on second call (already dispatched)");
+        let n2 = dispatcher
+            .drain_once()
+            .await
+            .expect("second drain_once failed");
+        assert_eq!(
+            n2, 0,
+            "expected 0 dispatched on second call (already dispatched)"
+        );
 
         // Simulate restart: construct a fresh dispatcher against the same DB.
         let dispatcher2 = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
-        let n3 = dispatcher2.drain_once().await.expect("third drain_once (restart) failed");
-        assert_eq!(n3, 0, "expected 0 dispatched after restart (row already marked)");
+        let n3 = dispatcher2
+            .drain_once()
+            .await
+            .expect("third drain_once (restart) failed");
+        assert_eq!(
+            n3, 0,
+            "expected 0 dispatched after restart (row already marked)"
+        );
 
         cleanup(&pool, board_id, project_id).await;
     }
@@ -653,7 +666,10 @@ mod tests {
             }
         }
 
-        assert_eq!(total, 10, "expected all 10 rows dispatched across multiple passes");
+        assert_eq!(
+            total, 10,
+            "expected all 10 rows dispatched across multiple passes"
+        );
         assert_eq!(count_dispatched(&pool, board_id).await, 10);
 
         cleanup(&pool, board_id, project_id).await;
@@ -697,7 +713,10 @@ mod tests {
         seed_event_log(&pool, board_id, "CardCreated").await;
 
         let dispatcher = make_dispatcher(pool.clone(), bad_nats, board_id);
-        let n = dispatcher.drain_once().await.expect("drain_once must not propagate publish error");
+        let n = dispatcher
+            .drain_once()
+            .await
+            .expect("drain_once must not propagate publish error");
         assert_eq!(n, 0, "expected 0 dispatched when publish fails");
 
         // Row must still be undispatched.

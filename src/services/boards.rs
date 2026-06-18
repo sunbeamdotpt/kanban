@@ -25,8 +25,8 @@ use prost_types::Timestamp;
 use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::broadcast;
-use tonic::{Request, Response, Status};
 use tokio_stream::Stream;
+use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -37,12 +37,10 @@ use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::board_service_server::BoardService;
 use crate::pb::{
-    board_event_envelope::Payload, AddColumnRequest, Board, BoardDetail,
-    BoardEventEnvelope, Column, CreateBoardRequest,
-    Cutover, DeleteBoardRequest, GetBoardRequest, Heartbeat,
-    ListBoardsRequest, ListBoardsResponse, MoveColumnRequest,
-    MoveColumnResponse, RemoveColumnRequest, SubscribeBoardRequest,
-    UpdateBoardRequest, UpdateColumnRequest,
+    AddColumnRequest, Board, BoardDetail, BoardEventEnvelope, Column, CreateBoardRequest, Cutover,
+    DeleteBoardRequest, GetBoardRequest, Heartbeat, ListBoardsRequest, ListBoardsResponse,
+    MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest, SubscribeBoardRequest,
+    UpdateBoardRequest, UpdateColumnRequest, board_event_envelope::Payload,
 };
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
@@ -203,7 +201,9 @@ fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
         emitted_at: None,
         emitter_pod_id: String::new(),
         actor_subject: "system".to_string(),
-        payload: Some(Payload::Cutover(Cutover { last_replay_nats_seq })),
+        payload: Some(Payload::Cutover(Cutover {
+            last_replay_nats_seq,
+        })),
     }
 }
 
@@ -238,10 +238,10 @@ async fn revalidate_token(watermark: &LogoutWatermark, auth: &AuthContext) -> Re
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    if let Some(claims) = &auth.claims {
-        if claims.exp < now_secs {
-            return Ok(false);
-        }
+    if let Some(claims) = &auth.claims
+        && claims.exp < now_secs
+    {
+        return Ok(false);
     }
 
     // Check logout watermark.
@@ -469,14 +469,13 @@ impl BoardService for BoardServiceImpl {
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Uuid>> = sqlx::query(
-                "SELECT response_card_id FROM idempotency_keys WHERE key = $1",
-            )
-            .bind(&req.idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("idempotency key lookup failed", e))?
-            .map(|r| r.get("response_card_id"));
+            let cached: Option<Option<Uuid>> =
+                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
+                    .bind(&req.idempotency_key)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| internal("idempotency key lookup failed", e))?
+                    .map(|r| r.get("response_card_id"));
 
             if let Some(Some(board_id)) = cached {
                 let row = sqlx::query(
@@ -491,7 +490,11 @@ impl BoardService for BoardServiceImpl {
                 if let Some(row) = row {
                     let columns_count = fetch_columns_count(&self.pool, board_id).await;
                     let cards_count = fetch_cards_count(&self.pool, board_id).await;
-                    return Ok(Response::new(board_from_row(&row, columns_count, cards_count)));
+                    return Ok(Response::new(board_from_row(
+                        &row,
+                        columns_count,
+                        cards_count,
+                    )));
                 }
             }
         }
@@ -516,14 +519,18 @@ impl BoardService for BoardServiceImpl {
         .bind(&req.name)
         .bind(&slug)
         .bind(&req.description)
-        .bind(if req.icon.is_empty() { None } else { Some(req.icon.clone()) })
+        .bind(if req.icon.is_empty() {
+            None
+        } else {
+            Some(req.icon.clone())
+        })
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e {
-                if db.constraint() == Some("boards_project_id_slug_key") {
-                    return Status::already_exists("board with that name already exists in project");
-                }
+            if let sqlx::Error::Database(ref db) = e
+                && db.constraint() == Some("boards_project_id_slug_key")
+            {
+                return Status::already_exists("board with that name already exists in project");
             }
             internal("failed to insert board", e)
         })?;
@@ -549,8 +556,8 @@ impl BoardService for BoardServiceImpl {
         }
 
         // Store idempotency response.
-        if !req.idempotency_key.is_empty() {
-            if let Err(e) = sqlx::query(
+        if !req.idempotency_key.is_empty()
+            && let Err(e) = sqlx::query(
                 "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
             .bind(&req.idempotency_key)
@@ -560,7 +567,6 @@ impl BoardService for BoardServiceImpl {
             {
                 warn!(error = %e, "failed to store idempotency key");
             }
-        }
 
         Ok(Response::new(board_from_row(&row, 0, 0)))
     }
@@ -603,7 +609,11 @@ impl BoardService for BoardServiceImpl {
 
         let columns_count = fetch_columns_count(&self.pool, board_id).await;
         let cards_count = fetch_cards_count(&self.pool, board_id).await;
-        Ok(Response::new(board_from_row(&row, columns_count, cards_count)))
+        Ok(Response::new(board_from_row(
+            &row,
+            columns_count,
+            cards_count,
+        )))
     }
 
     // ── DeleteBoard ───────────────────────────────────────────────────────────
@@ -661,14 +671,13 @@ impl BoardService for BoardServiceImpl {
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Uuid>> = sqlx::query(
-                "SELECT response_card_id FROM idempotency_keys WHERE key = $1",
-            )
-            .bind(&req.idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("idempotency key lookup failed", e))?
-            .map(|r| r.get("response_card_id"));
+            let cached: Option<Option<Uuid>> =
+                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
+                    .bind(&req.idempotency_key)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| internal("idempotency key lookup failed", e))?
+                    .map(|r| r.get("response_card_id"));
 
             if let Some(Some(col_id)) = cached {
                 let row = sqlx::query(
@@ -701,8 +710,16 @@ impl BoardService for BoardServiceImpl {
             .bind(column_id)
             .bind(board_id)
             .bind(&req.title)
-            .bind(if req.accent.is_empty() { None } else { Some(req.accent.clone()) })
-            .bind(if req.wip_limit == 0 { None } else { Some(req.wip_limit) })
+            .bind(if req.accent.is_empty() {
+                None
+            } else {
+                Some(req.accent.clone())
+            })
+            .bind(if req.wip_limit == 0 {
+                None
+            } else {
+                Some(req.wip_limit)
+            })
             .fetch_one(&self.pool)
             .await
             .map_err(|e| internal("failed to insert column", e))?
@@ -723,8 +740,16 @@ impl BoardService for BoardServiceImpl {
             .bind(column_id)
             .bind(board_id)
             .bind(&req.title)
-            .bind(if req.accent.is_empty() { None } else { Some(req.accent.clone()) })
-            .bind(if req.wip_limit == 0 { None } else { Some(req.wip_limit) })
+            .bind(if req.accent.is_empty() {
+                None
+            } else {
+                Some(req.accent.clone())
+            })
+            .bind(if req.wip_limit == 0 {
+                None
+            } else {
+                Some(req.wip_limit)
+            })
             .bind(req.position)
             .fetch_one(&self.pool)
             .await
@@ -734,8 +759,8 @@ impl BoardService for BoardServiceImpl {
         // Stage 4: emit BoardEventEnvelope::ColumnAdded over NATS subject kanban.board.<board_id>.events
 
         // Store idempotency response.
-        if !req.idempotency_key.is_empty() {
-            if let Err(e) = sqlx::query(
+        if !req.idempotency_key.is_empty()
+            && let Err(e) = sqlx::query(
                 "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
             .bind(&req.idempotency_key)
@@ -745,7 +770,6 @@ impl BoardService for BoardServiceImpl {
             {
                 warn!(error = %e, "failed to store idempotency key");
             }
-        }
 
         Ok(Response::new(column_from_row(&row)))
     }
@@ -820,15 +844,14 @@ impl BoardService for BoardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
         // Verify the column belongs to this board.
-        let exists: bool = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM columns WHERE id = $1 AND board_id = $2)",
-        )
-        .bind(col_id)
-        .bind(board_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| internal("failed to verify column ownership", e))
-        .map(|r| r.get::<bool, _>(0))?;
+        let exists: bool =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM columns WHERE id = $1 AND board_id = $2)")
+                .bind(col_id)
+                .bind(board_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| internal("failed to verify column ownership", e))
+                .map(|r| r.get::<bool, _>(0))?;
 
         if !exists {
             return Err(Status::not_found("column not found on this board"));
@@ -900,16 +923,15 @@ impl BoardService for BoardServiceImpl {
         let target_pos = req.to_position - 1;
 
         // Fetch current position.
-        let current_pos: i32 = sqlx::query(
-            "SELECT position FROM columns WHERE id = $1 AND board_id = $2",
-        )
-        .bind(col_id)
-        .bind(board_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch column position", e))?
-        .ok_or_else(|| Status::not_found("column not found on this board"))
-        .map(|r| r.get("position"))?;
+        let current_pos: i32 =
+            sqlx::query("SELECT position FROM columns WHERE id = $1 AND board_id = $2")
+                .bind(col_id)
+                .bind(board_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch column position", e))?
+                .ok_or_else(|| Status::not_found("column not found on this board"))
+                .map(|r| r.get("position"))?;
 
         if current_pos != target_pos {
             if target_pos > current_pos {
@@ -939,14 +961,12 @@ impl BoardService for BoardServiceImpl {
             }
 
             // Place the moved column at its new position.
-            sqlx::query(
-                "UPDATE columns SET position = $2, updated_at = now() WHERE id = $1",
-            )
-            .bind(col_id)
-            .bind(target_pos)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| internal("failed to place moved column", e))?;
+            sqlx::query("UPDATE columns SET position = $2, updated_at = now() WHERE id = $1")
+                .bind(col_id)
+                .bind(target_pos)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| internal("failed to place moved column", e))?;
         }
 
         // Stage 4: emit BoardEventEnvelope::ColumnsReordered over NATS subject kanban.board.<board_id>.events
@@ -1000,20 +1020,18 @@ mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
     use std::time::Duration;
-    use sunbeam_g2v::middleware::auth::AuthContext;
     use sunbeam_g2v::config::NatsConfig;
+    use sunbeam_g2v::middleware::auth::AuthContext;
     use sunbeam_g2v::mq::NatsClient;
 
     // ── Subscribe test helpers ───────────────────────────────────────────────
 
     fn nats_url() -> String {
-        std::env::var("NATS_URL")
-            .unwrap_or_else(|_| "nats://localhost:4222".to_string())
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
     }
 
     fn valkey_url() -> String {
-        std::env::var("VALKEY_URL")
-            .unwrap_or_else(|_| "redis://localhost:6379".to_string())
+        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string())
     }
 
     async fn connect_nats() -> Arc<NatsClient> {
@@ -1065,11 +1083,9 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("watermark"),
-        );
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
@@ -1080,7 +1096,9 @@ mod tests {
         ));
 
         // Grant view so the initial Keto recheck passes.
-        let _ = keto.grant("KanbanBoard", &board_id, "view", &subject_str).await;
+        let _ = keto
+            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .await;
 
         let mut stream = build_subscribe_board_stream(
             registry,
@@ -1103,7 +1121,10 @@ mod tests {
 
         match first.payload {
             Some(Payload::Cutover(c)) => {
-                assert_eq!(c.last_replay_nats_seq, 0, "cutover seq must be 0 for empty replay");
+                assert_eq!(
+                    c.last_replay_nats_seq, 0,
+                    "cutover seq must be 0 for empty replay"
+                );
             }
             other => panic!("expected Cutover, got {other:?}"),
         }
@@ -1133,11 +1154,9 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("watermark"),
-        );
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
@@ -1146,7 +1165,9 @@ mod tests {
                 write_grpc_endpoint: keto_write_url,
             },
         ));
-        let _ = keto.grant("KanbanBoard", &board_id, "view", &subject_str).await;
+        let _ = keto
+            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .await;
 
         let mut stream = build_subscribe_board_stream(
             registry,
@@ -1225,11 +1246,9 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("watermark"),
-        );
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
@@ -1238,7 +1257,9 @@ mod tests {
                 write_grpc_endpoint: keto_write_url,
             },
         ));
-        let _ = keto.grant("KanbanBoard", &board_id, "view", &subject_str).await;
+        let _ = keto
+            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .await;
 
         // Use a 1s heartbeat interval so we don't need to sleep 15s.
         let mut stream = build_subscribe_board_stream(
@@ -1268,7 +1289,10 @@ mod tests {
 
         match heartbeat_env.payload {
             Some(Payload::Heartbeat(h)) => {
-                assert!(h.server_time_ms > 0, "heartbeat server_time_ms must be positive");
+                assert!(
+                    h.server_time_ms > 0,
+                    "heartbeat server_time_ms must be positive"
+                );
             }
             other => panic!("expected Heartbeat, got {other:?}"),
         }
@@ -1298,11 +1322,9 @@ mod tests {
         // Issue a token with iat=0 so that once watermark > 0, it's revoked.
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("watermark"),
-        );
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
@@ -1311,7 +1333,9 @@ mod tests {
                 write_grpc_endpoint: keto_write_url,
             },
         ));
-        let _ = keto.grant("KanbanBoard", &board_id, "view", &subject_str).await;
+        let _ = keto
+            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .await;
 
         // Use a 100ms heartbeat so the loop iterates rapidly and picks up the
         // watermark quickly.
@@ -1383,11 +1407,9 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("watermark"),
-        );
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
@@ -1397,7 +1419,9 @@ mod tests {
             },
         ));
         // Grant view so initial check passes.
-        let _ = keto.grant("KanbanBoard", &board_id, "view", &subject_str).await;
+        let _ = keto
+            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .await;
 
         let keto_clone = Arc::clone(&keto);
         let board_id_clone = board_id.clone();
@@ -1470,13 +1494,11 @@ mod tests {
     }
 
     fn keto_read_url() -> String {
-        std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string())
+        std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string())
     }
 
     fn keto_write_url() -> String {
-        std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string())
+        std::env::var("KETO_WRITE_GRPC_URL").unwrap_or_else(|_| "http://localhost:4467".to_string())
     }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
@@ -1491,10 +1513,12 @@ mod tests {
     }
 
     fn setup_keto() -> Arc<KetoClient> {
-        Arc::new(KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
-            grpc_endpoint: keto_read_url(),
-            write_grpc_endpoint: keto_write_url(),
-        }))
+        Arc::new(KetoClient::new(
+            sunbeam_g2v::middleware::auth::keto::KetoConfig {
+                grpc_endpoint: keto_read_url(),
+                write_grpc_endpoint: keto_write_url(),
+            },
+        ))
     }
 
     /// Build a `BoardServiceImpl` for integration tests.
@@ -1505,10 +1529,14 @@ mod tests {
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> BoardServiceImpl {
         let nats = connect_nats().await;
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test"));
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url()).expect("LogoutWatermark::new"),
-        );
-        BoardServiceImpl { pool, keto, registry, watermark }
+        let watermark =
+            Arc::new(LogoutWatermark::new(&valkey_url()).expect("LogoutWatermark::new"));
+        BoardServiceImpl {
+            pool,
+            keto,
+            registry,
+            watermark,
+        }
     }
 
     /// Build an authenticated request carrying a subject in extensions.
@@ -1545,7 +1573,14 @@ mod tests {
     }
 
     /// Seed a card row for test setup.
-    async fn create_test_card(pool: &PgPool, project_id: Uuid, board_id: Uuid, column_id: Uuid, subject: &str, ref_: &str) -> Uuid {
+    async fn create_test_card(
+        pool: &PgPool,
+        project_id: Uuid,
+        board_id: Uuid,
+        column_id: Uuid,
+        subject: &str,
+        ref_: &str,
+    ) -> Uuid {
         let card_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO cards (id, project_id, board_id, column_id, ref, title, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1607,7 +1642,9 @@ mod tests {
 
         let detail = svc
             .get_board(authed_request_with_object(
-                GetBoardRequest { board_id: board_id.clone() },
+                GetBoardRequest {
+                    board_id: board_id.clone(),
+                },
                 &subject,
                 &board_id,
             ))
@@ -1666,7 +1703,9 @@ mod tests {
 
         let list_a = svc
             .list_boards(authed_request_with_object(
-                ListBoardsRequest { project_id: project_a.to_string() },
+                ListBoardsRequest {
+                    project_id: project_a.to_string(),
+                },
                 &subject,
                 &project_a.to_string(),
             ))
@@ -1681,7 +1720,9 @@ mod tests {
 
         let list_b = svc
             .list_boards(authed_request_with_object(
-                ListBoardsRequest { project_id: project_b.to_string() },
+                ListBoardsRequest {
+                    project_id: project_b.to_string(),
+                },
                 &subject,
                 &project_b.to_string(),
             ))
@@ -1749,7 +1790,10 @@ mod tests {
             .into_inner();
 
         assert_eq!(updated.name, "Updated Name");
-        assert_eq!(updated.description, "original desc", "description should be unchanged");
+        assert_eq!(
+            updated.description, "original desc",
+            "description should be unchanged"
+        );
         assert_eq!(updated.icon, "star", "icon should be unchanged");
 
         cleanup_project(&pool, project_id).await;
@@ -1807,7 +1851,9 @@ mod tests {
 
         // Delete the board.
         svc.delete_board(authed_request_with_object(
-            DeleteBoardRequest { board_id: board.id.clone() },
+            DeleteBoardRequest {
+                board_id: board.id.clone(),
+            },
             &subject,
             &board.id,
         ))
@@ -1864,24 +1910,54 @@ mod tests {
 
         let c1 = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "C1".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "C1".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         let c2 = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "C2".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "C2".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         let c3 = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "C3".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "C3".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         // Positions should be 0, 1, 2 in order.
         assert_eq!(c1.position, 0, "first column position");
@@ -1920,32 +1996,66 @@ mod tests {
 
         // Add two columns at position 0 (append).
         svc.add_column(authed_request_with_object(
-            AddColumnRequest { board_id: bid.clone(), title: "First".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-            &subject, &bid,
-        )).await.expect("add First failed");
+            AddColumnRequest {
+                board_id: bid.clone(),
+                title: "First".to_string(),
+                accent: String::new(),
+                wip_limit: 0,
+                position: 0,
+                idempotency_key: String::new(),
+            },
+            &subject,
+            &bid,
+        ))
+        .await
+        .expect("add First failed");
 
         svc.add_column(authed_request_with_object(
-            AddColumnRequest { board_id: bid.clone(), title: "Second".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-            &subject, &bid,
-        )).await.expect("add Second failed");
+            AddColumnRequest {
+                board_id: bid.clone(),
+                title: "Second".to_string(),
+                accent: String::new(),
+                wip_limit: 0,
+                position: 0,
+                idempotency_key: String::new(),
+            },
+            &subject,
+            &bid,
+        ))
+        .await
+        .expect("add Second failed");
 
         // Insert "Middle" at position 1 (0-based), should push "Second" to position 2.
         let middle = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "Middle".to_string(), accent: String::new(), wip_limit: 0, position: 1, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "Middle".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 1,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add Middle failed").into_inner();
+            .await
+            .expect("add Middle failed")
+            .into_inner();
 
-        assert_eq!(middle.position, 1, "inserted column should be at position 1");
+        assert_eq!(
+            middle.position, 1,
+            "inserted column should be at position 1"
+        );
 
         // Verify "Second" was shifted to 2.
-        let second_pos: i32 = sqlx::query("SELECT position FROM columns WHERE board_id = $1 AND title = 'Second'")
-            .bind(Uuid::parse_str(&bid).unwrap())
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("position");
+        let second_pos: i32 =
+            sqlx::query("SELECT position FROM columns WHERE board_id = $1 AND title = 'Second'")
+                .bind(Uuid::parse_str(&bid).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("position");
         assert_eq!(second_pos, 2, "Second should have shifted to position 2");
 
         cleanup_project(&pool, project_id).await;
@@ -1972,16 +2082,28 @@ mod tests {
                 &subject,
                 &project_id.to_string(),
             ))
-            .await.expect("create_board failed").into_inner();
+            .await
+            .expect("create_board failed")
+            .into_inner();
 
         let bid = board.id.clone();
 
         let col = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "Old Title".to_string(), accent: "blue".to_string(), wip_limit: 5, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "Old Title".to_string(),
+                    accent: "blue".to_string(),
+                    wip_limit: 5,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         let updated = svc
             .update_column(authed_request_with_object(
@@ -2003,11 +2125,16 @@ mod tests {
                 &subject,
                 &bid,
             ))
-            .await.expect("update_column failed").into_inner();
+            .await
+            .expect("update_column failed")
+            .into_inner();
 
         assert_eq!(updated.title, "New Title");
         assert_eq!(updated.wip_limit, 10);
-        assert_eq!(updated.accent, "blue", "accent should be unchanged (empty patch)");
+        assert_eq!(
+            updated.accent, "blue",
+            "accent should be unchanged (empty patch)"
+        );
 
         cleanup_project(&pool, project_id).await;
     }
@@ -2033,47 +2160,84 @@ mod tests {
                 &subject,
                 &project_id.to_string(),
             ))
-            .await.expect("create_board failed").into_inner();
+            .await
+            .expect("create_board failed")
+            .into_inner();
 
         let bid = board.id.clone();
         let board_uuid = Uuid::parse_str(&bid).unwrap();
 
         let col = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: "Doomed".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
+                AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "Doomed".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &bid,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         let col_uuid = Uuid::parse_str(&col.id).unwrap();
 
         // Seed 3 cards in the doomed column.
         for i in 0..3 {
-            create_test_card(&pool, project_id, board_uuid, col_uuid, &subject, &format!("DEL-{i}")).await;
+            create_test_card(
+                &pool,
+                project_id,
+                board_uuid,
+                col_uuid,
+                &subject,
+                &format!("DEL-{i}"),
+            )
+            .await;
         }
 
         // Verify cards exist.
         let card_count_before: i64 = sqlx::query("SELECT COUNT(*) FROM cards WHERE column_id = $1")
             .bind(col_uuid)
-            .fetch_one(&pool).await.unwrap().get(0);
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
         assert_eq!(card_count_before, 3);
 
         svc.remove_column(authed_request_with_object(
-            RemoveColumnRequest { board_id: bid.clone(), column_id: col.id.clone() },
-            &subject, &bid,
+            RemoveColumnRequest {
+                board_id: bid.clone(),
+                column_id: col.id.clone(),
+            },
+            &subject,
+            &bid,
         ))
-        .await.expect("remove_column failed");
+        .await
+        .expect("remove_column failed");
 
         // Cards should be cascade-deleted.
         let card_count_after: i64 = sqlx::query("SELECT COUNT(*) FROM cards WHERE board_id = $1")
             .bind(board_uuid)
-            .fetch_one(&pool).await.unwrap().get(0);
-        assert_eq!(card_count_after, 0, "all cards in removed column should be gone");
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            card_count_after, 0,
+            "all cards in removed column should be gone"
+        );
 
         // Column should be gone.
         let col_exists: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM columns WHERE id = $1)")
             .bind(col_uuid)
-            .fetch_one(&pool).await.unwrap().get(0);
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
         assert!(!col_exists, "removed column should not exist");
 
         cleanup_project(&pool, project_id).await;
@@ -2098,9 +2262,12 @@ mod tests {
                     icon: String::new(),
                     idempotency_key: String::new(),
                 },
-                &subject, &project_a.to_string(),
+                &subject,
+                &project_a.to_string(),
             ))
-            .await.expect("create_board A failed").into_inner();
+            .await
+            .expect("create_board A failed")
+            .into_inner();
 
         let board_b = svc
             .create_board(authed_request_with_object(
@@ -2111,27 +2278,53 @@ mod tests {
                     icon: String::new(),
                     idempotency_key: String::new(),
                 },
-                &subject, &project_b.to_string(),
+                &subject,
+                &project_b.to_string(),
             ))
-            .await.expect("create_board B failed").into_inner();
+            .await
+            .expect("create_board B failed")
+            .into_inner();
 
         // Add a column to board B.
         let col_b = svc
             .add_column(authed_request_with_object(
-                AddColumnRequest { board_id: board_b.id.clone(), title: "Col B".to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &board_b.id,
+                AddColumnRequest {
+                    board_id: board_b.id.clone(),
+                    title: "Col B".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                },
+                &subject,
+                &board_b.id,
             ))
-            .await.expect("add_column failed").into_inner();
+            .await
+            .expect("add_column failed")
+            .into_inner();
 
         // Try to remove col_b using board_a's object id — should fail with not_found.
-        let result = svc.remove_column(authed_request_with_object(
-            RemoveColumnRequest { board_id: board_a.id.clone(), column_id: col_b.id.clone() },
-            &subject, &board_a.id,
-        )).await;
+        let result = svc
+            .remove_column(authed_request_with_object(
+                RemoveColumnRequest {
+                    board_id: board_a.id.clone(),
+                    column_id: col_b.id.clone(),
+                },
+                &subject,
+                &board_a.id,
+            ))
+            .await;
 
-        assert!(result.is_err(), "removing column from wrong board should fail");
+        assert!(
+            result.is_err(),
+            "removing column from wrong board should fail"
+        );
         let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::NotFound, "wrong board removal should be not_found");
+        assert_eq!(
+            status.code(),
+            tonic::Code::NotFound,
+            "wrong board removal should be not_found"
+        );
 
         cleanup_project(&pool, project_a).await;
         cleanup_project(&pool, project_b).await;
@@ -2155,19 +2348,34 @@ mod tests {
                     icon: String::new(),
                     idempotency_key: String::new(),
                 },
-                &subject, &project_id.to_string(),
+                &subject,
+                &project_id.to_string(),
             ))
-            .await.expect("create_board failed").into_inner();
+            .await
+            .expect("create_board failed")
+            .into_inner();
 
         let bid = board.id.clone();
 
         // Add 4 columns: A(0), B(1), C(2), D(3).
         let mut col_ids = vec![];
         for title in &["A", "B", "C", "D"] {
-            let c = svc.add_column(authed_request_with_object(
-                AddColumnRequest { board_id: bid.clone(), title: title.to_string(), accent: String::new(), wip_limit: 0, position: 0, idempotency_key: String::new() },
-                &subject, &bid,
-            )).await.expect("add_column failed").into_inner();
+            let c = svc
+                .add_column(authed_request_with_object(
+                    AddColumnRequest {
+                        board_id: bid.clone(),
+                        title: title.to_string(),
+                        accent: String::new(),
+                        wip_limit: 0,
+                        position: 0,
+                        idempotency_key: String::new(),
+                    },
+                    &subject,
+                    &bid,
+                ))
+                .await
+                .expect("add_column failed")
+                .into_inner();
             col_ids.push(c.id.clone());
         }
 
@@ -2178,21 +2386,32 @@ mod tests {
                     board_id: bid.clone(),
                     column_id: col_ids[3].clone(), // D
                     to_position: 1, // 1-based → 0-based = 0... wait, to_position=1 → target_pos=0
-                    // Let's move D to position 2 (1-based) → 0-based = 1: A, D, B, C
-                    // Actually, to make it clearer: move B (index 1, pos 1) to position 3 (1-based)
-                    // so A(0), C(1), D(2), B(3) → no let's keep it simple
+                                    // Let's move D to position 2 (1-based) → 0-based = 1: A, D, B, C
+                                    // Actually, to make it clearer: move B (index 1, pos 1) to position 3 (1-based)
+                                    // so A(0), C(1), D(2), B(3) → no let's keep it simple
                 },
-                &subject, &bid,
+                &subject,
+                &bid,
             ))
-            .await.expect("move_column failed").into_inner();
+            .await
+            .expect("move_column failed")
+            .into_inner();
 
         // The response must contain all 4 columns.
-        assert_eq!(resp.columns.len(), 4, "move response must include all columns");
+        assert_eq!(
+            resp.columns.len(),
+            4,
+            "move response must include all columns"
+        );
 
         // Positions must be gap-free: 0, 1, 2, 3.
         let mut positions: Vec<i32> = resp.columns.iter().map(|c| c.position).collect();
         positions.sort();
-        assert_eq!(positions, vec![0, 1, 2, 3], "positions must be 0-3 after move");
+        assert_eq!(
+            positions,
+            vec![0, 1, 2, 3],
+            "positions must be 0-3 after move"
+        );
 
         // D must now be at position 0.
         let d = resp.columns.iter().find(|c| c.id == col_ids[3]).unwrap();

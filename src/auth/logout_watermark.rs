@@ -75,9 +75,7 @@ impl LogoutWatermark {
 
         let key = Self::key(subject);
         let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let _: () = conn
-            .set_ex(&key, now_ms, WATERMARK_VALKEY_TTL_SECS)
-            .await?;
+        let _: () = conn.set_ex(&key, now_ms, WATERMARK_VALKEY_TTL_SECS).await?;
 
         // Update local cache so in-process reads are immediately consistent.
         {
@@ -98,20 +96,27 @@ impl LogoutWatermark {
         // Fast path: cache hit.
         {
             let guard = self.cache.read();
-            if let Some(&(wm, cached_at)) = guard.get(subject) {
-                if cached_at.elapsed() < CACHE_TTL {
-                    return Ok(wm);
-                }
+            if let Some(&(wm, cached_at)) = guard.get(subject)
+                && cached_at.elapsed() < CACHE_TTL
+            {
+                return Ok(wm);
             }
         }
 
         // Cache miss or stale: fetch from Valkey.
-        tracing::debug!(subject, "logout watermark cache miss — fetching from Valkey");
+        tracing::debug!(
+            subject,
+            "logout watermark cache miss — fetching from Valkey"
+        );
         let key = Self::key(subject);
-        let mut conn = self.client.get_multiplexed_async_connection().await.map_err(|e| {
-            tracing::warn!(subject, error = %e, "Valkey unavailable fetching logout watermark");
-            e
-        })?;
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                tracing::warn!(subject, error = %e, "Valkey unavailable fetching logout watermark");
+                e
+            })?;
 
         let raw: Option<u64> = conn.get(&key).await.map_err(|e| {
             tracing::warn!(subject, error = %e, "Valkey GET error for logout watermark");
@@ -181,7 +186,10 @@ mod tests {
         let written = wm.signal_logout(&sub).await.unwrap();
         let read = wm.watermark_for(&sub).await.unwrap();
 
-        assert_eq!(written, read, "watermark read back must equal what was written");
+        assert_eq!(
+            written, read,
+            "watermark read back must equal what was written"
+        );
         assert!(written > 0, "watermark must be a positive unix_ms");
     }
 
@@ -208,9 +216,18 @@ mod tests {
             wm.cache.write().remove(&sub);
         }
 
-        assert!(!wm.is_token_valid(&sub, 999).await.unwrap(), "iat < wm should be invalid");
-        assert!(wm.is_token_valid(&sub, 1_000).await.unwrap(), "iat == wm should be valid");
-        assert!(wm.is_token_valid(&sub, 1_001).await.unwrap(), "iat > wm should be valid");
+        assert!(
+            !wm.is_token_valid(&sub, 999).await.unwrap(),
+            "iat < wm should be invalid"
+        );
+        assert!(
+            wm.is_token_valid(&sub, 1_000).await.unwrap(),
+            "iat == wm should be valid"
+        );
+        assert!(
+            wm.is_token_valid(&sub, 1_001).await.unwrap(),
+            "iat > wm should be valid"
+        );
     }
 
     #[tokio::test]

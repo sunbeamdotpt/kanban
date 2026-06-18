@@ -66,7 +66,11 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
 ///   size       — clamped limit
 fn build_query(req: &SearchCardsRequest) -> Result<Value, Status> {
     let limit = {
-        let l = if req.limit <= 0 { DEFAULT_LIMIT } else { req.limit };
+        let l = if req.limit <= 0 {
+            DEFAULT_LIMIT
+        } else {
+            req.limit
+        };
         l.min(MAX_LIMIT)
     };
 
@@ -226,7 +230,11 @@ impl SearchService for SearchServiceImpl {
 
         // ── 1. Build OpenSearch query ────────────────────────────────────────
         let limit = {
-            let l = if req.limit <= 0 { DEFAULT_LIMIT } else { req.limit };
+            let l = if req.limit <= 0 {
+                DEFAULT_LIMIT
+            } else {
+                req.limit
+            };
             l.min(MAX_LIMIT) as usize
         };
 
@@ -324,10 +332,7 @@ impl SearchService for SearchServiceImpl {
         // (A stricter approach would re-query when post-filter drops many hits;
         // that's a Stage 4 refinement.)
         let next_cursor = if hits.len() >= limit {
-            last_sort
-                .as_deref()
-                .map(encode_cursor)
-                .unwrap_or_default()
+            last_sort.as_deref().map(encode_cursor).unwrap_or_default()
         } else {
             String::new()
         };
@@ -368,8 +373,10 @@ mod tests {
         let client = Arc::new(OpenSearchClient::new(cfg));
 
         // Try a simple HEAD request to the root.
-        let url = format!("{}/", std::env::var("OPENSEARCH_URL")
-            .unwrap_or_else(|_| "http://localhost:9200".to_string()));
+        let url = format!(
+            "{}/",
+            std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string())
+        );
         match reqwest::get(&url).await {
             Ok(r) if r.status().is_success() || r.status().as_u16() == 401 => Some(client),
             _ => {
@@ -381,8 +388,8 @@ mod tests {
 
     /// Probe Keto. Returns `None` (skip) if unreachable.
     async fn probe_keto() -> Option<Arc<KetoClient>> {
-        let grpc = std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let grpc =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let write_grpc = std::env::var("KETO_WRITE_GRPC_URL")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
@@ -428,13 +435,18 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_empty_when_index_missing() {
-        let Some(os) = probe_opensearch().await else { return };
-        let Some(keto) = probe_keto().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
+        let Some(keto) = probe_keto().await else {
+            return;
+        };
 
         // Deliberately use a non-existent index name.
         let nonexistent = "sunbeam-kanban-cards-test-does-not-exist-ever";
 
-        let result = os.search(nonexistent, &json!({ "query": { "match_all": {} } }))
+        let result = os
+            .search(nonexistent, &json!({ "query": { "match_all": {} } }))
             .await
             .expect("search should not return Err for missing index");
 
@@ -471,8 +483,12 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_card_by_title_match() {
-        let Some(os) = probe_opensearch().await else { return };
-        let Some(keto) = probe_keto().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
+        let Some(keto) = probe_keto().await else {
+            return;
+        };
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -487,7 +503,13 @@ mod tests {
             .await
             .expect("keto grant");
 
-        let doc = sample_card(&card_id, &board_id, &project_id, "Unique Zephyr Widget", vec![]);
+        let doc = sample_card(
+            &card_id,
+            &board_id,
+            &project_id,
+            "Unique Zephyr Widget",
+            vec![],
+        );
         os.index_card(&index, &doc).await.expect("index card");
         os.refresh(&index).await.expect("refresh");
 
@@ -504,7 +526,11 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp = os.search(&index, &body).await.expect("search").expect("got results");
+        let resp = os
+            .search(&index, &body)
+            .await
+            .expect("search")
+            .expect("got results");
 
         assert!(resp.hits.total.value >= 1, "expected ≥1 total hit");
         assert!(
@@ -528,7 +554,9 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_project_id() {
-        let Some(os) = probe_opensearch().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -540,8 +568,20 @@ mod tests {
         let card_a = format!("{}", uuid::Uuid::new_v4());
         let card_b = format!("{}", uuid::Uuid::new_v4());
 
-        let doc_a = sample_card(&card_a, &board_id, &project_a, "Widget in project A", vec![]);
-        let doc_b = sample_card(&card_b, &board_id, &project_b, "Widget in project B", vec![]);
+        let doc_a = sample_card(
+            &card_a,
+            &board_id,
+            &project_a,
+            "Widget in project A",
+            vec![],
+        );
+        let doc_b = sample_card(
+            &card_b,
+            &board_id,
+            &project_b,
+            "Widget in project B",
+            vec![],
+        );
         os.index_card(&index, &doc_a).await.expect("index a");
         os.index_card(&index, &doc_b).await.expect("index b");
         os.refresh(&index).await.expect("refresh");
@@ -559,11 +599,26 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp = os.search(&index, &body).await.expect("search").expect("results");
+        let resp = os
+            .search(&index, &body)
+            .await
+            .expect("search")
+            .expect("results");
 
-        let ids: Vec<&str> = resp.hits.hits.iter().map(|h| h.source.id.as_str()).collect();
-        assert!(ids.contains(&card_a.as_str()), "card_a missing from results");
-        assert!(!ids.contains(&card_b.as_str()), "card_b should be filtered out");
+        let ids: Vec<&str> = resp
+            .hits
+            .hits
+            .iter()
+            .map(|h| h.source.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&card_a.as_str()),
+            "card_a missing from results"
+        );
+        assert!(
+            !ids.contains(&card_b.as_str()),
+            "card_b should be filtered out"
+        );
 
         os.delete_index(&index).await.ok();
     }
@@ -572,7 +627,9 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_label_name() {
-        let Some(os) = probe_opensearch().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -584,7 +641,13 @@ mod tests {
         let card_feat = format!("{}", uuid::Uuid::new_v4());
 
         let doc_bug = sample_card(&card_bug, &board_id, &project_id, "A bug card", vec!["bug"]);
-        let doc_feat = sample_card(&card_feat, &board_id, &project_id, "A feature card", vec!["feature"]);
+        let doc_feat = sample_card(
+            &card_feat,
+            &board_id,
+            &project_id,
+            "A feature card",
+            vec!["feature"],
+        );
         os.index_card(&index, &doc_bug).await.expect("index bug");
         os.index_card(&index, &doc_feat).await.expect("index feat");
         os.refresh(&index).await.expect("refresh");
@@ -602,11 +665,23 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp = os.search(&index, &body).await.expect("search").expect("results");
+        let resp = os
+            .search(&index, &body)
+            .await
+            .expect("search")
+            .expect("results");
 
-        let ids: Vec<&str> = resp.hits.hits.iter().map(|h| h.source.id.as_str()).collect();
+        let ids: Vec<&str> = resp
+            .hits
+            .hits
+            .iter()
+            .map(|h| h.source.id.as_str())
+            .collect();
         assert!(ids.contains(&card_bug.as_str()), "bug card missing");
-        assert!(!ids.contains(&card_feat.as_str()), "feat card should be filtered");
+        assert!(
+            !ids.contains(&card_feat.as_str()),
+            "feat card should be filtered"
+        );
 
         os.delete_index(&index).await.ok();
     }
@@ -615,8 +690,12 @@ mod tests {
 
     #[tokio::test]
     async fn search_post_filters_via_keto_expand() {
-        let Some(os) = probe_opensearch().await else { return };
-        let Some(keto) = probe_keto().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
+        let Some(keto) = probe_keto().await else {
+            return;
+        };
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -634,8 +713,20 @@ mod tests {
         let card_allowed = format!("{}", uuid::Uuid::new_v4());
         let card_denied = format!("{}", uuid::Uuid::new_v4());
 
-        let doc_a = sample_card(&card_allowed, &board_allowed, &project_id, "visible card alpha", vec![]);
-        let doc_d = sample_card(&card_denied, &board_denied, &project_id, "hidden card alpha", vec![]);
+        let doc_a = sample_card(
+            &card_allowed,
+            &board_allowed,
+            &project_id,
+            "visible card alpha",
+            vec![],
+        );
+        let doc_d = sample_card(
+            &card_denied,
+            &board_denied,
+            &project_id,
+            "hidden card alpha",
+            vec![],
+        );
         os.index_card(&index, &doc_a).await.expect("index allowed");
         os.index_card(&index, &doc_d).await.expect("index denied");
         os.refresh(&index).await.expect("refresh");
@@ -675,7 +766,11 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp = os.search(&index, &body).await.expect("search").expect("results");
+        let resp = os
+            .search(&index, &body)
+            .await
+            .expect("search")
+            .expect("results");
 
         let authorized_hits: Vec<&str> = resp
             .hits
@@ -685,7 +780,11 @@ mod tests {
             .map(|h| h.source.id.as_str())
             .collect();
 
-        assert_eq!(authorized_hits.len(), 1, "expected exactly 1 authorized hit");
+        assert_eq!(
+            authorized_hits.len(),
+            1,
+            "expected exactly 1 authorized hit"
+        );
         assert_eq!(authorized_hits[0], card_allowed.as_str());
 
         // Teardown
@@ -704,7 +803,9 @@ mod tests {
 
     #[tokio::test]
     async fn search_paginates_via_next_cursor() {
-        let Some(os) = probe_opensearch().await else { return };
+        let Some(os) = probe_opensearch().await else {
+            return;
+        };
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -716,7 +817,13 @@ mod tests {
         let mut all_ids = vec![];
         for i in 0..5usize {
             let id = format!("{}", uuid::Uuid::new_v4());
-            let doc = sample_card(&id, &board_id, &project_id, &format!("Paginate card {i}"), vec![]);
+            let doc = sample_card(
+                &id,
+                &board_id,
+                &project_id,
+                &format!("Paginate card {i}"),
+                vec![],
+            );
             os.index_card(&index, &doc).await.expect("index card");
             all_ids.push(id);
         }
@@ -730,7 +837,11 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp1 = os.search(&index, &body_p1).await.expect("search p1").expect("results p1");
+        let resp1 = os
+            .search(&index, &body_p1)
+            .await
+            .expect("search p1")
+            .expect("results p1");
         assert_eq!(resp1.hits.hits.len(), 3, "page 1 should have 3 hits");
 
         let last_sort = resp1
@@ -759,8 +870,16 @@ mod tests {
             "track_total_hits": true
         });
 
-        let resp2 = os.search(&index, &body_p2).await.expect("search p2").expect("results p2");
-        assert_eq!(resp2.hits.hits.len(), 2, "page 2 should have remaining 2 hits");
+        let resp2 = os
+            .search(&index, &body_p2)
+            .await
+            .expect("search p2")
+            .expect("results p2");
+        assert_eq!(
+            resp2.hits.hits.len(),
+            2,
+            "page 2 should have remaining 2 hits"
+        );
 
         // All IDs across pages should be unique and sum to 5.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

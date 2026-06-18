@@ -4,13 +4,13 @@
 //! or `delete_relation_tuples`, so we implement them here using the generated
 //! gRPC clients from our local proto build.
 
-use tonic::transport::Channel;
 use crate::keto_proto::{
     ListRelationTuplesRequest, ListRelationTuplesResponse, RelationQuery, Subject,
     read_service_client::ReadServiceClient,
 };
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use sunbeam_g2v::error::{ServiceError, ServiceResult};
+use sunbeam_g2v::middleware::auth::keto::KetoClient;
+use tonic::transport::Channel;
 
 /// List relation tuples from Keto ReadService.
 pub async fn list_relation_tuples(
@@ -23,9 +23,7 @@ pub async fn list_relation_tuples(
 ) -> ServiceResult<(Vec<crate::keto_proto::RelationTuple>, String)> {
     let config = client.config();
     let channel = Channel::from_shared(config.grpc_endpoint.clone())
-        .map_err(|e| ServiceError::Internal(
-            format!("invalid keto endpoint: {e}")
-        ))?
+        .map_err(|e| ServiceError::Internal(format!("invalid keto endpoint: {e}")))?
         .connect_lazy();
 
     let mut grpc = ReadServiceClient::new(channel);
@@ -47,9 +45,9 @@ pub async fn list_relation_tuples(
     let resp: ListRelationTuplesResponse = grpc
         .list_relation_tuples(tonic::Request::new(req))
         .await
-        .map_err(|status| ServiceError::Internal(
-            format!("keto list_relation_tuples failed: {status}")
-        ))?
+        .map_err(|status| {
+            ServiceError::Internal(format!("keto list_relation_tuples failed: {status}"))
+        })?
         .into_inner();
 
     Ok((resp.relation_tuples, resp.next_page_token))
@@ -69,9 +67,7 @@ pub async fn delete_relation_tuples(
 
     let config = client.config();
     let channel = Channel::from_shared(config.write_grpc_endpoint.clone())
-        .map_err(|e| ServiceError::Internal(
-            format!("invalid keto write endpoint: {e}")
-        ))?
+        .map_err(|e| ServiceError::Internal(format!("invalid keto write endpoint: {e}")))?
         .connect_lazy();
 
     let mut grpc = WriteServiceClient::new(channel);
@@ -82,18 +78,19 @@ pub async fn delete_relation_tuples(
             object: None,
             relation: relation.map(|s| s.to_string()),
             subject: subject.map(|s| SgvSubject {
-                r#ref: Some(sunbeam_g2v::middleware::auth::keto_proto::subject::Ref::Id(s.to_string())),
+                r#ref: Some(sunbeam_g2v::middleware::auth::keto_proto::subject::Ref::Id(
+                    s.to_string(),
+                )),
             }),
         }),
         ..Default::default()
     };
 
-    grpc
-        .delete_relation_tuples(tonic::Request::new(req))
+    grpc.delete_relation_tuples(tonic::Request::new(req))
         .await
-        .map_err(|status| ServiceError::Internal(
-            format!("keto delete_relation_tuples failed: {status}")
-        ))?;
+        .map_err(|status| {
+            ServiceError::Internal(format!("keto delete_relation_tuples failed: {status}"))
+        })?;
 
     Ok(())
 }

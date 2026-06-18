@@ -21,8 +21,8 @@ use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use sqlx::PgPool;
 use sqlx::Row;
-use tonic::{Request, Response, Status};
 use tokio_stream::Stream;
+use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -32,15 +32,14 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
 use crate::auth::logout_watermark::LogoutWatermark;
-use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
     AddMemberRequest, BoardEventEnvelope, CreateProjectRequest, DeleteProjectRequest,
-    GetProjectRequest, ListMembersRequest, ListMembersResponse,
-    ListProjectsRequest, ListProjectsResponse, Project,
-    ProjectMember, RemoveMemberRequest, SubscribeProjectRequest,
+    GetProjectRequest, ListMembersRequest, ListMembersResponse, ListProjectsRequest,
+    ListProjectsResponse, Project, ProjectMember, RemoveMemberRequest, SubscribeProjectRequest,
     UpdateProjectRequest,
 };
+use crate::realtime::registry::BoardSubscriberRegistry;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -157,14 +156,13 @@ impl ProjectService for ProjectServiceImpl {
 
         // Idempotency check — look up by key; if found, re-fetch the project from DB.
         if !req.idempotency_key.is_empty() {
-            let cached_id: Option<Option<Uuid>> = sqlx::query(
-                "SELECT response_card_id FROM idempotency_keys WHERE key = $1",
-            )
-            .bind(&req.idempotency_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("idempotency key lookup failed", e))?
-            .map(|r| r.get("response_card_id"));
+            let cached_id: Option<Option<Uuid>> =
+                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
+                    .bind(&req.idempotency_key)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| internal("idempotency key lookup failed", e))?
+                    .map(|r| r.get("response_card_id"));
 
             if let Some(Some(project_id)) = cached_id {
                 let row = sqlx::query(
@@ -218,10 +216,10 @@ impl ProjectService for ProjectServiceImpl {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e {
-                if db.constraint() == Some("projects_slug_key") {
-                    return Status::already_exists("project with that prefix already exists");
-                }
+            if let sqlx::Error::Database(ref db) = e
+                && db.constraint() == Some("projects_slug_key")
+            {
+                return Status::already_exists("project with that prefix already exists");
             }
             internal("failed to insert project", e)
         })?;
@@ -258,8 +256,8 @@ impl ProjectService for ProjectServiceImpl {
         let project = project_from_row(&row, member_count);
 
         // Store idempotency response — record the created project UUID.
-        if !req.idempotency_key.is_empty() {
-            if let Err(e) = sqlx::query(
+        if !req.idempotency_key.is_empty()
+            && let Err(e) = sqlx::query(
                 "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
             .bind(&req.idempotency_key)
@@ -269,7 +267,6 @@ impl ProjectService for ProjectServiceImpl {
             {
                 warn!(error = %e, "failed to store idempotency key");
             }
-        }
 
         Ok(Response::new(project))
     }
@@ -417,10 +414,7 @@ impl ProjectService for ProjectServiceImpl {
 
     // ── AddMember ────────────────────────────────────────────────────────────
 
-    async fn add_member(
-        &self,
-        request: Request<AddMemberRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn add_member(&self, request: Request<AddMemberRequest>) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = Uuid::parse_str(&object_id)
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
@@ -442,7 +436,12 @@ impl ProjectService for ProjectServiceImpl {
 
         // Keto FIRST (mirror-table write order per plan / Pre-mortem 5).
         self.keto
-            .grant(KETO_NS, &project_id.to_string(), &req.relation, &req.subject)
+            .grant(
+                KETO_NS,
+                &project_id.to_string(),
+                &req.relation,
+                &req.subject,
+            )
             .await
             .map_err(|e| internal("failed to write Keto member tuple", e))?;
 
@@ -499,33 +498,31 @@ impl ProjectService for ProjectServiceImpl {
                 .map(|r| r.get("role"));
 
         // Delete Keto tuple for the known relation.
-        if let Some(ref relation) = existing_role {
-            if let Err(e) = crate::auth::keto_compat::delete_relation_tuples(
+        if let Some(ref relation) = existing_role
+            && let Err(e) = crate::auth::keto_compat::delete_relation_tuples(
                 &self.keto,
                 KETO_NS,
                 Some(relation.as_str()),
                 Some(&req.subject),
             )
             .await
-            {
-                warn!(
-                    error = %e,
-                    project_id = %project_id,
-                    subject = %req.subject,
-                    "mirror_drift: failed to delete Keto tuple for removed member"
-                );
-            }
+        {
+            warn!(
+                error = %e,
+                project_id = %project_id,
+                subject = %req.subject,
+                "mirror_drift: failed to delete Keto tuple for removed member"
+            );
         }
 
         // Delete SQL row.
-        let result = sqlx::query(
-            "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
-        )
-        .bind(project_id)
-        .bind(&req.subject)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| internal("failed to delete member row", e))?;
+        let result =
+            sqlx::query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2")
+                .bind(project_id)
+                .bind(&req.subject)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| internal("failed to delete member row", e))?;
 
         if result.rows_affected() == 0 {
             return Err(Status::not_found("member not found"));
@@ -593,13 +590,11 @@ mod tests {
     }
 
     fn keto_read_url() -> String {
-        std::env::var("KETO_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string())
+        std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string())
     }
 
     fn keto_write_url() -> String {
-        std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string())
+        std::env::var("KETO_WRITE_GRPC_URL").unwrap_or_else(|_| "http://localhost:4467".to_string())
     }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
@@ -614,17 +609,19 @@ mod tests {
     }
 
     fn setup_keto() -> Arc<KetoClient> {
-        Arc::new(KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
-            grpc_endpoint: keto_read_url(),
-            write_grpc_endpoint: keto_write_url(),
-        }))
+        Arc::new(KetoClient::new(
+            sunbeam_g2v::middleware::auth::keto::KetoConfig {
+                grpc_endpoint: keto_read_url(),
+                write_grpc_endpoint: keto_write_url(),
+            },
+        ))
     }
 
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
-        let nats_url = std::env::var("NATS_URL")
-            .unwrap_or_else(|_| "nats://localhost:4222".to_string());
-        let valkey_url = std::env::var("VALKEY_URL")
-            .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let valkey_url =
+            std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
         let nats = Arc::new(
             sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
                 url: nats_url,
@@ -635,10 +632,13 @@ mod tests {
             .expect("NATS connect failed"),
         );
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-projects"));
-        let watermark = Arc::new(
-            LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"),
-        );
-        ProjectServiceImpl { pool, keto, registry, watermark }
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"));
+        ProjectServiceImpl {
+            pool,
+            keto,
+            registry,
+            watermark,
+        }
     }
 
     /// Build an authenticated request carrying a subject in extensions.
@@ -715,7 +715,9 @@ mod tests {
 
         let fetched = svc
             .get_project(authed_request_with_object(
-                GetProjectRequest { project_id: created.id.clone() },
+                GetProjectRequest {
+                    project_id: created.id.clone(),
+                },
                 &subject,
                 &created.id,
             ))
@@ -790,7 +792,11 @@ mod tests {
             .into_inner();
 
         let ids_a: Vec<String> = list_a.projects.iter().map(|p| p.id.clone()).collect();
-        assert_eq!(ids_a.len(), 3, "user A should see exactly 3 projects, got: {ids_a:?}");
+        assert_eq!(
+            ids_a.len(),
+            3,
+            "user A should see exactly 3 projects, got: {ids_a:?}"
+        );
         for pid in &project_ids_a {
             assert!(
                 ids_a.contains(&pid.to_string()),
@@ -806,7 +812,11 @@ mod tests {
             .into_inner();
 
         let ids_b: Vec<String> = list_b.projects.iter().map(|p| p.id.clone()).collect();
-        assert_eq!(ids_b.len(), 1, "user B should see exactly 1 project, got: {ids_b:?}");
+        assert_eq!(
+            ids_b.len(),
+            1,
+            "user B should see exactly 1 project, got: {ids_b:?}"
+        );
         assert!(
             ids_b.contains(&project_id_b.to_string()),
             "user B's project {project_id_b} missing from list"
@@ -913,17 +923,18 @@ mod tests {
         let pid = Uuid::parse_str(&project_id).unwrap();
 
         // Verify it exists before delete.
-        let before: Option<Uuid> =
-            sqlx::query("SELECT id FROM projects WHERE id = $1")
-                .bind(pid)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
-                .map(|r| r.get("id"));
+        let before: Option<Uuid> = sqlx::query("SELECT id FROM projects WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .map(|r| r.get("id"));
         assert!(before.is_some(), "project should exist before delete");
 
         svc.delete_project(authed_request_with_object(
-            DeleteProjectRequest { project_id: project_id.clone() },
+            DeleteProjectRequest {
+                project_id: project_id.clone(),
+            },
             &subject,
             &project_id,
         ))
@@ -931,13 +942,12 @@ mod tests {
         .expect("delete_project failed");
 
         // Verify row is gone.
-        let after: Option<Uuid> =
-            sqlx::query("SELECT id FROM projects WHERE id = $1")
-                .bind(pid)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
-                .map(|r| r.get("id"));
+        let after: Option<Uuid> = sqlx::query("SELECT id FROM projects WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .map(|r| r.get("id"));
         assert!(after.is_none(), "project row should be gone after delete");
 
         // Cleanup residual Keto tuples (best-effort; delete already ran).
@@ -1066,7 +1076,10 @@ mod tests {
             .check_permission(KETO_NS, &project_id, "view", &member)
             .await
             .unwrap_or(false);
-        assert!(!keto_allowed, "Keto 'view' tuple should be gone after remove");
+        assert!(
+            !keto_allowed,
+            "Keto 'view' tuple should be gone after remove"
+        );
 
         // SQL row should be gone.
         let sql_row: Option<String> =
@@ -1077,7 +1090,10 @@ mod tests {
                 .await
                 .unwrap()
                 .map(|r| r.get("role"));
-        assert!(sql_row.is_none(), "project_members row should be gone after remove");
+        assert!(
+            sql_row.is_none(),
+            "project_members row should be gone after remove"
+        );
 
         // Cleanup
         cleanup_project(&pool, pid).await;
@@ -1126,7 +1142,9 @@ mod tests {
 
         let members = svc
             .list_members(authed_request_with_object(
-                ListMembersRequest { project_id: project_id.clone() },
+                ListMembersRequest {
+                    project_id: project_id.clone(),
+                },
                 &owner,
                 &project_id,
             ))
@@ -1143,8 +1161,14 @@ mod tests {
         );
 
         let subjects: Vec<&str> = members.iter().map(|m| m.subject.as_str()).collect();
-        assert!(subjects.contains(&owner.as_str()), "owner should be in members list");
-        assert!(subjects.contains(&viewer.as_str()), "viewer should be in members list");
+        assert!(
+            subjects.contains(&owner.as_str()),
+            "owner should be in members list"
+        );
+        assert!(
+            subjects.contains(&viewer.as_str()),
+            "viewer should be in members list"
+        );
 
         let viewer_entry = members.iter().find(|m| m.subject == viewer).unwrap();
         assert_eq!(viewer_entry.relation, "view");
@@ -1228,11 +1252,16 @@ mod tests {
         req.extensions_mut()
             .insert(AuthContext::authenticated(&subject, None));
         req.extensions_mut()
-            .insert(crate::auth::keto_dispatch::CheckedObjectId(project_id.clone()));
+            .insert(crate::auth::keto_dispatch::CheckedObjectId(
+                project_id.clone(),
+            ));
 
         let result = svc.subscribe_project(req).await;
 
-        assert!(result.is_err(), "SubscribeProject must return an error (unimplemented)");
+        assert!(
+            result.is_err(),
+            "SubscribeProject must return an error (unimplemented)"
+        );
         let status = result.err().expect("result was Ok after is_err check");
         assert_eq!(
             status.code(),

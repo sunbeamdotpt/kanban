@@ -128,8 +128,14 @@ message BoardEventEnvelope {
     CommentDeleted comment_deleted = 40;
     AttachmentAdded attachment_added = 41;
     AttachmentDeleted attachment_deleted = 42;
-    ForgejoLinkAdded forgejo_link_added = 43;
-    ForgejoLinkRefreshed forgejo_link_refreshed = 44;
+    GitHubLinkAdded github_link_added = 43;
+    GitHubLinkRefreshed github_link_refreshed = 44;
+    // ── Aggregated board events ──────────────────────────────────────────────
+    AggregatedBoardCreated aggregated_board_created = 45;
+    AggregatedBoardUpdated aggregated_board_updated = 46;
+    AggregatedBoardDeleted aggregated_board_deleted = 47;
+    SourceBoardAdded source_board_added = 48;
+    SourceBoardRemoved source_board_removed = 49;
     // ── Stream control ───────────────────────────────────────────────────────
     Heartbeat heartbeat = 19;
     Cutover cutover = 20;
@@ -151,7 +157,7 @@ message CardCreated {
 
 // Emitted on any non-positional card mutation (title, description,
 // labels, assignees, checklist, priority, due, blocked, cover,
-// milestone, comments_count, attachments_count, forgejo_links).
+// milestone, comments_count, attachments_count, github_links).
 // Carries a sparse patch instead of the full Card to keep envelope
 // size small — clients merge into their cached Card by `card_id`.
 //
@@ -393,15 +399,41 @@ message AttachmentDeleted {
   string attachment_id = 2;
 }
 
-// Emitted when a Forgejo issue is linked to a card.
-message ForgejoLinkAdded {
+// Emitted when a GitHub issue is linked to a card.
+message GitHubLinkAdded {
   string card_id = 1;
   string link_id = 2;
 }
 
-// Emitted when a Forgejo issue link is refreshed (state change, title update).
-message ForgejoLinkRefreshed {
+// Emitted when a GitHub issue link is refreshed (state change, title update).
+message GitHubLinkRefreshed {
   string card_id = 1;
   string link_id = 2;
   string new_state = 3;
+}
+// Emitted when an aggregated board is created.
+message AggregatedBoardCreated {
+  string aggregated_board_id = 1;
+}
+
+// Emitted when an aggregated board's metadata changes.
+message AggregatedBoardUpdated {
+  string aggregated_board_id = 1;
+}
+
+// Emitted when an aggregated board is deleted.
+message AggregatedBoardDeleted {
+  string aggregated_board_id = 1;
+}
+
+// Emitted when a source board is added to an aggregate.
+message SourceBoardAdded {
+  string aggregated_board_id = 1;
+  string board_id = 2;
+}
+
+// Emitted when a source board is removed from an aggregate.
+message SourceBoardRemoved {
+  string aggregated_board_id = 1;
+  string board_id = 2;
 }

@@ -24,20 +24,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_nats::jetstream::consumer::push;
-use tokio_stream::StreamExt;
 use parking_lot::RwLock;
 use prost::Message as ProstMessage;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use sunbeam_g2v::mq::NatsClient;
 
+use super::jetstream_bootstrap::{STREAM_NAME, board_subject, live_tail_consumer_name};
 use crate::pb::BoardEventEnvelope;
-use super::jetstream_bootstrap::{board_subject, live_tail_consumer_name, STREAM_NAME};
 
 /// Per-board ring-buffer capacity. 256 covers typical burst windows;
 /// slow receivers get `RecvError::Lagged` and must reconnect.
@@ -108,7 +108,11 @@ impl BoardSubscriberRegistry {
                 if let Some(ch) = guard.get_mut(board_id) {
                     ch.refcount += 1;
                     let receiver = ch.sender.subscribe();
-                    debug!(board_id, refcount = ch.refcount, "subscriber joined existing channel");
+                    debug!(
+                        board_id,
+                        refcount = ch.refcount,
+                        "subscriber joined existing channel"
+                    );
                     return Ok(StreamHandle {
                         board_id: board_id.to_string(),
                         receiver,
@@ -251,13 +255,11 @@ impl BoardSubscriberRegistry {
             }
         };
 
-        if remove {
-            if let Some(ch) = guard.remove(board_id) {
-                // Abort the pump task. The ephemeral consumer will be GC'd by
-                // NATS after `inactive_threshold` (30s). No async work needed.
-                ch.consumer_task.abort();
-                debug!(board_id, "removed board channel (last subscriber dropped)");
-            }
+        if remove && let Some(ch) = guard.remove(board_id) {
+            // Abort the pump task. The ephemeral consumer will be GC'd by
+            // NATS after `inactive_threshold` (30s). No async work needed.
+            ch.consumer_task.abort();
+            debug!(board_id, "removed board channel (last subscriber dropped)");
         }
     }
 }
@@ -292,8 +294,7 @@ mod tests {
     use sunbeam_g2v::config::NatsConfig;
 
     async fn connect_nats() -> Arc<NatsClient> {
-        let url = std::env::var("NATS_URL")
-            .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
         Arc::new(
             NatsClient::connect(&NatsConfig {
                 url,
@@ -324,9 +325,7 @@ mod tests {
             emitter_pod_id: "test-pod".to_string(),
             actor_subject: "test".to_string(),
             payload: Some(crate::pb::board_event_envelope::Payload::Heartbeat(
-                crate::pb::Heartbeat {
-                    server_time_ms: 0,
-                },
+                crate::pb::Heartbeat { server_time_ms: 0 },
             )),
         }
     }
@@ -349,7 +348,10 @@ mod tests {
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
-        let registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), "pod-test-1"));
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-1",
+        ));
         let mut handle = Arc::clone(&registry)
             .subscribe(&board_id)
             .await
@@ -375,13 +377,26 @@ mod tests {
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
-        let registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), "pod-test-2"));
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-2",
+        ));
 
-        let mut handle1 = Arc::clone(&registry).subscribe(&board_id).await.expect("subscribe 1");
-        let mut handle2 = Arc::clone(&registry).subscribe(&board_id).await.expect("subscribe 2");
+        let mut handle1 = Arc::clone(&registry)
+            .subscribe(&board_id)
+            .await
+            .expect("subscribe 1");
+        let mut handle2 = Arc::clone(&registry)
+            .subscribe(&board_id)
+            .await
+            .expect("subscribe 2");
 
         // Assert only one entry in the boards map.
-        assert_eq!(registry.boards.read().len(), 1, "should have exactly one board channel");
+        assert_eq!(
+            registry.boards.read().len(),
+            1,
+            "should have exactly one board channel"
+        );
         {
             let guard = registry.boards.read();
             let ch = guard.get(&board_id).expect("board channel missing");
@@ -412,10 +427,16 @@ mod tests {
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
-        let registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), "pod-test-3"));
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-3",
+        ));
 
         {
-            let _handle = Arc::clone(&registry).subscribe(&board_id).await.expect("subscribe");
+            let _handle = Arc::clone(&registry)
+                .subscribe(&board_id)
+                .await
+                .expect("subscribe");
             assert_eq!(registry.boards.read().len(), 1);
         } // handle drops here
 
@@ -430,7 +451,10 @@ mod tests {
         );
 
         // Re-subscribe opens a new channel (refcount starts at 1 again).
-        let _handle2 = Arc::clone(&registry).subscribe(&board_id).await.expect("re-subscribe");
+        let _handle2 = Arc::clone(&registry)
+            .subscribe(&board_id)
+            .await
+            .expect("re-subscribe");
         assert_eq!(registry.boards.read().len(), 1);
         {
             let guard = registry.boards.read();
@@ -447,10 +471,19 @@ mod tests {
 
         let board_a = format!("test-board-{}", Uuid::new_v4().simple());
         let board_b = format!("test-board-{}", Uuid::new_v4().simple());
-        let registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), "pod-test-4"));
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-4",
+        ));
 
-        let mut handle_a = Arc::clone(&registry).subscribe(&board_a).await.expect("sub a");
-        let mut handle_b = Arc::clone(&registry).subscribe(&board_b).await.expect("sub b");
+        let mut handle_a = Arc::clone(&registry)
+            .subscribe(&board_a)
+            .await
+            .expect("sub a");
+        let mut handle_b = Arc::clone(&registry)
+            .subscribe(&board_b)
+            .await
+            .expect("sub b");
 
         // Publish an event to board A only.
         let envelope = make_envelope(&board_a, "evt-a-only");
@@ -479,11 +512,20 @@ mod tests {
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
-        let registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), "pod-test-5"));
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-5",
+        ));
 
-        let mut fast = Arc::clone(&registry).subscribe(&board_id).await.expect("fast");
+        let mut fast = Arc::clone(&registry)
+            .subscribe(&board_id)
+            .await
+            .expect("fast");
         // Slow: we keep the handle alive but never read from it.
-        let _slow = Arc::clone(&registry).subscribe(&board_id).await.expect("slow");
+        let _slow = Arc::clone(&registry)
+            .subscribe(&board_id)
+            .await
+            .expect("slow");
 
         const EVENT_COUNT: usize = 300;
         for i in 0..EVENT_COUNT {

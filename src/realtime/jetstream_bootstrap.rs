@@ -134,15 +134,9 @@ impl From<&StreamConfig> for async_nats::jetstream::stream::Config {
             name: cfg.name.to_string(),
             subjects: cfg.subjects.iter().map(|s| s.to_string()).collect(),
             retention: match cfg.retention {
-                Retention::Limits => {
-                    async_nats::jetstream::stream::RetentionPolicy::Limits
-                }
-                Retention::Interest => {
-                    async_nats::jetstream::stream::RetentionPolicy::Interest
-                }
-                Retention::WorkQueue => {
-                    async_nats::jetstream::stream::RetentionPolicy::WorkQueue
-                }
+                Retention::Limits => async_nats::jetstream::stream::RetentionPolicy::Limits,
+                Retention::Interest => async_nats::jetstream::stream::RetentionPolicy::Interest,
+                Retention::WorkQueue => async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
             },
             max_age: Duration::from_secs(cfg.max_age_secs),
             max_messages_per_subject: cfg.max_msgs_per_subject,
@@ -175,7 +169,10 @@ impl From<&StreamConfig> for async_nats::jetstream::stream::Config {
 pub async fn ensure_kanban_stream(nats: &NatsClient, cfg: &StreamConfig) -> Result<()> {
     let nats_cfg = async_nats::jetstream::stream::Config::from(cfg);
     nats.ensure_stream(nats_cfg).await.map_err(|e| {
-        anyhow::anyhow!("fatal: failed to bootstrap {stream}: {e}", stream = cfg.name)
+        anyhow::anyhow!(
+            "fatal: failed to bootstrap {stream}: {e}",
+            stream = cfg.name
+        )
     })?;
     Ok(())
 }
@@ -194,8 +191,8 @@ mod tests {
     /// is shared / idempotent).
     #[tokio::test]
     async fn ensure_kanban_stream_is_idempotent() {
-        let nats_url = std::env::var("NATS_URL")
-            .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
 
         let nats = NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
             url: nats_url,

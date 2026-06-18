@@ -138,11 +138,7 @@ impl OpenSearchClient {
     /// Returns `Ok(None)` when OpenSearch returns 404 with
     /// `index_not_found_exception` — callers should treat this as an empty
     /// result set rather than an error.
-    pub async fn search(
-        &self,
-        index: &str,
-        body: &Value,
-    ) -> Result<Option<SearchResponse>> {
+    pub async fn search(&self, index: &str, body: &Value) -> Result<Option<SearchResponse>> {
         let url = format!("{}/{}/_search", self.base_url, index);
 
         let resp = self
@@ -159,7 +155,8 @@ impl OpenSearchClient {
         // 404 can mean index_not_found — parse and decide.
         if status == reqwest::StatusCode::NOT_FOUND {
             let text = resp.text().await.unwrap_or_default();
-            let parsed: OpenSearchError = serde_json::from_str(&text).unwrap_or(OpenSearchError { error: None });
+            let parsed: OpenSearchError =
+                serde_json::from_str(&text).unwrap_or(OpenSearchError { error: None });
             let is_index_missing = parsed
                 .error
                 .and_then(|e| e.kind)
@@ -167,7 +164,10 @@ impl OpenSearchClient {
                 .unwrap_or(false);
 
             if is_index_missing {
-                tracing::warn!(index, "opensearch: index not found — returning empty result");
+                tracing::warn!(
+                    index,
+                    "opensearch: index not found — returning empty result"
+                );
                 return Ok(None);
             }
 
