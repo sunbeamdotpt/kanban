@@ -1,14 +1,14 @@
 # Sunbeam Kanban
 
-Real-time collaborative board management for Sunbeam Studios. Organize cards across projects, share with teammates, link to Forgejo issues, search globally, and see changes sync live across tabs and devices.
+Real-time collaborative board management for Sunbeam Studios. Organize cards across projects, share with teammates, link to GitHub issues, search globally, and see changes sync live across tabs and devices.
 
 ## What It Does
 
 - **Boards & Cards:** Create projects with boards; add/drag/edit cards. Optimistic UI, server-truth reconciliation via event stream.
 - **Real-time Sync:** All changes stream to connected clients via NATS JetStream. Two users on different pods see each other's edits in ≤30ms.
 - **Access Control:** Keto-gated read/write. Share boards with team members; private boards visible only to you. Permission checks gate every RPC.
-- **Global Search:** Search card titles, descriptions, and Forgejo issue titles across all accessible projects. Results streamed and paginated.
-- **Forgejo Integration:** Link cards to Forgejo issues. Auto-fetch issue title, assignee, labels. Manual refresh for state sync (auto-sync is v2).
+- **Global Search:** Search card titles, descriptions, and GitHub issue titles across all accessible projects. Results streamed and paginated.
+- **GitHub Integration:** Link cards to GitHub issues. Auto-fetch issue title, assignee, labels. Manual refresh for state sync (auto-sync is v2).
 - **Dark Mode:** Styled with `@sunbeam/beam-ui` dark-mode tokens from beam-ui package.
 
 ## How to Run Locally

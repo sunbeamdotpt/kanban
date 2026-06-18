@@ -81,7 +81,7 @@ kanban/
 │   ├── test_support.rs         # Shared test seeders (project/board/column/card chain)
 │   ├── bin/keto-coverage.rs    # CI binary: verifies MATRIX covers all proto RPCs
 │   ├── auth/
-│   │   ├── keto_dispatch.rs    # Static 49-entry dispatch matrix + middleware
+│   │   ├── keto_dispatch.rs    # Static 58-entry dispatch matrix + middleware
 │   │   ├── keto_expand.rs      # `expand_objects` helper for list post-filtering
 │   │   └── logout_watermark.rs # Valkey-backed token revocation
 │   ├── realtime/
@@ -99,7 +99,7 @@ kanban/
 │       ├── boards.rs           # Board CRUD + column ops + SubscribeBoard
 │       ├── cards.rs            # 17-card RPCs (the largest service)
 │       ├── attachments.rs      # Presigned upload/download/confirm/delete
-│       ├── forgejo.rs          # Forgejo issue linking
+│       ├── github.rs           # GitHub issue linking
 │       └── search.rs           # Global card search (post-filtered via Keto)
 ├── ui/
 │   ├── package.json
@@ -169,6 +169,16 @@ cargo run --bin keto-coverage
 
 **Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.
 
+**Running tests with testcontainers (no compose stack required):**
+```sh
+# macOS with socktainer
+DOCKER_HOST=unix://$HOME/.socktainer/container.sock cargo test
+
+# Linux / Docker Desktop / OrbStack / Podman — any Docker-compatible socket
+cargo test
+```
+The `containers` harness in `src/test_support.rs` starts Postgres, NATS (JetStream), Valkey, and Keto automatically. Alternatively, set `DATABASE_URL`, `NATS_URL`, `VALKEY_URL`, `KETO_GRPC_URL`, and `KETO_WRITE_GRPC_URL` to reuse an existing stack. On Apple-silicon hosts running containers through `socktainer`/`container`, first container startup may be slow while images are pulled; the harness uses a 10-minute startup timeout.
+
 ### Frontend
 
 ```sh
@@ -207,9 +217,11 @@ Rust tests are **inline** inside `#[cfg(test)]` modules at the bottom of each so
 - **Integration tests:** Require shared Postgres, Valkey, and Keto. They run against the real database using the seeders in `test_support.rs`. Each test uses fresh UUIDs so parallel `nextest` tasks do not collide.
 - **No `#[ignore]` attributes:** All tests run by default. If a test requires external infra, it fails clearly rather than being skipped.
 
+> **Testcontainers support:** `src/test_support.rs` includes a `containers` harness that spins up Postgres, NATS (JetStream), Valkey, and Ory Keto via [`sunbeam-test`](https://github.com/sunbeamdotpt/test) and [`testcontainers-modules`](https://github.com/testcontainers/testcontainers-rs-modules-community). Set `DOCKER_HOST` to a Docker-compatible socket (e.g. socktainer on macOS) and run `cargo test`; the harness starts dependencies automatically and runs migrations. If the standard env vars are already set, the harness reuses external services instead.
+
 Key test modules:
 - `src/auth/keto_dispatch.rs` — Matrix shape tests + middleware behavior tests (mocked watermark/Keto) + integration tests (live Valkey + Keto).
-- `src/services/boards.rs`, `projects.rs`, `cards.rs` — Service handler integration tests (DB round-trips).
+- `src/services/boards.rs`, `projects.rs`, `cards.rs`, `aggregated_boards.rs` — Service handler integration tests (DB round-trips).
 - `src/realtime/outbox.rs` — Outbox dispatcher tests (event_log → NATS).
 - `src/realtime/registry.rs` — Broadcast fanout tests.
 
