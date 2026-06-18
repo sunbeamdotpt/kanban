@@ -31,10 +31,10 @@ use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::integrations::s3::{S3Client, S3Error, sanitize_filename};
 use crate::pb::attachment_service_server::AttachmentService;
 use crate::pb::{
-    Attachment, ConfirmUploadRequest, DeleteAttachmentRequest,
-    ListAttachmentsByCardRequest, ListAttachmentsByCardResponse,
-    RequestPresignedDownloadRequest, RequestPresignedDownloadResponse,
-    RequestPresignedUploadRequest, RequestPresignedUploadResponse,
+    Attachment, ConfirmUploadRequest, DeleteAttachmentRequest, ListAttachmentsByCardRequest,
+    ListAttachmentsByCardResponse, RequestPresignedDownloadRequest,
+    RequestPresignedDownloadResponse, RequestPresignedUploadRequest,
+    RequestPresignedUploadResponse,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -66,7 +66,10 @@ fn now_plus_secs(secs: u64) -> Timestamp {
         .unwrap_or(Duration::ZERO)
         .as_secs()
         .saturating_add(secs);
-    Timestamp { seconds: t as i64, nanos: 0 }
+    Timestamp {
+        seconds: t as i64,
+        nanos: 0,
+    }
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -160,7 +163,10 @@ impl AttachmentService for AttachmentServiceImpl {
 
         let attachment_id = Uuid::new_v4();
         let safe_filename = sanitize_filename(&req.filename);
-        let s3_key = format!("kanban/cards/{}/{}/{}", card_id, attachment_id, safe_filename);
+        let s3_key = format!(
+            "kanban/cards/{}/{}/{}",
+            card_id, attachment_id, safe_filename
+        );
 
         // INSERT pending row (size=0 initially; ConfirmUpload fills it from HEAD).
         sqlx::query(
@@ -179,7 +185,9 @@ impl AttachmentService for AttachmentServiceImpl {
         .await
         .map_err(|e| internal("failed to insert attachment row", e))?;
 
-        let presigned_url = self.s3.presign_put(&s3_key, &req.mime_type, UPLOAD_EXPIRES_SECS);
+        let presigned_url = self
+            .s3
+            .presign_put(&s3_key, &req.mime_type, UPLOAD_EXPIRES_SECS);
         let expires_at = now_plus_secs(UPLOAD_EXPIRES_SECS);
 
         Ok(Response::new(RequestPresignedUploadResponse {
@@ -220,13 +228,19 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "confirm_upload: card_id mismatch — possible header-vs-body bypass attempt"
             );
-            return Err(Status::permission_denied("attachment does not belong to the authorized card"));
+            return Err(Status::permission_denied(
+                "attachment does not belong to the authorized card",
+            ));
         }
 
         let s3_key: String = row.get("s3_key");
 
         // HEAD the object to verify it exists and get actual size.
-        let head = self.s3.head_object(&s3_key).await.map_err(|e| s3_err_to_status(e, "ConfirmUpload/HEAD"))?;
+        let head = self
+            .s3
+            .head_object(&s3_key)
+            .await
+            .map_err(|e| s3_err_to_status(e, "ConfirmUpload/HEAD"))?;
 
         // UPDATE size from the actual HEAD response.
         let updated = sqlx::query(
@@ -258,14 +272,12 @@ impl AttachmentService for AttachmentServiceImpl {
         let attachment_id = Uuid::parse_str(&req.attachment_id)
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
-        let row = sqlx::query(
-            "SELECT card_id, s3_key FROM card_attachments WHERE id = $1",
-        )
-        .bind(attachment_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch attachment", e))?
-        .ok_or_else(|| Status::not_found("attachment not found"))?;
+        let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
+            .bind(attachment_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch attachment", e))?
+            .ok_or_else(|| Status::not_found("attachment not found"))?;
 
         let db_card_id: Uuid = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -275,7 +287,9 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "request_presigned_download: card_id mismatch"
             );
-            return Err(Status::permission_denied("attachment does not belong to the authorized card"));
+            return Err(Status::permission_denied(
+                "attachment does not belong to the authorized card",
+            ));
         }
 
         let s3_key: String = row.get("s3_key");
@@ -300,14 +314,12 @@ impl AttachmentService for AttachmentServiceImpl {
         let attachment_id = Uuid::parse_str(&req.attachment_id)
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
-        let row = sqlx::query(
-            "SELECT card_id, s3_key FROM card_attachments WHERE id = $1",
-        )
-        .bind(attachment_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch attachment", e))?
-        .ok_or_else(|| Status::not_found("attachment not found"))?;
+        let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
+            .bind(attachment_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch attachment", e))?
+            .ok_or_else(|| Status::not_found("attachment not found"))?;
 
         let db_card_id: Uuid = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -317,7 +329,9 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "delete_attachment: card_id mismatch"
             );
-            return Err(Status::permission_denied("attachment does not belong to the authorized card"));
+            return Err(Status::permission_denied(
+                "attachment does not belong to the authorized card",
+            ));
         }
 
         let s3_key: String = row.get("s3_key");
@@ -380,58 +394,21 @@ impl AttachmentService for AttachmentServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
 
     // ── Test env config ──────────────────────────────────────────────────────
 
-    fn database_url() -> String {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
-    }
-
     fn s3_config() -> crate::integrations::s3::S3Config {
-        crate::integrations::s3::S3Config {
-            endpoint: std::env::var("S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-            region: std::env::var("S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_string()),
-            access_key: std::env::var("S3_ACCESS_KEY")
-                .unwrap_or_else(|_| "minioadmin".to_string()),
-            secret_key: std::env::var("S3_SECRET_KEY")
-                .unwrap_or_else(|_| "minioadmin".to_string()),
-            bucket: std::env::var("S3_BUCKET")
-                .unwrap_or_else(|_| "sunbeam-kanban".to_string()),
-        }
+        crate::integrations::s3::S3Config::from_env()
     }
 
-    async fn setup_pool() -> PgPool {
-        PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&database_url())
-            .await
-            .expect("failed to connect to Postgres")
-    }
-
-    /// Anonymous PUT to create the bucket; idempotent on seaweedfs (returns
-    /// 200 whether the bucket existed or was just created).
-    async fn ensure_bucket_exists(cfg: &crate::integrations::s3::S3Config) {
-        let url = format!("{}/{}", cfg.endpoint.trim_end_matches('/'), cfg.bucket);
-        let _ = reqwest::Client::new()
-            .put(&url)
-            .send()
-            .await
-            .expect("seaweedfs unreachable; check S3_ENDPOINT");
-    }
-
-    async fn make_service(pool: PgPool) -> AttachmentServiceImpl {
+    async fn setup() -> (&'static crate::test_support::containers::TestInfra, AttachmentServiceImpl) {
+        let infra = crate::test_support::containers::setup().await;
         let cfg = s3_config();
-        ensure_bucket_exists(&cfg).await;
-        AttachmentServiceImpl {
-            pool,
+        let svc = AttachmentServiceImpl {
+            pool: infra.pool.clone(),
             s3: Arc::new(S3Client::new(cfg)),
-        }
+        };
+        (infra, svc)
     }
 
     fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
@@ -464,8 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_presigned_upload_returns_signed_url() {
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
 
         let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -491,23 +468,30 @@ mod tests {
             resp.presigned_url
         );
         assert!(
-            resp.presigned_url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"),
+            resp.presigned_url
+                .contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"),
             "URL must contain algorithm"
         );
-        assert!(!resp.attachment_id.is_empty(), "attachment_id must be non-empty");
+        assert!(
+            !resp.attachment_id.is_empty(),
+            "attachment_id must be non-empty"
+        );
         assert!(!resp.s3_key.is_empty(), "s3_key must be non-empty");
         assert!(resp.expires_at.is_some(), "expires_at must be present");
 
         // Cleanup
         let att_id = Uuid::parse_str(&resp.attachment_id).unwrap();
         cleanup_attachment(&pool, att_id).await;
-        let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(card_id).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+            .bind(card_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]
     async fn presigned_upload_then_confirm_then_download_round_trip() {
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
@@ -562,7 +546,10 @@ mod tests {
             .into_inner();
 
         assert_eq!(confirmed.id, attachment_id);
-        assert_eq!(confirmed.size_bytes, 5, "size should match uploaded content");
+        assert_eq!(
+            confirmed.size_bytes, 5,
+            "size should match uploaded content"
+        );
 
         // Step 4: RequestPresignedDownload
         let download_resp = svc
@@ -585,20 +572,27 @@ mod tests {
             .expect("GET from presigned URL failed");
         assert!(get_resp.status().is_success(), "S3 GET failed");
         let body = get_resp.bytes().await.expect("failed to read body");
-        assert_eq!(body.as_ref(), file_content, "downloaded content must be byte-identical");
+        assert_eq!(
+            body.as_ref(),
+            file_content,
+            "downloaded content must be byte-identical"
+        );
 
         // Teardown: delete from S3 + SQL
         let s3_client = S3Client::new(s3_cfg);
         let _ = s3_client.delete_object(&s3_key).await;
         let att_id = Uuid::parse_str(&attachment_id).unwrap();
         cleanup_attachment(&pool, att_id).await;
-        let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(card_id).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+            .bind(card_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]
     async fn confirm_upload_rejects_when_file_not_in_s3() {
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
 
         let card_id = seed_card_chain(&pool).await;
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -624,26 +618,39 @@ mod tests {
         // ConfirmUpload before the PUT — should fail with not_found.
         let result = svc
             .confirm_upload(authed_request_with_object(
-                ConfirmUploadRequest { attachment_id: attachment_id.clone() },
+                ConfirmUploadRequest {
+                    attachment_id: attachment_id.clone(),
+                },
                 &subject,
                 &card_id.to_string(),
             ))
             .await;
 
-        assert!(result.is_err(), "confirm_upload should fail when file is not in S3");
+        assert!(
+            result.is_err(),
+            "confirm_upload should fail when file is not in S3"
+        );
         let status = result.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::NotFound, "expected NotFound, got: {:?}", status.code());
+        assert_eq!(
+            status.code(),
+            tonic::Code::NotFound,
+            "expected NotFound, got: {:?}",
+            status.code()
+        );
 
         // Cleanup
         let att_id = Uuid::parse_str(&attachment_id).unwrap();
         cleanup_attachment(&pool, att_id).await;
-        let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(card_id).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+            .bind(card_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]
     async fn delete_attachment_removes_from_s3_and_db() {
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
         let s3_cfg = s3_config();
         let http = reqwest::Client::new();
 
@@ -677,7 +684,9 @@ mod tests {
             .expect("PUT failed");
 
         svc.confirm_upload(authed_request_with_object(
-            ConfirmUploadRequest { attachment_id: attachment_id.clone() },
+            ConfirmUploadRequest {
+                attachment_id: attachment_id.clone(),
+            },
             &subject,
             &card_id.to_string(),
         ))
@@ -686,7 +695,9 @@ mod tests {
 
         // DeleteAttachment
         svc.delete_attachment(authed_request_with_object(
-            DeleteAttachmentRequest { attachment_id: attachment_id.clone() },
+            DeleteAttachmentRequest {
+                attachment_id: attachment_id.clone(),
+            },
             &subject,
             &card_id.to_string(),
         ))
@@ -708,16 +719,20 @@ mod tests {
         let head_result = s3_client.head_object(&s3_key).await;
         assert!(
             matches!(head_result, Err(S3Error::NotFound)),
-            "S3 object should be gone after delete, got: {:?}", head_result
+            "S3 object should be gone after delete, got: {:?}",
+            head_result
         );
 
-        let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(card_id).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+            .bind(card_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]
     async fn list_attachments_by_card_returns_only_that_cards_rows() {
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
         let s3_cfg = s3_config();
 
         let card_a = seed_card_chain(&pool).await;
@@ -744,7 +759,9 @@ mod tests {
 
         let list = svc
             .list_attachments_by_card(authed_request_with_object(
-                ListAttachmentsByCardRequest { card_id: card_a.to_string() },
+                ListAttachmentsByCardRequest {
+                    card_id: card_a.to_string(),
+                },
                 &subject,
                 &card_a.to_string(),
             ))
@@ -752,10 +769,20 @@ mod tests {
             .expect("list_attachments_by_card failed")
             .into_inner();
 
-        assert_eq!(list.attachments.len(), 2, "should only see card_a's 2 attachments");
+        assert_eq!(
+            list.attachments.len(),
+            2,
+            "should only see card_a's 2 attachments"
+        );
         let ids: Vec<&str> = list.attachments.iter().map(|a| a.id.as_str()).collect();
-        assert!(ids.contains(&att_a1.to_string().as_str()) || ids.iter().any(|&id| id == att_a1.to_string()));
-        assert!(!ids.iter().any(|&id| id == att_b1.to_string()), "card_b's attachment must not appear");
+        assert!(
+            ids.contains(&att_a1.to_string().as_str())
+                || ids.iter().any(|&id| id == att_a1.to_string())
+        );
+        assert!(
+            !ids.iter().any(|&id| id == att_b1.to_string()),
+            "card_b's attachment must not appear"
+        );
 
         // Cleanup
         for att_id in &[att_a1, att_a2, att_b1] {
@@ -763,10 +790,15 @@ mod tests {
         }
         let s3_client = S3Client::new(s3_cfg);
         for (att_id, cid) in &[(att_a1, card_a), (att_a2, card_a), (att_b1, card_b)] {
-            let _ = s3_client.delete_object(&format!("kanban/cards/{}/{}/f.txt", cid, att_id)).await;
+            let _ = s3_client
+                .delete_object(&format!("kanban/cards/{}/{}/f.txt", cid, att_id))
+                .await;
         }
         for cid in &[card_a, card_b] {
-            let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(cid).execute(&pool).await;
+            let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+                .bind(cid)
+                .execute(&pool)
+                .await;
         }
     }
 
@@ -774,8 +806,8 @@ mod tests {
     async fn confirm_upload_rejects_when_card_id_mismatches_checked_object_id() {
         // Security regression test: attacker presents attachment_id for card X
         // but puts card Y in the x-sunbeam-object-id header (authorized for Y).
-        let pool = setup_pool().await;
-        let svc = make_service(pool.clone()).await;
+        let (infra, svc) = setup().await;
+        let pool = infra.pool.clone();
 
         let card_legit = seed_card_chain(&pool).await;
         let card_attacker = seed_card_chain(&pool).await;
@@ -803,13 +835,18 @@ mod tests {
         // but the attachment_id belongs to card_legit.
         let result = svc
             .confirm_upload(authed_request_with_object(
-                ConfirmUploadRequest { attachment_id: attachment_id.clone() },
+                ConfirmUploadRequest {
+                    attachment_id: attachment_id.clone(),
+                },
                 &subject,
                 &card_attacker.to_string(), // WRONG card_id in header
             ))
             .await;
 
-        assert!(result.is_err(), "confirm_upload must reject card_id mismatch");
+        assert!(
+            result.is_err(),
+            "confirm_upload must reject card_id mismatch"
+        );
         let status = result.unwrap_err();
         assert_eq!(
             status.code(),
@@ -822,7 +859,10 @@ mod tests {
         let att_id = Uuid::parse_str(&attachment_id).unwrap();
         cleanup_attachment(&pool, att_id).await;
         for cid in &[card_legit, card_attacker] {
-            let _ = sqlx::query("DELETE FROM cards WHERE id = $1").bind(cid).execute(&pool).await;
+            let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+                .bind(cid)
+                .execute(&pool)
+                .await;
         }
     }
 }

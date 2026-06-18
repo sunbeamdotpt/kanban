@@ -36,14 +36,13 @@ impl S3Config {
     /// Load from `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`.
     pub fn from_env() -> Self {
         Self {
-            endpoint: std::env::var("S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://seaweedfs-filer.storage.svc.cluster.local:8333".to_string()),
-            region: std::env::var("S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_string()),
+            endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| {
+                "http://seaweedfs-filer.storage.svc.cluster.local:8333".to_string()
+            }),
+            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
             access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
             secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
-            bucket: std::env::var("S3_BUCKET")
-                .unwrap_or_else(|_| "sunbeam-kanban".to_string()),
+            bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "sunbeam-kanban".to_string()),
         }
     }
 }
@@ -74,7 +73,12 @@ impl S3Client {
 
     /// Object key path: `/{bucket}/{key}`
     fn object_url(&self, key: &str) -> String {
-        format!("{}/{}/{}", self.config.endpoint.trim_end_matches('/'), self.config.bucket, key)
+        format!(
+            "{}/{}/{}",
+            self.config.endpoint.trim_end_matches('/'),
+            self.config.bucket,
+            key
+        )
     }
 
     // ── Presign helpers ───────────────────────────────────────────────────────
@@ -90,15 +94,21 @@ impl S3Client {
     }
 
     /// Core SigV4 presign: builds a signed URL using query-string auth.
-    fn presign(&self, method: &str, key: &str, expires_in: u64, extra_header: Option<(&str, &str)>) -> String {
+    fn presign(
+        &self,
+        method: &str,
+        key: &str,
+        expires_in: u64,
+        extra_header: Option<(&str, &str)>,
+    ) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
         let now_secs = now.as_secs();
 
         // Format timestamps: YYYYMMDDTHHmmssZ and YYYYMMDD
-        let date_stamp = format_iso8601(now_secs);   // e.g. "20240101T120000Z"
-        let short_date = &date_stamp[..8];            // e.g. "20240101"
+        let date_stamp = format_iso8601(now_secs); // e.g. "20240101T120000Z"
+        let short_date = &date_stamp[..8]; // e.g. "20240101"
         let scope = format!("{}/{}/s3/aws4_request", short_date, self.config.region);
 
         // Construct the object URL path
@@ -126,11 +136,17 @@ impl S3Client {
         // Build canonical query string (params sorted by key)
         let credential = format!("{}/{}", self.config.access_key, scope);
         let mut params: Vec<(String, String)> = vec![
-            ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
             ("X-Amz-Credential".to_string(), credential),
             ("X-Amz-Date".to_string(), date_stamp.clone()),
             ("X-Amz-Expires".to_string(), expires_in.to_string()),
-            ("X-Amz-SignedHeaders".to_string(), signed_headers_str.clone()),
+            (
+                "X-Amz-SignedHeaders".to_string(),
+                signed_headers_str.clone(),
+            ),
         ];
         params.sort_by(|a, b| a.0.cmp(&b.0));
         let canonical_qs = params
@@ -144,7 +160,8 @@ impl S3Client {
             .iter()
             .map(|(k, v)| format!("{}:{}", k, v))
             .collect::<Vec<_>>()
-            .join("\n") + "\n";
+            .join("\n")
+            + "\n";
 
         // Canonical request
         let canonical_request = format!(
@@ -154,13 +171,11 @@ impl S3Client {
 
         // String to sign
         let cr_hash = sha256_hex(canonical_request.as_bytes());
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            date_stamp, scope, cr_hash
-        );
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", date_stamp, scope, cr_hash);
 
         // Signing key
-        let signing_key = derive_signing_key(&self.config.secret_key, short_date, &self.config.region);
+        let signing_key =
+            derive_signing_key(&self.config.secret_key, short_date, &self.config.region);
 
         // Signature
         let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
@@ -222,7 +237,8 @@ impl S3Client {
     /// DELETE the object from S3.
     pub async fn delete_object(&self, key: &str) -> Result<(), S3Error> {
         let url = self.object_url(key);
-        let signed_headers = self.sign_request_headers("DELETE", key, "");
+        let path = format!("/{}/{}", self.config.bucket, key);
+        let signed_headers = self.sign_request("DELETE", &path, "");
 
         let mut req = self.http.delete(&url);
         for (k, v) in &signed_headers {
@@ -242,10 +258,54 @@ impl S3Client {
         }
     }
 
+    /// Create the configured bucket. Idempotent — 409 BucketAlreadyExists is
+    /// treated as success.
+    pub async fn create_bucket(&self) -> Result<(), S3Error> {
+        let url = format!(
+            "{}/{}",
+            self.config.endpoint.trim_end_matches('/'),
+            self.config.bucket
+        );
+        let path = format!("/{}", self.config.bucket);
+        let signed_headers = self.sign_request("PUT", &path, "");
+
+        let mut req = self.http.put(&url);
+        for (k, v) in &signed_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        let resp = req.send().await.map_err(|e| S3Error::Http(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 | 204 => Ok(()),
+            409 => Ok(()), // bucket already exists
+            403 => Err(S3Error::Forbidden),
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(S3Error::Unexpected(status, body))
+            }
+        }
+    }
+
     /// Build Authorization header + x-amz-date/x-amz-content-sha256 for a
     /// standard (non-presigned) request. Returns key-value pairs to add to
     /// the request.
-    fn sign_request_headers(&self, method: &str, key: &str, body_hash: &str) -> Vec<(String, String)> {
+    fn sign_request_headers(
+        &self,
+        method: &str,
+        key: &str,
+        body_hash: &str,
+    ) -> Vec<(String, String)> {
+        let path = format!("/{}/{}", self.config.bucket, key);
+        self.sign_request(method, &path, body_hash)
+    }
+
+    /// Core SigV4 signer for an arbitrary path.
+    fn sign_request(
+        &self,
+        method: &str,
+        path: &str,
+        body_hash: &str,
+    ) -> Vec<(String, String)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
@@ -279,21 +339,19 @@ impl S3Client {
             .iter()
             .map(|(k, v)| format!("{}:{}", k, v))
             .collect::<Vec<_>>()
-            .join("\n") + "\n";
+            .join("\n")
+            + "\n";
 
-        let path = format!("/{}/{}", self.config.bucket, key);
         let canonical_request = format!(
             "{}\n{}\n\n{}\n{}\n{}",
             method, path, canonical_headers, signed_headers_str, body_hash
         );
 
         let cr_hash = sha256_hex(canonical_request.as_bytes());
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-            date_stamp, scope, cr_hash
-        );
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{}\n{}\n{}", date_stamp, scope, cr_hash);
 
-        let signing_key = derive_signing_key(&self.config.secret_key, &short_date, &self.config.region);
+        let signing_key =
+            derive_signing_key(&self.config.secret_key, &short_date, &self.config.region);
         let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
         let auth_header = format!(
@@ -368,7 +426,8 @@ fn format_iso8601(secs: u64) -> String {
     // Days from epoch to compute date fields.
     // Using chrono from workspace is fine here; it's already a dep.
     use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_opt(s as i64, 0)
+    let dt = Utc
+        .timestamp_opt(s as i64, 0)
         .single()
         .expect("valid timestamp");
     dt.format("%Y%m%dT%H%M%SZ").to_string()
@@ -437,7 +496,10 @@ mod tests {
     #[test]
     fn endpoint_host_strips_scheme_and_path() {
         assert_eq!(endpoint_host("http://localhost:9000"), "localhost:9000");
-        assert_eq!(endpoint_host("https://s3.example.com/bucket"), "s3.example.com");
+        assert_eq!(
+            endpoint_host("https://s3.example.com/bucket"),
+            "s3.example.com"
+        );
         assert_eq!(endpoint_host("http://seaweedfs:8333"), "seaweedfs:8333");
     }
 
@@ -467,8 +529,14 @@ mod tests {
         };
         let client = S3Client::new(cfg);
         let url = client.presign_put("kanban/cards/test/file.pdf", "application/pdf", 900);
-        assert!(url.contains("X-Amz-Signature="), "presigned URL must contain X-Amz-Signature");
-        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "must include algorithm");
+        assert!(
+            url.contains("X-Amz-Signature="),
+            "presigned URL must contain X-Amz-Signature"
+        );
+        assert!(
+            url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"),
+            "must include algorithm"
+        );
         assert!(url.contains("test-bucket"), "must reference the bucket");
     }
 
@@ -483,6 +551,9 @@ mod tests {
         };
         let client = S3Client::new(cfg);
         let url = client.presign_get("kanban/cards/test/file.pdf", 300);
-        assert!(url.contains("X-Amz-Signature="), "presigned GET URL must contain X-Amz-Signature");
+        assert!(
+            url.contains("X-Amz-Signature="),
+            "presigned GET URL must contain X-Amz-Signature"
+        );
     }
 }
