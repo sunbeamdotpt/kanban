@@ -12,4 +12,5 @@ pub mod github;
 pub mod projects;
 pub mod public_boards;
 pub mod search;
+pub mod templates;
 pub mod visibility;

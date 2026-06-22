@@ -44,14 +44,14 @@ use crate::pb::{
     github_link_service_server::GithubLinkServiceServer,
     project_service_server::ProjectServiceServer,
     public_board_service_server::PublicBoardServiceServer,
-    search_service_server::SearchServiceServer,
+    search_service_server::SearchServiceServer, templates_service_server::TemplatesServiceServer,
 };
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
     auth::AuthServiceImpl, boards::BoardServiceImpl, cards::CardServiceImpl,
     github::GitHubServiceImpl, projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl,
-    search::SearchServiceImpl,
+    search::SearchServiceImpl, templates::TemplatesServiceImpl,
 };
 
 // ── JetStream stream name & config ──────────────────────────────────────────
@@ -237,13 +237,11 @@ where
 
     let jwt_secret = get_env("JWT_SECRET").unwrap_or_else(|| "change-me".into());
 
-    let database_url =
-        get_env("DATABASE_URL").context("DATABASE_URL is required")?;
+    let database_url = get_env("DATABASE_URL").context("DATABASE_URL is required")?;
 
     let nats_url = get_env("NATS_URL").unwrap_or_else(|| "nats://localhost:4222".into());
 
-    let valkey_url =
-        get_env("VALKEY_URL").unwrap_or_else(|| "redis://localhost:6379".into());
+    let valkey_url = get_env("VALKEY_URL").unwrap_or_else(|| "redis://localhost:6379".into());
 
     let keto_read_addr =
         get_env("KETO_READ_ADDR").unwrap_or_else(|| "http://localhost:4466".into());
@@ -350,8 +348,7 @@ pub async fn run_with_config(
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
     let watermark = Arc::new(
-        LogoutWatermark::new(&config.valkey_url)
-            .context("failed to construct LogoutWatermark")?,
+        LogoutWatermark::new(&config.valkey_url).context("failed to construct LogoutWatermark")?,
     );
 
     info!("Valkey client initialised");
@@ -375,9 +372,7 @@ pub async fn run_with_config(
     let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
     info!(
         "S3 client initialised (endpoint={})",
-        config
-            .s3_endpoint
-            .unwrap_or_else(|| "<default>".into())
+        config.s3_endpoint.unwrap_or_else(|| "<default>".into())
     );
 
     // ── 8b. OpenSearch client for SearchService ─────────────────────────────
@@ -425,6 +420,10 @@ pub async fn run_with_config(
         keto: Arc::clone(&keto),
         opensearch: Arc::clone(&opensearch_client),
         index_name: None,
+    }))
+    .add_service(TemplatesServiceServer::new(TemplatesServiceImpl {
+        pool: pg_pool.clone(),
+        keto: Arc::clone(&keto),
     }))
     .into_axum_router();
 
@@ -742,11 +741,11 @@ mod tests {
         let local_addr = listener.local_addr().expect("local addr");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let shutdown = async { rx.await.ok(); };
+        let shutdown = async {
+            rx.await.ok();
+        };
 
-        let handle = tokio::spawn(async move {
-            run_with_config(config, listener, shutdown).await
-        });
+        let handle = tokio::spawn(async move { run_with_config(config, listener, shutdown).await });
 
         // Wait for migrations + service startup.
         tokio::time::sleep(Duration::from_secs(3)).await;
