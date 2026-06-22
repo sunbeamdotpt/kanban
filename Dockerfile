@@ -33,7 +33,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cargo/git/db \
     --mount=type=cache,target=/root/.cargo/registry/cache \
     --mount=type=cache,target=/root/.cargo/registry/index \
-    cargo fetch -p kanban
+    cargo fetch --locked
 
 ARG TARGETPLATFORM
 
