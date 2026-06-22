@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cargo/git/db \
     --mount=type=cache,target=/root/.cargo/registry/cache \
     --mount=type=cache,target=/root/.cargo/registry/index \
     xx-apt-get install -y libc6-dev \
-    && xx-cargo build --release --bin kanban -p kanban \
+    && xx-cargo build --release --locked --bin kanban -p kanban \
     && cp /app/target/$(xx-cargo --print-target-triple)/release/kanban /app/kanban \
     && xx-verify /app/kanban
 
