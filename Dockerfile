@@ -20,7 +20,7 @@ COPY --from=xx / /
 # Install host build dependencies. protobuf-compiler is needed by tonic-prost-build;
 # clang + lld are used by xx-cargo for cross-compilation.
 RUN apt-get update \
-    && apt-get install -y protobuf-compiler clang lld pkg-config libssl-dev \
+    && apt-get install -y protobuf-compiler clang lld \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -42,7 +42,7 @@ ARG TARGETPLATFORM
 RUN --mount=type=cache,target=/root/.cargo/git/db \
     --mount=type=cache,target=/root/.cargo/registry/cache \
     --mount=type=cache,target=/root/.cargo/registry/index \
-    xx-apt-get install -y libc6-dev libssl-dev \
+    xx-apt-get install -y libc6-dev \
     && xx-cargo build --release --bin kanban -p kanban \
     && cp /app/target/$(xx-cargo --print-target-triple)/release/kanban /app/kanban \
     && xx-verify /app/kanban

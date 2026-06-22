@@ -22,7 +22,7 @@ path = "src/bin/keto-coverage.rs"
 
 [dependencies]
 anyhow = "1.0"
-async-nats = "0.47"
+async-nats = "0.49"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["http2", "macros"] }
 bytes = "1"
@@ -31,7 +31,7 @@ figment = { version = "0.10", features = ["env", "toml", "json"] }
 hex = "0.4"
 hmac = "0.12"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.14"
+metrics-exporter-prometheus = { version = "0.14", default-features = false, features = ["http-listener"] }
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
@@ -40,12 +40,12 @@ prometheus = "0.13"
 prost = "0.14"
 prost-types = "0.14"
 redis = { version = "0.27", features = ["tokio-comp"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
-sunbeam-g2v = "0.1.1"
+sunbeam-g2v = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.14"
