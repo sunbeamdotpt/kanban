@@ -12,6 +12,8 @@ use sunbeam_g2v::error::{ServiceError, ServiceResult};
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use tonic::transport::Channel;
 
+use crate::auth::keto_retry::retry;
+
 /// List relation tuples from Keto ReadService.
 pub async fn list_relation_tuples(
     client: &KetoClient,
@@ -66,12 +68,6 @@ pub async fn delete_relation_tuples(
     };
 
     let config = client.config();
-    let channel = Channel::from_shared(config.write_grpc_endpoint.clone())
-        .map_err(|e| ServiceError::Internal(format!("invalid keto write endpoint: {e}")))?
-        .connect_lazy();
-
-    let mut grpc = WriteServiceClient::new(channel);
-
     let req = DeleteRelationTuplesRequest {
         relation_query: Some(SgvRelationQuery {
             namespace: Some(namespace.to_string()),
@@ -86,11 +82,18 @@ pub async fn delete_relation_tuples(
         ..Default::default()
     };
 
-    grpc.delete_relation_tuples(tonic::Request::new(req))
-        .await
-        .map_err(|status| {
-            ServiceError::Internal(format!("keto delete_relation_tuples failed: {status}"))
-        })?;
+    retry(|| async {
+        let channel = Channel::from_shared(config.write_grpc_endpoint.clone())
+            .map_err(|e| ServiceError::Internal(format!("invalid keto write endpoint: {e}")))?
+            .connect_lazy();
+        let mut grpc = WriteServiceClient::new(channel);
+        grpc.delete_relation_tuples(tonic::Request::new(req.clone()))
+            .await
+            .map_err(|status| {
+                ServiceError::Internal(format!("keto delete_relation_tuples failed: {status}"))
+            })
+    })
+    .await?;
 
     Ok(())
 }
