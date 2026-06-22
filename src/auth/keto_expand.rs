@@ -315,7 +315,10 @@ mod tests {
 
         assert!(result.is_err(), "expected Err when max_results is zero");
         assert!(
-            result.unwrap_err().to_string().contains("expand exceeded max_results"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expand exceeded max_results"),
             "expected max_results error"
         );
     }
@@ -350,8 +353,12 @@ mod tests {
 
     #[test]
     fn is_keto_retryable_detects_sqlite_conflicts() {
-        assert!(is_keto_retryable("Unable to serialize access due to a concurrent update"));
-        assert!(is_keto_retryable("database is locked: concurrent update in another session"));
+        assert!(is_keto_retryable(
+            "Unable to serialize access due to a concurrent update"
+        ));
+        assert!(is_keto_retryable(
+            "database is locked: concurrent update in another session"
+        ));
     }
 
     #[test]

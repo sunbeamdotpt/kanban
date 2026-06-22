@@ -106,7 +106,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 58] = [
+static MATRIX: [DispatchEntry; 68] = [
     // ── AuthService (2) ─────────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AuthService/WhoAmI",
@@ -469,6 +469,70 @@ static MATRIX: [DispatchEntry; 58] = [
         namespace: "",
         relation: "",
         object_id_source: ObjectIdSource::None, // post-filter via keto_expand in handler
+    },
+    // ── TemplatesService (10) ───────────────────────────────────────────────
+    // Templates are project-owned resources.  Global templates are read-only
+    // and visible to every authenticated user; project-scoped templates require
+    // the corresponding KanbanProject permission in the handler.
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/ListTemplates",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // post-filter by project visibility
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/GetTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler enforces visibility
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/CreateTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/UpdateTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/DeleteTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/ListCardTemplates",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // post-filter by project visibility
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/GetCardTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler enforces visibility
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/CreateCardTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/UpdateCardTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.TemplatesService/DeleteCardTemplate",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
     },
 ];
 
@@ -866,6 +930,16 @@ mod tests {
                     "/sunbeam.kanban.v1.AggregatedBoardService/ListAggregatedBoards",
                     "/sunbeam.kanban.v1.AggregatedBoardService/SubscribeAggregatedBoard",
                     "/sunbeam.kanban.v1.SearchService/SearchCards",
+                    "/sunbeam.kanban.v1.TemplatesService/ListTemplates",
+                    "/sunbeam.kanban.v1.TemplatesService/GetTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/CreateTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/UpdateTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/DeleteTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/ListCardTemplates",
+                    "/sunbeam.kanban.v1.TemplatesService/GetCardTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/CreateCardTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/UpdateCardTemplate",
+                    "/sunbeam.kanban.v1.TemplatesService/DeleteCardTemplate",
                 ];
                 assert!(
                     none_methods.contains(&entry.method),
@@ -877,8 +951,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_58() {
-        assert_eq!(MATRIX.len(), 58, "matrix must contain exactly 58 entries");
+    fn matrix_size_is_68() {
+        assert_eq!(MATRIX.len(), 68, "matrix must contain exactly 68 entries");
     }
 
     #[test]
@@ -900,6 +974,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_rejects_revoked_token() {
+        // Start shared test infrastructure and export service URLs.
+        let _infra = crate::test_support::containers::setup().await;
+
         // Signal a logout for the test subject, then verify dispatch rejects
         // a token whose iat_ms is before the watermark.
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
@@ -965,6 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_403_on_keto_denial() {
+        let _infra = crate::test_support::containers::setup().await;
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
         let keto_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
@@ -1032,6 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_400_when_header_missing() {
+        let _infra = crate::test_support::containers::setup().await;
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
         let keto_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
@@ -1070,6 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_500_on_keto_error() {
+        let _infra = crate::test_support::containers::setup().await;
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
 
         use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
@@ -1106,6 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_503_on_watermark_error() {
+        let _infra = crate::test_support::containers::setup().await;
         let keto_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4466".to_string());
