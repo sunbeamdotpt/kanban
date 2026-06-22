@@ -10,4 +10,6 @@ pub mod boards;
 pub mod cards;
 pub mod github;
 pub mod projects;
+pub mod public_boards;
 pub mod search;
+pub mod visibility;

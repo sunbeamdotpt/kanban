@@ -43,6 +43,14 @@ message Column {
   google.protobuf.Timestamp updated_at = 8;
 }
 
+// Visibility levels for boards and aggregated boards.
+enum BoardVisibility {
+  BOARD_VISIBILITY_UNSPECIFIED = 0;
+  PRIVATE = 1;
+  INTERNAL = 2;
+  PUBLIC = 3;
+}
+
 // Board groups columns and cards within a project.
 message Board {
   string id = 1;
@@ -56,6 +64,7 @@ message Board {
   // Denormalized counts for list views; exact data via GetBoard.
   int32 columns_count = 8;
   int32 cards_count = 9;
+  BoardVisibility visibility = 10;
 }
 
 // BoardDetail includes the full column list.
@@ -75,6 +84,7 @@ message CreateBoardRequest {
   string icon = 4;
   // ULID for idempotency.
   string idempotency_key = 5;
+  BoardVisibility visibility = 6;
 }
 
 message GetBoardRequest {

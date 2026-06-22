@@ -36,6 +36,7 @@ message AggregatedBoard {
   string icon = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  BoardVisibility visibility = 8;
 }
 
 // SourceBoardRef identifies a board included in an aggregate.
@@ -87,6 +88,7 @@ message CreateAggregatedBoardRequest {
   repeated string source_board_ids = 4;
   // ULID for idempotency.
   string idempotency_key = 5;
+  BoardVisibility visibility = 6;
 }
 
 message GetAggregatedBoardRequest {

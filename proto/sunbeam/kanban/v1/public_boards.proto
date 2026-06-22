@@ -1,0 +1,36 @@
+// Sunbeam Kanban — Public read-only board access.
+//
+// These RPCs are intentionally NOT protected by JwtLayer or keto_dispatch.
+// They are mounted on a separate Axum router so unauthenticated clients can
+// read public boards. Every handler must verify that the requested board's
+// visibility is exactly PUBLIC before returning it.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "sunbeam/kanban/v1/boards.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+message GetPublicBoardRequest {
+  string board_id = 1;
+}
+
+message ListPublicBoardsRequest {
+  string project_id = 1;
+}
+
+// PublicBoardService exposes read-only access to public boards.
+//
+// These RPCs do not require a bearer token. Callers must not send credentials
+// expecting them to be honoured; the routes skip the auth middleware stack.
+service PublicBoardService {
+  // GetPublicBoard returns a board only if its visibility is PUBLIC.
+  rpc GetPublicBoard(GetPublicBoardRequest) returns (Board);
+
+  // ListPublicBoards returns all public boards in the given project.
+  rpc ListPublicBoards(ListPublicBoardsRequest) returns (ListBoardsResponse);
+}

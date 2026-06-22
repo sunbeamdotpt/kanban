@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/sunbeam/kanban/v1/aggregated_boards.proto",
         "proto/sunbeam/kanban/v1/github.proto",
         "proto/sunbeam/kanban/v1/projects.proto",
+        "proto/sunbeam/kanban/v1/public_boards.proto",
         "proto/sunbeam/kanban/v1/search.proto",
         "proto/ory/keto/relation_tuples/v1alpha2/read_service.proto",
     ];
