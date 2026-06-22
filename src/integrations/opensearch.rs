@@ -307,3 +307,293 @@ impl OpenSearchClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_from_env_uses_env_or_default() {
+        let expected = std::env::var("OPENSEARCH_URL")
+            .unwrap_or_else(|_| "http://localhost:9200".to_string());
+        let cfg = OpenSearchConfig::from_env();
+        assert_eq!(cfg.url, expected);
+    }
+
+    #[test]
+    fn client_trims_trailing_slash_from_url() {
+        let client = OpenSearchClient::new(OpenSearchConfig {
+            url: "http://localhost:9200/".to_string(),
+        });
+        assert_eq!(client.base_url, "http://localhost:9200");
+    }
+
+    #[test]
+    fn card_document_serializes_and_deserializes() {
+        let doc = CardDocument {
+            id: "card-1".to_string(),
+            board_id: "board-1".to_string(),
+            project_id: "proj-1".to_string(),
+            card_ref: "KB-1".to_string(),
+            title: "Test".to_string(),
+            description: "Desc".to_string(),
+            priority: "high".to_string(),
+            labels: vec!["bug".to_string()],
+            assignees: vec!["user:alice".to_string()],
+            completed_at: None,
+        };
+        let json_str = serde_json::to_string(&doc).unwrap();
+        assert!(json_str.contains("\"ref\":\"KB-1\""));
+
+        let round: CardDocument = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(round.id, doc.id);
+        assert_eq!(round.labels, doc.labels);
+        assert_eq!(round.completed_at, None);
+    }
+
+    // ── Mock-server tests for HTTP methods ─────────────────────────────────────
+
+    use axum::{
+        extract::Path,
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{delete, post, put},
+        Json, Router,
+    };
+    use serde_json::json;
+    use std::net::SocketAddr;
+
+    fn mock_app() -> Router {
+        Router::new()
+            .route("/{index}/_search", post(search_handler))
+            .route("/{index}", put(create_index_handler))
+            .route("/{index}/_doc/{id}", put(index_doc_handler))
+            .route("/{index}/_refresh", post(refresh_handler))
+            .route("/{index}", delete(delete_index_handler))
+    }
+
+    async fn search_handler(Path(index): Path<String>, Json(body): Json<Value>) -> impl IntoResponse {
+        if index == "missing" {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": {"type": "index_not_found_exception"}})),
+            )
+                .into_response();
+        }
+        if index == "bad" {
+            return (StatusCode::NOT_FOUND, "plain 404").into_response();
+        }
+        if index == "error" {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+        }
+
+        let hits = if body["query"].get("match_all").is_some() {
+            vec![
+                json!({
+                    "_id": "card-1",
+                    "_score": 1.0,
+                    "_source": {
+                        "id": "card-1",
+                        "board_id": "board-1",
+                        "project_id": "proj-1",
+                        "ref": "KB-1",
+                        "title": "Hit",
+                        "description": "Desc",
+                        "priority": "medium",
+                        "labels": [],
+                        "assignees": [],
+                        "completed_at": null
+                    }
+                }),
+            ]
+        } else {
+            vec![]
+        };
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "hits": {
+                    "total": { "value": hits.len() as i64 },
+                    "hits": hits
+                }
+            })),
+        )
+            .into_response()
+    }
+
+    async fn create_index_handler(Path(index): Path<String>) -> impl IntoResponse {
+        if index == "existing" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"type": "resource_already_exists_exception"}})),
+            )
+                .into_response();
+        }
+        if index == "error" {
+            return (StatusCode::BAD_REQUEST, "bad mapping").into_response();
+        }
+        (StatusCode::OK, Json(json!({"acknowledged": true}))).into_response()
+    }
+
+    async fn index_doc_handler(Path((index, _id)): Path<(String, String)>) -> impl IntoResponse {
+        if index == "error" {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "index doc failed").into_response();
+        }
+        (StatusCode::CREATED, Json(json!({"result": "created"}))).into_response()
+    }
+
+    async fn refresh_handler() -> impl IntoResponse {
+        (StatusCode::OK, Json(json!({"_shards": {"successful": 1}})))
+    }
+
+    async fn delete_index_handler(Path(index): Path<String>) -> impl IntoResponse {
+        if index == "gone" {
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+        (StatusCode::OK, Json(json!({"acknowledged": true}))).into_response()
+    }
+
+    async fn start_mock_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, mock_app()).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    fn client_for(addr: SocketAddr) -> OpenSearchClient {
+        OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        })
+    }
+
+    #[tokio::test]
+    async fn search_returns_parsed_response() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let result = client
+            .search("hits", &json!({ "query": { "match_all": {} } }))
+            .await
+            .expect("search should succeed");
+
+        let resp = result.expect("expected Some response");
+        assert_eq!(resp.hits.total.value, 1);
+        assert_eq!(resp.hits.hits.len(), 1);
+        assert_eq!(resp.hits.hits[0].id, "card-1");
+    }
+
+    #[tokio::test]
+    async fn search_returns_none_for_missing_index() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let result = client
+            .search("missing", &json!({ "query": { "match_all": {} } }))
+            .await
+            .expect("search should not error for missing index");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_errors_for_non_index_404() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let result = client
+            .search("bad", &json!({ "query": { "match_all": {} } }))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_errors_for_5xx() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let result = client
+            .search("error", &json!({ "query": { "match_all": {} } }))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_cards_index_succeeds_and_ignores_existing() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        client.create_cards_index("new-index").await.expect("create index");
+        client.create_cards_index("existing").await.expect("existing index should be ignored");
+    }
+
+    #[tokio::test]
+    async fn create_cards_index_errors_on_unexpected_400() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let result = client.create_cards_index("error").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn index_card_succeeds() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let doc = CardDocument {
+            id: "card-1".to_string(),
+            board_id: "board-1".to_string(),
+            project_id: "proj-1".to_string(),
+            card_ref: "KB-1".to_string(),
+            title: "T".to_string(),
+            description: "D".to_string(),
+            priority: "low".to_string(),
+            labels: vec![],
+            assignees: vec![],
+            completed_at: None,
+        };
+        client.index_card("hits", &doc).await.expect("index card");
+    }
+
+    #[tokio::test]
+    async fn index_card_errors_on_5xx() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        let doc = CardDocument {
+            id: "card-1".to_string(),
+            board_id: "board-1".to_string(),
+            project_id: "proj-1".to_string(),
+            card_ref: "KB-1".to_string(),
+            title: "T".to_string(),
+            description: "D".to_string(),
+            priority: "low".to_string(),
+            labels: vec![],
+            assignees: vec![],
+            completed_at: None,
+        };
+        let result = client.index_card("error", &doc).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_succeeds() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+        client.refresh("hits").await.expect("refresh");
+    }
+
+    #[tokio::test]
+    async fn delete_index_succeeds_and_ignores_404() {
+        let (addr, _handle) = start_mock_server().await;
+        let client = client_for(addr);
+
+        client.delete_index("hits").await.expect("delete index");
+        client.delete_index("gone").await.expect("404 delete is ignored");
+    }
+}

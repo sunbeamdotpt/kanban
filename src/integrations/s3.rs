@@ -300,12 +300,7 @@ impl S3Client {
     }
 
     /// Core SigV4 signer for an arbitrary path.
-    fn sign_request(
-        &self,
-        method: &str,
-        path: &str,
-        body_hash: &str,
-    ) -> Vec<(String, String)> {
+    fn sign_request(&self, method: &str, path: &str, body_hash: &str) -> Vec<(String, String)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
