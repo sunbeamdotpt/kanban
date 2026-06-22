@@ -36,7 +36,7 @@ opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
 parking_lot = "0.12"
-prometheus = "0.13"
+prometheus = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 redis = { version = "0.27", features = ["tokio-comp"] }
@@ -45,7 +45,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
-sunbeam-g2v = "0.2"
+sunbeam-g2v = "0.2.1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.14"
