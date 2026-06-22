@@ -25,6 +25,18 @@ pub mod services;
 pub(crate) mod test_support;
 
 #[cfg(test)]
+#[ctor::ctor]
+fn init_test_containers() {
+    // Start the shared testcontainers stack once per test process. This sets
+    // the standard service env vars (DATABASE_URL, NATS_URL, VALKEY_URL, ...)
+    // before any test reads them.
+    let rt = tokio::runtime::Runtime::new().expect("test runtime");
+    rt.block_on(async {
+        let _ = crate::test_support::containers::setup().await;
+    });
+}
+
+#[cfg(test)]
 mod codegen_smoke {
     #[test]
     fn types_exist() {

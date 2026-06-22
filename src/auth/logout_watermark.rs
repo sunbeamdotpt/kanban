@@ -179,6 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn signal_then_query_returns_watermark() {
+        let _infra = crate::test_support::containers::setup().await;
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
         let sub = subject("signal");
@@ -195,6 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_token_valid_iat_boundary() {
+        let _infra = crate::test_support::containers::setup().await;
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
         let sub = subject("validity");
@@ -232,6 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_does_not_call_valkey() {
+        let _infra = crate::test_support::containers::setup().await;
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
         let sub = subject("cache");
@@ -256,6 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn signal_logout_persists_through_cache_expiry() {
+        let _infra = crate::test_support::containers::setup().await;
         let url = valkey_url().expect("VALKEY_URL not set");
         let wm = make_wm(&url);
         let sub = subject("persist");

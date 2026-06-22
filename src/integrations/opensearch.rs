@@ -314,8 +314,8 @@ mod tests {
 
     #[test]
     fn config_from_env_uses_env_or_default() {
-        let expected = std::env::var("OPENSEARCH_URL")
-            .unwrap_or_else(|_| "http://localhost:9200".to_string());
+        let expected =
+            std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
         let cfg = OpenSearchConfig::from_env();
         assert_eq!(cfg.url, expected);
     }
@@ -354,11 +354,11 @@ mod tests {
     // ── Mock-server tests for HTTP methods ─────────────────────────────────────
 
     use axum::{
+        Json, Router,
         extract::Path,
         http::StatusCode,
         response::IntoResponse,
         routing::{delete, post, put},
-        Json, Router,
     };
     use serde_json::json;
     use std::net::SocketAddr;
@@ -372,7 +372,10 @@ mod tests {
             .route("/{index}", delete(delete_index_handler))
     }
 
-    async fn search_handler(Path(index): Path<String>, Json(body): Json<Value>) -> impl IntoResponse {
+    async fn search_handler(
+        Path(index): Path<String>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
         if index == "missing" {
             return (
                 StatusCode::NOT_FOUND,
@@ -388,24 +391,22 @@ mod tests {
         }
 
         let hits = if body["query"].get("match_all").is_some() {
-            vec![
-                json!({
-                    "_id": "card-1",
-                    "_score": 1.0,
-                    "_source": {
-                        "id": "card-1",
-                        "board_id": "board-1",
-                        "project_id": "proj-1",
-                        "ref": "KB-1",
-                        "title": "Hit",
-                        "description": "Desc",
-                        "priority": "medium",
-                        "labels": [],
-                        "assignees": [],
-                        "completed_at": null
-                    }
-                }),
-            ]
+            vec![json!({
+                "_id": "card-1",
+                "_score": 1.0,
+                "_source": {
+                    "id": "card-1",
+                    "board_id": "board-1",
+                    "project_id": "proj-1",
+                    "ref": "KB-1",
+                    "title": "Hit",
+                    "description": "Desc",
+                    "priority": "medium",
+                    "labels": [],
+                    "assignees": [],
+                    "completed_at": null
+                }
+            })]
         } else {
             vec![]
         };
@@ -527,8 +528,14 @@ mod tests {
         let (addr, _handle) = start_mock_server().await;
         let client = client_for(addr);
 
-        client.create_cards_index("new-index").await.expect("create index");
-        client.create_cards_index("existing").await.expect("existing index should be ignored");
+        client
+            .create_cards_index("new-index")
+            .await
+            .expect("create index");
+        client
+            .create_cards_index("existing")
+            .await
+            .expect("existing index should be ignored");
     }
 
     #[tokio::test]
@@ -594,6 +601,9 @@ mod tests {
         let client = client_for(addr);
 
         client.delete_index("hits").await.expect("delete index");
-        client.delete_index("gone").await.expect("404 delete is ignored");
+        client
+            .delete_index("gone")
+            .await
+            .expect("404 delete is ignored");
     }
 }

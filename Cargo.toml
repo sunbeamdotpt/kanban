@@ -63,6 +63,7 @@ url = "2"
 sunbeam-test = { git = "https://github.com/sunbeamdotpt/test", rev = "8807a47ac5873b380c62e3e5831e77b107b0c952" }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "nats", "valkey", "minio"] }
+ctor = "0.3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -403,7 +403,9 @@ mod tests {
     use crate::test_support::containers;
 
     // Mock-server support for service-level tests.
-    use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use axum::{
+        Json, Router, extract::Path, http::StatusCode, response::IntoResponse, routing::post,
+    };
     use std::net::SocketAddr;
 
     // ── Unit tests for pure helpers ────────────────────────────────────────────
@@ -469,10 +471,26 @@ mod tests {
         };
         let body = build_query(&req).unwrap();
         let filters = body["query"]["bool"]["filter"].as_array().unwrap();
-        assert!(filters.iter().any(|f| f["terms"]["project_id"] == json!(["p1"])));
-        assert!(filters.iter().any(|f| f["terms"]["board_id"] == json!(["b1"])));
-        assert!(filters.iter().any(|f| f["terms"]["labels"] == json!(["bug"])));
-        assert!(filters.iter().any(|f| f["terms"]["assignees"] == json!(["user:alice"])));
+        assert!(
+            filters
+                .iter()
+                .any(|f| f["terms"]["project_id"] == json!(["p1"]))
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f["terms"]["board_id"] == json!(["b1"]))
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f["terms"]["labels"] == json!(["bug"]))
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f["terms"]["assignees"] == json!(["user:alice"]))
+        );
     }
 
     #[test]
@@ -501,7 +519,10 @@ mod tests {
 
     #[test]
     fn internal_returns_internal_status() {
-        let err = internal("boom", std::io::Error::new(std::io::ErrorKind::Other, "ouch"));
+        let err = internal(
+            "boom",
+            std::io::Error::new(std::io::ErrorKind::Other, "ouch"),
+        );
         assert_eq!(err.code(), tonic::Code::Internal);
         assert!(err.message().contains("boom"));
     }
@@ -513,8 +534,8 @@ mod tests {
     }
 
     fn keto_client() -> Arc<KetoClient> {
-        let grpc = std::env::var("KETO_READ_ADDR")
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let grpc =
+            std::env::var("KETO_READ_ADDR").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let write_grpc = std::env::var("KETO_WRITE_ADDR")
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
         Arc::new(KetoClient::new(KetoConfig {
@@ -522,7 +543,6 @@ mod tests {
             write_grpc_endpoint: write_grpc,
         }))
     }
-
 
     /// Unique index per test run to avoid cross-test interference.
     fn test_index() -> String {
@@ -1225,8 +1245,10 @@ mod tests {
         let project_b = Uuid::new_v4();
         insert_test_board_with_project(&infra.pool, board_id, project_a, "public").await;
 
-        let card_a = index_public_card(&os, &index, board_id, project_a, "Card A", vec![], vec![]).await;
-        let _card_b = index_public_card(&os, &index, board_id, project_b, "Card B", vec![], vec![]).await;
+        let card_a =
+            index_public_card(&os, &index, board_id, project_a, "Card A", vec![], vec![]).await;
+        let _card_b =
+            index_public_card(&os, &index, board_id, project_b, "Card B", vec![], vec![]).await;
         os.refresh(&index).await.unwrap();
 
         let mut req = search_request("Card");
@@ -1264,8 +1286,10 @@ mod tests {
         insert_test_board_with_project(&infra.pool, board_a, project_id, "public").await;
         insert_test_board_with_project(&infra.pool, board_b, project_id, "public").await;
 
-        let card_a = index_public_card(&os, &index, board_a, project_id, "Card A", vec![], vec![]).await;
-        let _card_b = index_public_card(&os, &index, board_b, project_id, "Card B", vec![], vec![]).await;
+        let card_a =
+            index_public_card(&os, &index, board_a, project_id, "Card A", vec![], vec![]).await;
+        let _card_b =
+            index_public_card(&os, &index, board_b, project_id, "Card B", vec![], vec![]).await;
         os.refresh(&index).await.unwrap();
 
         let mut req = search_request("Card");

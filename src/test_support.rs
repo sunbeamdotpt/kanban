@@ -173,12 +173,17 @@ pub(crate) fn nats_url() -> String {
 // ── Testcontainers-backed dependency harness ───────────────────────────────
 //
 // This module starts Postgres, NATS (JetStream), Valkey, and Ory Keto in
-// throwaway containers when `containers::setup()` is first called. It is
-// designed to work with Docker-compatible runtimes; on macOS the project
-// expects `DOCKER_HOST=unix://$HOME/.socktainer/container.sock`.
+// throwaway containers when `containers::setup()` is first called. The
+// implementation uses testcontainers' GenericImage directly instead of
+// module-specific wrappers because Apple Container's Docker-compatible API
+// (accessed via socktainer) does not reliably stream container logs, so
+// log-based readiness strategies hang. Instead we start containers with no
+// wait strategy and poll readiness manually.
 //
-// If the standard environment variables are already set (DATABASE_URL, etc.)
-// the harness skips container creation and uses the provided services.
+// Because socktainer does not publish container ports to the host, we connect
+// to each container via its bridge IP address and the original internal port.
+// `sunbeam_test::container_bridge_ip` resolves that IP by inspecting
+// `NetworkSettings.Networks`, which works with this runtime.
 
 #[cfg(test)]
 pub(crate) mod containers {
@@ -189,17 +194,43 @@ pub(crate) mod containers {
     use sunbeam_g2v::config::NatsConfig;
     use sunbeam_g2v::middleware::auth::keto::KetoClient;
     use sunbeam_g2v::mq::NatsClient;
-    use sunbeam_test::Keto;
+    use sunbeam_test::container_bridge_ip;
+    use testcontainers::core::{ContainerPort, IntoContainerPort};
     use testcontainers::runners::AsyncRunner;
-    use testcontainers::{ContainerAsync, ImageExt};
-    use testcontainers_modules::minio::MinIO;
-    use testcontainers_modules::nats::{Nats, NatsServerCmd};
-    use testcontainers_modules::postgres::Postgres;
-    use testcontainers_modules::valkey::Valkey;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
     use tokio::sync::OnceCell;
+    use tokio::time::sleep;
 
     use crate::auth::logout_watermark::LogoutWatermark;
     use crate::integrations::s3::{S3Client, S3Config};
+
+    /// Container images used by the harness. Override via environment variables.
+    const POSTGRES_IMAGE: &str = match option_env!("KANBAN_TEST_POSTGRES_IMAGE") {
+        Some(s) => s,
+        None => "mirror.gcr.io/library/postgres:16-alpine",
+    };
+    const NATS_IMAGE: &str = match option_env!("KANBAN_TEST_NATS_IMAGE") {
+        Some(s) => s,
+        None => "nats:2.10-alpine",
+    };
+    const VALKEY_IMAGE: &str = match option_env!("KANBAN_TEST_VALKEY_IMAGE") {
+        Some(s) => s,
+        None => "valkey/valkey:8.0.2-alpine",
+    };
+    const KETO_IMAGE: &str = match option_env!("KANBAN_TEST_KETO_IMAGE") {
+        Some(s) => s,
+        None => "oryd/keto:v26.2.0",
+    };
+    const MINIO_IMAGE: &str = match option_env!("KANBAN_TEST_MINIO_IMAGE") {
+        Some(s) => s,
+        None => "minio/minio:RELEASE.2025-02-28T09-55-16Z",
+    };
+    const OPENSEARCH_IMAGE: &str = match option_env!("KANBAN_TEST_OPENSEARCH_IMAGE") {
+        Some(s) => s,
+        None => "opensearchproject/opensearch:2.19.1",
+    };
+
+    const MINIO_BUCKET: &str = "sunbeam-kanban";
 
     /// Live dependency clients used by a single integration test.
     ///
@@ -221,22 +252,381 @@ pub(crate) mod containers {
         valkey_url: String,
         keto_read_url: String,
         keto_write_url: String,
-        _pg: Option<ContainerAsync<Postgres>>,
-        _nats: Option<ContainerAsync<Nats>>,
-        _valkey: Option<ContainerAsync<Valkey>>,
-        _keto: Option<ContainerAsync<testcontainers::GenericImage>>,
-        _minio: Option<ContainerAsync<MinIO>>,
+        _pg: Option<ContainerAsync<GenericImage>>,
+        _nats: Option<ContainerAsync<GenericImage>>,
+        _valkey: Option<ContainerAsync<GenericImage>>,
+        _keto: Option<ContainerAsync<GenericImage>>,
+        _minio: Option<ContainerAsync<GenericImage>>,
+        _opensearch: Option<ContainerAsync<GenericImage>>,
     }
 
     static SHARED: OnceCell<SharedInfra> = OnceCell::const_new();
 
-    /// Resolve the bridge IP of a running container.
-    async fn bridge_ip(container: &ContainerAsync<impl testcontainers::Image>) -> String {
-        container
-            .get_bridge_ip_address()
+    /// Build or reuse the shared test infrastructure and return a fresh
+    /// `TestInfra` for the calling test.
+    pub async fn setup() -> TestInfra {
+        let shared = SHARED
+            .get_or_init(|| async {
+                if let Some(infra) = from_env().await {
+                    return infra;
+                }
+                start_containers().await
+            })
+            .await;
+
+        build_test_infra(shared).await
+    }
+
+    /// Use externally-provided services when the standard env vars are set.
+    async fn from_env() -> Option<SharedInfra> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let nats_url = std::env::var("NATS_URL").ok()?;
+        let valkey_url = std::env::var("VALKEY_URL").ok()?;
+        let keto_read_url = std::env::var("KETO_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_READ_ADDR"))
+            .ok()?;
+        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
+            .ok()?;
+
+        // Ensure an S3 bucket exists even when the rest of the stack is external.
+        let _ = ensure_minio().await;
+
+        Some(SharedInfra {
+            database_url,
+            nats_url,
+            valkey_url,
+            keto_read_url,
+            keto_write_url,
+            _pg: None,
+            _nats: None,
+            _valkey: None,
+            _keto: None,
+            _minio: None,
+            _opensearch: None,
+        })
+    }
+
+    /// Start all containers, run migrations, and return the shared URLs/handles.
+    async fn start_containers() -> SharedInfra {
+        eprintln!(
+            "[testcontainers] starting Postgres, NATS, Valkey, Keto, MinIO, and OpenSearch..."
+        );
+
+        let startup_timeout = Duration::from_secs(600);
+
+        let pg = start_postgres(startup_timeout).await;
+        let pg_ip = bridge_ip(&pg).await;
+        let database_url = format!("postgres://sunbeam:sunbeam@{pg_ip}:5432/kanban");
+
+        let nats = start_nats(startup_timeout).await;
+        let nats_ip = bridge_ip(&nats).await;
+        let nats_url = format!("nats://{nats_ip}:4222");
+
+        let valkey = start_valkey(startup_timeout).await;
+        let valkey_ip = bridge_ip(&valkey).await;
+        let valkey_url = format!("redis://{valkey_ip}:6379");
+
+        let keto = start_keto(startup_timeout).await;
+        let keto_ip = bridge_ip(&keto).await;
+        let keto_read_url = format!("http://{keto_ip}:4466");
+        let keto_write_url = format!("http://{keto_ip}:4467");
+
+        let minio = start_minio(startup_timeout).await;
+        let minio_ip = bridge_ip(&minio).await;
+        let s3_endpoint = format!("http://{minio_ip}:9000");
+
+        let opensearch = start_opensearch(startup_timeout).await;
+        let opensearch_ip = bridge_ip(&opensearch).await;
+        let opensearch_url = format!("http://{opensearch_ip}:9200");
+
+        // Export the service URLs as environment variables so that tests that
+        // spin up their own clients (e.g. auth::keto_dispatch integration tests)
+        // can find the running containers.
+        unsafe {
+            std::env::set_var("DATABASE_URL", &database_url);
+            std::env::set_var("NATS_URL", &nats_url);
+            std::env::set_var("VALKEY_URL", &valkey_url);
+            std::env::set_var("KETO_GRPC_URL", &keto_read_url);
+            std::env::set_var("KETO_READ_ADDR", &keto_read_url);
+            std::env::set_var("KETO_WRITE_GRPC_URL", &keto_write_url);
+            std::env::set_var("KETO_WRITE_ADDR", &keto_write_url);
+            std::env::set_var("OPENSEARCH_URL", &opensearch_url);
+        }
+
+        // Run migrations against the fresh Postgres instance.
+        {
+            let pool = connect_pool(&database_url).await;
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("failed to run database migrations");
+        }
+
+        // Create the MinIO bucket used by attachment tests.
+        unsafe {
+            std::env::set_var("S3_ENDPOINT", &s3_endpoint);
+            std::env::set_var("S3_REGION", "us-east-1");
+            std::env::set_var("S3_ACCESS_KEY", "minioadmin");
+            std::env::set_var("S3_SECRET_KEY", "minioadmin");
+            std::env::set_var("S3_BUCKET", MINIO_BUCKET);
+        }
+        let s3 = S3Client::new(S3Config::from_env());
+        s3.create_bucket()
             .await
-            .expect("container bridge IP unavailable")
-            .to_string()
+            .expect("failed to create MinIO bucket");
+
+        eprintln!("[testcontainers] infrastructure ready");
+
+        SharedInfra {
+            database_url,
+            nats_url,
+            valkey_url,
+            keto_read_url,
+            keto_write_url,
+            _pg: Some(pg),
+            _nats: Some(nats),
+            _valkey: Some(valkey),
+            _keto: Some(keto),
+            _minio: Some(minio),
+            _opensearch: Some(opensearch),
+        }
+    }
+
+    /// Return the bridge IP address of a running container.
+    ///
+    /// Uses `sunbeam_test::container_bridge_ip`, which inspects
+    /// `NetworkSettings.Networks` directly and therefore works with runtimes
+    /// such as socktainer that do not expose host port mappings.
+    async fn bridge_ip(container: &ContainerAsync<GenericImage>) -> String {
+        container_bridge_ip(container.id())
+            .await
+            .expect("failed to resolve container bridge IP")
+    }
+
+    async fn start_postgres(timeout: Duration) -> ContainerAsync<GenericImage> {
+        let parts: Vec<&str> = POSTGRES_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (POSTGRES_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(5432.tcp())
+            .with_env_var("POSTGRES_USER", "sunbeam")
+            .with_env_var("POSTGRES_PASSWORD", "sunbeam")
+            .with_env_var("POSTGRES_DB", "kanban")
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+
+        let host = bridge_ip(&container).await;
+
+        // Poll until Postgres accepts connections.
+        for _ in 0..120 {
+            match tokio::net::TcpStream::connect((&*host, 5432)).await {
+                Ok(_) => {
+                    // Also verify we can run a simple query.
+                    let url = format!("postgres://sunbeam:sunbeam@{host}:5432/kanban");
+                    if let Ok(pool) = PgPoolOptions::new()
+                        .max_connections(1)
+                        .acquire_timeout(Duration::from_secs(2))
+                        .connect(&url)
+                        .await
+                    {
+                        if sqlx::query("SELECT 1").fetch_optional(&pool).await.is_ok() {
+                            return container;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        panic!("Postgres did not become ready in time");
+    }
+
+    async fn start_nats(timeout: Duration) -> ContainerAsync<GenericImage> {
+        let parts: Vec<&str> = NATS_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (NATS_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(4222.tcp())
+            .with_cmd(vec!["-js"])
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start NATS container");
+
+        let host = bridge_ip(&container).await;
+
+        for _ in 0..120 {
+            if tokio::net::TcpStream::connect((&*host, 4222)).await.is_ok() {
+                return container;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        panic!("NATS did not become ready in time");
+    }
+
+    async fn start_valkey(timeout: Duration) -> ContainerAsync<GenericImage> {
+        let parts: Vec<&str> = VALKEY_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (VALKEY_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(6379.tcp())
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start Valkey container");
+
+        let host = bridge_ip(&container).await;
+
+        for _ in 0..120 {
+            let url = format!("redis://{host}:6379");
+            if let Ok(client) = redis::Client::open(url.as_str()) {
+                if client.get_multiplexed_async_connection().await.is_ok() {
+                    return container;
+                }
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        panic!("Valkey did not become ready in time");
+    }
+
+    async fn start_keto(timeout: Duration) -> ContainerAsync<GenericImage> {
+        // Write the Keto config to a host path and bind-mount it into the
+        // container. testcontainers' `with_copy_to` copies files before the
+        // container starts, which socktainer does not support ("Rootfs not
+        // found"); a bind mount works because the runtime resolves it at start.
+        let config_path =
+            std::env::temp_dir().join(format!("kanban-keto-config-{}.yml", std::process::id()));
+        std::fs::write(&config_path, keto_config()).expect("write keto config");
+
+        let parts: Vec<&str> = KETO_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (KETO_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(ContainerPort::Tcp(4466))
+            .with_exposed_port(ContainerPort::Tcp(4467))
+            .with_exposed_port(ContainerPort::Tcp(4468))
+            .with_host_config_modifier(move |host_config| {
+                let bind = format!("{}:/home/ory/keto.yml", config_path.display());
+                host_config.binds = Some(vec![bind]);
+            })
+            .with_cmd(vec!["serve", "-c", "/home/ory/keto.yml"])
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start Keto container");
+
+        let host = bridge_ip(&container).await;
+
+        let client = KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
+            grpc_endpoint: format!("http://{host}:4466"),
+            write_grpc_endpoint: format!("http://{host}:4467"),
+        });
+
+        for _ in 0..120 {
+            if client
+                .check_permission("_kanban_health", "probe", "health", "probe-subject")
+                .await
+                .is_ok()
+            {
+                return container;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        panic!("Keto did not become ready in time");
+    }
+
+    async fn start_minio(timeout: Duration) -> ContainerAsync<GenericImage> {
+        let parts: Vec<&str> = MINIO_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (MINIO_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(9000.tcp())
+            .with_env_var("MINIO_ROOT_USER", "minioadmin")
+            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+            .with_cmd(vec!["server", "/data"])
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start MinIO container");
+
+        let host = bridge_ip(&container).await;
+
+        for _ in 0..120 {
+            let url = format!("http://{host}:9000/minio/health/live");
+            if let Ok(resp) = reqwest::get(&url).await {
+                if resp.status().is_success() {
+                    return container;
+                }
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        panic!("MinIO did not become ready in time");
+    }
+
+    async fn start_opensearch(timeout: Duration) -> ContainerAsync<GenericImage> {
+        let parts: Vec<&str> = OPENSEARCH_IMAGE.rsplitn(2, ':').collect();
+        let (name, tag) = match parts.as_slice() {
+            [tag, name] => (name.to_string(), tag.to_string()),
+            _ => (OPENSEARCH_IMAGE.to_string(), "latest".to_string()),
+        };
+
+        let container = GenericImage::new(name, tag)
+            .with_exposed_port(9200.tcp())
+            .with_env_var("discovery.type", "single-node")
+            .with_env_var("plugins.security.disabled", "true")
+            .with_env_var("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "OpenSearchTest123!")
+            .with_env_var("DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI", "true")
+            .with_env_var(
+                "OPENSEARCH_JAVA_OPTS",
+                "-Xms512m -Xmx512m -Dopensearch.transport.cname_in_publish_address=true",
+            )
+            .with_startup_timeout(timeout)
+            .start()
+            .await
+            .expect("failed to start OpenSearch container");
+
+        let host = bridge_ip(&container).await;
+
+        for _ in 0..240 {
+            let url = format!("http://{host}:9200/_cluster/health");
+            if let Ok(resp) = reqwest::get(&url).await {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.text().await {
+                        if body.contains("\"status\":\"green\"")
+                            || body.contains("\"status\":\"yellow\"")
+                        {
+                            return container;
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        panic!("OpenSearch did not become ready in time");
     }
 
     /// Return a Keto YAML that declares the namespaces used by kanban.
@@ -273,157 +663,18 @@ serve:
         .to_string()
     }
 
-    /// Build or reuse the shared test infrastructure and return a fresh
-    /// `TestInfra` for the calling test.
-    pub async fn setup() -> TestInfra {
-        let shared = SHARED
-            .get_or_init(|| async {
-                if let Some(infra) = from_env().await {
-                    return infra;
-                }
-                start_containers().await
-            })
-            .await;
-
-        build_test_infra(shared).await
-    }
-
-    /// Use externally-provided services when the standard env vars are set.
-    async fn from_env() -> Option<SharedInfra> {
-        let database_url = std::env::var("DATABASE_URL").ok()?;
-        let nats_url = std::env::var("NATS_URL").ok()?;
-        let valkey_url = std::env::var("VALKEY_URL").ok()?;
-        let keto_read_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .ok()?;
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .ok()?;
-
-        let _minio = ensure_minio().await;
-
-        Some(SharedInfra {
-            database_url,
-            nats_url,
-            valkey_url,
-            keto_read_url,
-            keto_write_url,
-            _pg: None,
-            _nats: None,
-            _valkey: None,
-            _keto: None,
-            _minio,
-        })
-    }
-
-    /// Start all containers, run migrations, and return the shared URLs/handles.
-    async fn start_containers() -> SharedInfra {
-        eprintln!("[testcontainers] starting Postgres, NATS, Valkey, and Keto...");
-
-        let startup_timeout = Duration::from_secs(600);
-
-        let pg_fut = tokio::spawn(
-            Postgres::default()
-                .with_db_name("kanban")
-                .with_user("sunbeam")
-                .with_password("sunbeam")
-                .with_startup_timeout(startup_timeout)
-                .start(),
-        );
-
-        let nats_cmd = NatsServerCmd::default().with_jetstream();
-        let nats_fut = tokio::spawn(
-            Nats::default()
-                .with_cmd(&nats_cmd)
-                .with_startup_timeout(startup_timeout)
-                .start(),
-        );
-
-        let valkey_fut = tokio::spawn(
-            Valkey::default()
-                .with_startup_timeout(startup_timeout)
-                .start(),
-        );
-
-        let keto_fut = tokio::spawn(Keto::new().with_config(keto_config()).start());
-
-        let pg = pg_fut
-            .await
-            .expect("Postgres startup task panicked")
-            .expect("failed to start Postgres container");
-        let nats_container = nats_fut
-            .await
-            .expect("NATS startup task panicked")
-            .expect("failed to start NATS container");
-        let valkey = valkey_fut
-            .await
-            .expect("Valkey startup task panicked")
-            .expect("failed to start Valkey container");
-        let keto_container = keto_fut
-            .await
-            .expect("Keto startup task panicked")
-            .expect("failed to start Keto container");
-
-        eprintln!("[testcontainers] containers started; resolving bridge IPs...");
-
-        let pg_ip = bridge_ip(&pg).await;
-        let nats_ip = bridge_ip(&nats_container).await;
-        let valkey_ip = bridge_ip(&valkey).await;
-        let keto_ip = bridge_ip(&keto_container).await;
-
-        let database_url = format!("postgres://sunbeam:sunbeam@{pg_ip}:5432/kanban");
-        let nats_url = format!("nats://{nats_ip}:4222");
-        let valkey_url = format!("redis://{valkey_ip}:6379");
-        let keto_read_url = format!("http://{keto_ip}:4466");
-        let keto_write_url = format!("http://{keto_ip}:4467");
-
-        eprintln!("[testcontainers] running database migrations...");
-        {
-            let pool = connect_pool(&database_url).await;
-            sqlx::migrate!("./migrations")
-                .run(&pool)
-                .await
-                .expect("failed to run database migrations");
-        }
-        eprintln!("[testcontainers] infrastructure ready");
-
-        let _minio = ensure_minio().await;
-
-        SharedInfra {
-            database_url,
-            nats_url,
-            valkey_url,
-            keto_read_url,
-            keto_write_url,
-            _pg: Some(pg),
-            _nats: Some(nats_container),
-            _valkey: Some(valkey),
-            _keto: Some(keto_container),
-            _minio,
-        }
-    }
-
-    const MINIO_BUCKET: &str = "sunbeam-kanban";
-
     /// Ensure an S3-compatible endpoint is available for attachments tests.
     ///
-    /// If `S3_ENDPOINT` is already set the harness reuses it and returns `None`.
-    /// Otherwise it starts a MinIO container, sets the standard S3 env vars, and
-    /// creates the bucket.
-    async fn ensure_minio() -> Option<ContainerAsync<MinIO>> {
-        if std::env::var("S3_ENDPOINT").is_ok() {
-            return None;
+    /// If `S3_ENDPOINT` is already set the harness reuses it and returns it.
+    /// Otherwise it starts a MinIO container and returns the endpoint.
+    async fn ensure_minio() -> String {
+        if let Some(endpoint) = std::env::var("S3_ENDPOINT").ok() {
+            return endpoint;
         }
 
-        eprintln!("[testcontainers] starting MinIO...");
-        let minio = MinIO::default()
-            .with_startup_timeout(Duration::from_secs(600))
-            .start()
-            .await
-            .expect("failed to start MinIO container");
-
-        let ip = bridge_ip(&minio).await;
-        let endpoint = format!("http://{ip}:9000");
+        let minio = start_minio(Duration::from_secs(600)).await;
+        let host = bridge_ip(&minio).await;
+        let endpoint = format!("http://{host}:9000");
 
         unsafe {
             std::env::set_var("S3_ENDPOINT", &endpoint);
@@ -437,9 +688,8 @@ serve:
         s3.create_bucket()
             .await
             .expect("failed to create MinIO bucket");
-        eprintln!("[testcontainers] MinIO ready at {endpoint}");
 
-        Some(minio)
+        endpoint
     }
 
     /// Build a fresh `TestInfra` from the shared URLs so each test owns its own
@@ -466,8 +716,6 @@ serve:
 
     async fn connect_pool(database_url: &str) -> sqlx::PgPool {
         PgPoolOptions::new()
-            // Each test gets its own pool; keep it small so many nextest
-            // workers in parallel do not exhaust Postgres max_connections.
             .max_connections(10)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(30))
