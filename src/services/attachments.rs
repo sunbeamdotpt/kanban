@@ -401,7 +401,7 @@ mod tests {
         crate::integrations::s3::S3Config::from_env()
     }
 
-    async fn setup() -> (&'static crate::test_support::containers::TestInfra, AttachmentServiceImpl) {
+    async fn setup() -> (crate::test_support::containers::TestInfra, AttachmentServiceImpl) {
         let infra = crate::test_support::containers::setup().await;
         let cfg = s3_config();
         let svc = AttachmentServiceImpl {

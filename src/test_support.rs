@@ -201,16 +201,26 @@ pub(crate) mod containers {
     use crate::auth::logout_watermark::LogoutWatermark;
     use crate::integrations::s3::{S3Client, S3Config};
 
-    /// Live dependency clients used by integration tests.
+    /// Live dependency clients used by a single integration test.
     ///
-    /// The optional `_*` fields keep testcontainers containers alive for the
-    /// lifetime of the test process. They are `None` when the harness reuses
-    /// externally-provided services via environment variables.
+    /// A fresh `TestInfra` is returned on every call so that each test owns
+    /// its own Postgres pool and clients. The heavy container handles are kept
+    /// alive in the static `SHARED` singleton and stopped when the test process
+    /// exits.
     pub struct TestInfra {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
         pub keto: Arc<KetoClient>,
         pub watermark: Arc<LogoutWatermark>,
+    }
+
+    /// Connection URLs and container handles shared by the whole test process.
+    struct SharedInfra {
+        database_url: String,
+        nats_url: String,
+        valkey_url: String,
+        keto_read_url: String,
+        keto_write_url: String,
         _pg: Option<ContainerAsync<Postgres>>,
         _nats: Option<ContainerAsync<Nats>>,
         _valkey: Option<ContainerAsync<Valkey>>,
@@ -218,7 +228,7 @@ pub(crate) mod containers {
         _minio: Option<ContainerAsync<MinIO>>,
     }
 
-    static INFRA: OnceCell<TestInfra> = OnceCell::const_new();
+    static SHARED: OnceCell<SharedInfra> = OnceCell::const_new();
 
     /// Resolve the bridge IP of a running container.
     async fn bridge_ip(container: &ContainerAsync<impl testcontainers::Image>) -> String {
@@ -263,20 +273,23 @@ serve:
         .to_string()
     }
 
-    /// Build or reuse the shared test infrastructure.
-    pub async fn setup() -> &'static TestInfra {
-        INFRA
+    /// Build or reuse the shared test infrastructure and return a fresh
+    /// `TestInfra` for the calling test.
+    pub async fn setup() -> TestInfra {
+        let shared = SHARED
             .get_or_init(|| async {
                 if let Some(infra) = from_env().await {
                     return infra;
                 }
                 start_containers().await
             })
-            .await
+            .await;
+
+        build_test_infra(shared).await
     }
 
     /// Use externally-provided services when the standard env vars are set.
-    async fn from_env() -> Option<TestInfra> {
+    async fn from_env() -> Option<SharedInfra> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let nats_url = std::env::var("NATS_URL").ok()?;
         let valkey_url = std::env::var("VALKEY_URL").ok()?;
@@ -287,35 +300,24 @@ serve:
             .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .ok()?;
 
-        let pool = connect_pool(&database_url).await;
-        let nats = connect_nats(&nats_url).await;
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"));
-        let keto = Arc::new(KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_read_url.clone(),
-                write_grpc_endpoint: keto_write_url.clone(),
-            },
-        ));
+        let _minio = ensure_minio().await;
 
-        // If the caller did not provide an S3 endpoint, start a throwaway MinIO
-        // bucket for attachments tests.
-        let minio = ensure_minio().await;
-
-        Some(TestInfra {
-            pool,
-            nats,
-            keto,
-            watermark,
+        Some(SharedInfra {
+            database_url,
+            nats_url,
+            valkey_url,
+            keto_read_url,
+            keto_write_url,
             _pg: None,
             _nats: None,
             _valkey: None,
             _keto: None,
-            _minio: minio,
+            _minio,
         })
     }
 
-    /// Start all containers and run migrations.
-    async fn start_containers() -> TestInfra {
+    /// Start all containers, run migrations, and return the shared URLs/handles.
+    async fn start_containers() -> SharedInfra {
         eprintln!("[testcontainers] starting Postgres, NATS, Valkey, and Keto...");
 
         let startup_timeout = Duration::from_secs(600);
@@ -375,37 +377,29 @@ serve:
         let keto_read_url = format!("http://{keto_ip}:4466");
         let keto_write_url = format!("http://{keto_ip}:4467");
 
-        let pool = connect_pool(&database_url).await;
-
         eprintln!("[testcontainers] running database migrations...");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("failed to run database migrations");
+        {
+            let pool = connect_pool(&database_url).await;
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("failed to run database migrations");
+        }
         eprintln!("[testcontainers] infrastructure ready");
 
-        let nats = connect_nats(&nats_url).await;
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"));
-        let keto = Arc::new(KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_read_url.clone(),
-                write_grpc_endpoint: keto_write_url.clone(),
-            },
-        ));
+        let _minio = ensure_minio().await;
 
-        // Start a throwaway MinIO bucket for attachments tests.
-        let minio = ensure_minio().await;
-
-        TestInfra {
-            pool,
-            nats,
-            keto,
-            watermark,
+        SharedInfra {
+            database_url,
+            nats_url,
+            valkey_url,
+            keto_read_url,
+            keto_write_url,
             _pg: Some(pg),
             _nats: Some(nats_container),
             _valkey: Some(valkey),
             _keto: Some(keto_container),
-            _minio: minio,
+            _minio,
         }
     }
 
@@ -448,10 +442,35 @@ serve:
         Some(minio)
     }
 
+    /// Build a fresh `TestInfra` from the shared URLs so each test owns its own
+    /// connections and is isolated from other parallel tests.
+    async fn build_test_infra(shared: &SharedInfra) -> TestInfra {
+        let pool = connect_pool(&shared.database_url).await;
+        let nats = connect_nats(&shared.nats_url).await;
+        let watermark =
+            Arc::new(LogoutWatermark::new(&shared.valkey_url).expect("LogoutWatermark::new"));
+        let keto = Arc::new(KetoClient::new(
+            sunbeam_g2v::middleware::auth::keto::KetoConfig {
+                grpc_endpoint: shared.keto_read_url.clone(),
+                write_grpc_endpoint: shared.keto_write_url.clone(),
+            },
+        ));
+
+        TestInfra {
+            pool,
+            nats,
+            keto,
+            watermark,
+        }
+    }
+
     async fn connect_pool(database_url: &str) -> sqlx::PgPool {
         PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
+            // Each test gets its own pool; keep it small so many nextest
+            // workers in parallel do not exhaust Postgres max_connections.
+            .max_connections(10)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
             .connect(database_url)
             .await
             .expect("failed to connect to Postgres")
