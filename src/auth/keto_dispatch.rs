@@ -176,17 +176,19 @@ static MATRIX: [DispatchEntry; 58] = [
         object_id_source: ObjectIdSource::Header,
     },
     // ── BoardService (10) ───────────────────────────────────────────────────
+    // ListBoards, GetBoard and SubscribeBoard use application-level visibility
+    // filtering (private/internal/public) in the handler.
     DispatchEntry {
         method: "/sunbeam.kanban.v1.BoardService/ListBoards",
-        namespace: "KanbanProject",
-        relation: "view",
-        object_id_source: ObjectIdSource::Header, // project id in header
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.BoardService/GetBoard",
-        namespace: "KanbanBoard",
-        relation: "view",
-        object_id_source: ObjectIdSource::Header,
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.BoardService/CreateBoard",
@@ -232,9 +234,9 @@ static MATRIX: [DispatchEntry; 58] = [
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.BoardService/SubscribeBoard",
-        namespace: "KanbanBoard",
-        relation: "view",
-        object_id_source: ObjectIdSource::Header,
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
     },
     // ── CardService (17) ────────────────────────────────────────────────────
     DispatchEntry {
@@ -411,11 +413,13 @@ static MATRIX: [DispatchEntry; 58] = [
         relation: "",
         object_id_source: ObjectIdSource::None,
     },
+    // GetAggregatedBoard and SubscribeAggregatedBoard use application-level
+    // visibility filtering (private/internal/public) in the handler.
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AggregatedBoardService/GetAggregatedBoard",
-        namespace: "KanbanAggregatedBoard",
-        relation: "view",
-        object_id_source: ObjectIdSource::Header,
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AggregatedBoardService/UpdateAggregatedBoard",
@@ -455,9 +459,9 @@ static MATRIX: [DispatchEntry; 58] = [
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AggregatedBoardService/SubscribeAggregatedBoard",
-        namespace: "KanbanAggregatedBoard",
-        relation: "view",
-        object_id_source: ObjectIdSource::Header,
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None,
     },
     // ── SearchService (1) ───────────────────────────────────────────────────
     DispatchEntry {
@@ -466,6 +470,15 @@ static MATRIX: [DispatchEntry; 58] = [
         relation: "",
         object_id_source: ObjectIdSource::None, // post-filter via keto_expand in handler
     },
+];
+
+/// RPC methods that bypass the `keto_dispatch` middleware entirely.
+///
+/// These are served by a separate Axum router that does not run `JwtLayer` or
+/// `keto_dispatch`, so they must not be counted by the matrix coverage checks.
+pub const BYPASSED_METHODS: &[&str] = &[
+    "/sunbeam.kanban.v1.PublicBoardService/GetPublicBoard",
+    "/sunbeam.kanban.v1.PublicBoardService/ListPublicBoards",
 ];
 
 // ============================================================================
@@ -655,17 +668,17 @@ mod tests {
     /// regex over raw bytes — no proto codegen dependency required.
     #[test]
     fn matrix_covers_all_rpcs() {
-        let expected = expected_methods_from_protos();
+        let expected: HashSet<String> = expected_methods_from_protos()
+            .into_iter()
+            .filter(|m| !BYPASSED_METHODS.contains(&m.as_str()))
+            .collect();
         let actual: HashSet<&str> = MATRIX.iter().map(|e| e.method).collect();
 
         let missing: Vec<_> = expected
             .iter()
             .filter(|m| !actual.contains(m.as_str()))
             .collect();
-        let extra: Vec<_> = actual
-            .iter()
-            .filter(|m| !expected.iter().any(|e| e.as_str() == **m))
-            .collect();
+        let extra: Vec<_> = actual.iter().filter(|m| !expected.contains(**m)).collect();
 
         assert!(
             missing.is_empty() && extra.is_empty(),
@@ -825,14 +838,14 @@ mod tests {
     /// Resolution: the `dispatch_returns_400_when_header_missing_for_header_source`
     /// integration test covers this with `#[ignore = "needs shared valkey"]`.
     #[test]
-    fn object_id_source_header_entry_exists_for_get_board() {
+    fn object_id_source_none_entry_exists_for_get_board() {
         let entry = MATRIX
             .iter()
             .find(|e| e.method == "/sunbeam.kanban.v1.BoardService/GetBoard")
             .expect("GetBoard must be in MATRIX");
-        assert_eq!(entry.object_id_source, ObjectIdSource::Header);
-        assert_eq!(entry.namespace, "KanbanBoard");
-        assert_eq!(entry.relation, "view");
+        assert_eq!(entry.object_id_source, ObjectIdSource::None);
+        assert!(entry.namespace.is_empty());
+        assert!(entry.relation.is_empty());
     }
 
     #[test]
@@ -845,8 +858,13 @@ mod tests {
                     "/sunbeam.kanban.v1.AuthService/SignalLogout",
                     "/sunbeam.kanban.v1.ProjectService/ListProjects",
                     "/sunbeam.kanban.v1.ProjectService/CreateProject",
+                    "/sunbeam.kanban.v1.BoardService/ListBoards",
+                    "/sunbeam.kanban.v1.BoardService/GetBoard",
+                    "/sunbeam.kanban.v1.BoardService/SubscribeBoard",
                     "/sunbeam.kanban.v1.AggregatedBoardService/CreateAggregatedBoard",
+                    "/sunbeam.kanban.v1.AggregatedBoardService/GetAggregatedBoard",
                     "/sunbeam.kanban.v1.AggregatedBoardService/ListAggregatedBoards",
+                    "/sunbeam.kanban.v1.AggregatedBoardService/SubscribeAggregatedBoard",
                     "/sunbeam.kanban.v1.SearchService/SearchCards",
                 ];
                 assert!(
@@ -885,9 +903,11 @@ mod tests {
         // Signal a logout for the test subject, then verify dispatch rejects
         // a token whose iat_ms is before the watermark.
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let keto_url = std::env::var("KETO_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_READ_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
@@ -946,9 +966,11 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_403_on_keto_denial() {
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let keto_url = std::env::var("KETO_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_READ_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
         use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
@@ -963,7 +985,8 @@ mod tests {
 
         // Token issued well in the future (iat=99999999999s) — no watermark
         // will block it.  Object id points to a non-existent board → Keto
-        // returns false → 403.
+        // returns false → 403. Use DeleteBoard because GetBoard now bypasses
+        // the Keto middleware for visibility filtering in the handler.
         let subject = "user:test-403";
         let claims = JwtClaims {
             sub: subject.to_string(),
@@ -974,7 +997,7 @@ mod tests {
             extra: Default::default(),
         };
         let auth = AuthContext::authenticated(subject, Some(claims));
-        let mut req = make_request("/sunbeam.kanban.v1.BoardService/GetBoard", auth.clone());
+        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
         req.headers_mut().insert(
             "x-sunbeam-object-id",
             "non-existent-board-id-00000000".parse().unwrap(),
@@ -984,6 +1007,128 @@ mod tests {
 
         let result = dispatch_raw(req).await;
         assert_eq!(result, StatusCode::FORBIDDEN, "Keto denial must yield 403");
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_unknown_method() {
+        let auth = make_auth(true);
+        let mut req = make_request("/sunbeam.kanban.v1.UnknownService/UnknownRpc", auth.clone());
+
+        let dummy_keto = Arc::new(KetoClient::with_defaults());
+        let watermark = Arc::new(
+            LogoutWatermark::new("redis://127.0.0.1:6379")
+                .expect("LogoutWatermark::new should not connect eagerly"),
+        );
+        let state = Arc::new(DispatchState {
+            keto: dummy_keto,
+            watermark,
+        });
+        req.extensions_mut().insert(auth);
+        req.extensions_mut().insert(state);
+
+        let result = dispatch_raw(req).await;
+        assert_eq!(result, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_400_when_header_missing() {
+        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
+        let keto_url = std::env::var("KETO_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_READ_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4467".to_string());
+
+        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
+
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
+        let keto = Arc::new(KetoClient::new(KetoConfig {
+            grpc_endpoint: keto_url,
+            write_grpc_endpoint: keto_write_url,
+        }));
+        let state = Arc::new(DispatchState { keto, watermark });
+
+        let subject = "user:test-missing-header";
+        let claims = JwtClaims {
+            sub: subject.to_string(),
+            iat: 99_999_999_999,
+            exp: i64::MAX,
+            iss: None,
+            aud: None,
+            extra: Default::default(),
+        };
+        let auth = AuthContext::authenticated(subject, Some(claims));
+        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
+        req.extensions_mut().insert(auth);
+        req.extensions_mut().insert(state);
+
+        let result = dispatch_raw(req).await;
+        assert_eq!(result, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_500_on_keto_error() {
+        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
+
+        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
+
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
+        let keto = Arc::new(KetoClient::new(KetoConfig {
+            grpc_endpoint: "http://127.0.0.1:1".to_string(),
+            write_grpc_endpoint: "http://127.0.0.1:1".to_string(),
+        }));
+        let state = Arc::new(DispatchState { keto, watermark });
+
+        let subject = "user:test-keto-error";
+        let claims = JwtClaims {
+            sub: subject.to_string(),
+            iat: 99_999_999_999,
+            exp: i64::MAX,
+            iss: None,
+            aud: None,
+            extra: Default::default(),
+        };
+        let auth = AuthContext::authenticated(subject, Some(claims));
+        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
+        req.headers_mut().insert(
+            "x-sunbeam-object-id",
+            "any-board-id-000000000000".parse().unwrap(),
+        );
+        req.extensions_mut().insert(auth);
+        req.extensions_mut().insert(state);
+
+        let result = dispatch_raw(req).await;
+        assert_eq!(result, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_503_on_watermark_error() {
+        let keto_url = std::env::var("KETO_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_READ_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
+            .unwrap_or_else(|_| "http://localhost:4467".to_string());
+
+        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
+
+        let watermark = Arc::new(LogoutWatermark::new("redis://127.0.0.1:1").unwrap());
+        let keto = Arc::new(KetoClient::new(KetoConfig {
+            grpc_endpoint: keto_url,
+            write_grpc_endpoint: keto_write_url,
+        }));
+        let state = Arc::new(DispatchState { keto, watermark });
+
+        let auth = make_auth(true);
+        let mut req = make_request("/sunbeam.kanban.v1.AuthService/WhoAmI", auth.clone());
+        req.extensions_mut().insert(auth);
+        req.extensions_mut().insert(state);
+
+        let result = dispatch_raw(req).await;
+        assert_eq!(result, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

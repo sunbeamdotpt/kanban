@@ -16,9 +16,12 @@
 //! introduced here.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use sunbeam_g2v::error::ServiceError;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
+use tokio::time::sleep;
 
 /// Query parameters for [`expand_objects`].
 pub struct ExpandQuery<'a> {
@@ -34,12 +37,23 @@ pub struct ExpandQuery<'a> {
     pub max_page_size: u32,
 }
 
+/// Return `true` if a Keto error looks like a transient SQLite serialization
+/// conflict from the in-memory test Keto image.
+fn is_keto_retryable(e: &str) -> bool {
+    let msg = e.to_lowercase();
+    msg.contains("unable to serialize access") || msg.contains("concurrent update")
+}
+
 /// Return the sorted, deduplicated set of object IDs for which `subject` holds
 /// `relation` in `namespace`.
 ///
 /// Pagination is handled internally.  If the running total would exceed
 /// `max_results` before the next page is fetched, the function returns
 /// `Err` rather than fetching more data.
+///
+/// Keto read calls are retried a few times when the backend reports a transient
+/// serialization conflict, which is common with the in-memory SQLite Keto used
+/// in integration tests.
 ///
 /// # Errors
 ///
@@ -54,6 +68,7 @@ pub async fn expand_objects(
     let mut page_token = String::new();
     let mut page_num: u32 = 0;
     let page_size = q.max_page_size.min(1000) as i32;
+    const MAX_RETRIES: usize = 4;
 
     loop {
         // Guard: refuse to fetch the next page if we're already at the ceiling.
@@ -61,16 +76,33 @@ pub async fn expand_objects(
             return Err(anyhow!("expand exceeded max_results: {}", objects.len()));
         }
 
-        let (tuples, next_token) = crate::auth::keto_compat::list_relation_tuples(
-            client,
-            q.namespace,
-            Some(q.relation),
-            Some(q.subject),
-            page_size,
-            &page_token,
-        )
-        .await
-        .map_err(|e| anyhow!("keto list_relation_tuples: {}", e))?;
+        let mut last_err = None;
+        let result = loop {
+            match crate::auth::keto_compat::list_relation_tuples(
+                client,
+                q.namespace,
+                Some(q.relation),
+                Some(q.subject),
+                page_size,
+                &page_token,
+            )
+            .await
+            {
+                Ok(r) => break Ok(r),
+                Err(ServiceError::Internal(ref e)) if is_keto_retryable(e.as_str()) => {
+                    let attempt = last_err.as_ref().map(|i: &usize| *i).unwrap_or(0);
+                    if attempt >= MAX_RETRIES {
+                        break Err(ServiceError::Internal(e.clone()));
+                    }
+                    sleep(Duration::from_millis(25 * (attempt + 1) as u64)).await;
+                    last_err = Some(attempt + 1);
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        let (tuples, next_token) =
+            result.map_err(|e| anyhow!("keto list_relation_tuples: {}", e))?;
 
         let count = tuples.len();
         page_num += 1;
@@ -108,9 +140,13 @@ mod tests {
     use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
     use uuid::Uuid;
 
+    use crate::auth::keto_retry::KetoRetryExt;
+
     /// Keto namespace for kanban integration tests.
     /// Must be declared in the keto namespace config for the dev instance.
-    const NS: &str = "KanbanTest";
+    /// KanbanProject is present in both the production OPL config and the
+    /// legacy in-memory config used by `test.sh`.
+    const NS: &str = "KanbanProject";
     const RELATION: &str = "view";
 
     struct KetoCtx {
@@ -153,7 +189,7 @@ mod tests {
         for i in 0..n {
             let obj = format!("{base_id}-{i}");
             ctx.client
-                .grant(NS, &obj, RELATION, subject)
+                .grant_with_retry(NS, &obj, RELATION, subject)
                 .await
                 .expect("seed_tuples: grant failed");
             objects.push(obj);
@@ -256,5 +292,72 @@ mod tests {
         );
 
         cleanup(&ctx, &subject).await;
+    }
+
+    /// max_results=0 errors immediately without fetching.
+    #[tokio::test]
+    async fn expand_errors_when_max_results_is_zero() {
+        let Some(ctx) = probe().await else { return };
+
+        let subject = format!("user:_test_zero_ceiling_{}", Uuid::new_v4());
+
+        let result = expand_objects(
+            &ctx.client,
+            ExpandQuery {
+                namespace: NS,
+                relation: RELATION,
+                subject: &subject,
+                max_page_size: 256,
+            },
+            0,
+        )
+        .await;
+
+        assert!(result.is_err(), "expected Err when max_results is zero");
+        assert!(
+            result.unwrap_err().to_string().contains("expand exceeded max_results"),
+            "expected max_results error"
+        );
+    }
+
+    /// page sizes above Keto's 1000 cap are truncated internally.
+    #[tokio::test]
+    async fn expand_caps_page_size_at_1000() {
+        let Some(ctx) = probe().await else { return };
+
+        let subject = format!("user:_test_page_cap_{}", Uuid::new_v4());
+        let base_id = format!("obj-{}", Uuid::new_v4());
+        let seeded = seed_tuples(&ctx, &subject, &base_id, 5).await;
+
+        let result = expand_objects(
+            &ctx.client,
+            ExpandQuery {
+                namespace: NS,
+                relation: RELATION,
+                subject: &subject,
+                max_page_size: 10_000,
+            },
+            10_000,
+        )
+        .await
+        .expect("expand_objects should succeed");
+
+        let expected: BTreeSet<String> = seeded.into_iter().collect();
+        assert_eq!(result, expected);
+
+        cleanup(&ctx, &subject).await;
+    }
+
+    #[test]
+    fn is_keto_retryable_detects_sqlite_conflicts() {
+        assert!(is_keto_retryable("Unable to serialize access due to a concurrent update"));
+        assert!(is_keto_retryable("database is locked: concurrent update in another session"));
+    }
+
+    #[test]
+    fn is_keto_retryable_ignores_unrelated_errors() {
+        assert!(!is_keto_retryable("permission denied"));
+        assert!(!is_keto_retryable("connection refused"));
+        assert!(!is_keto_retryable(""));
     }
 }
