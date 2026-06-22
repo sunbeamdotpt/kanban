@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Add prefix column to projects for card-ref allocation (MF-3, Stage 3c)
 -- Default to upper-case slug prefix (first 4 chars of slug, uppercased).
 -- Existing rows get a derived prefix; new rows should set it explicitly.

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Ported from apps/kanban-old/server/migrate.ts migration 5
 -- columns: swim-lanes within a board
 

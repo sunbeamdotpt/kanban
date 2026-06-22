@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Sunbeam Kanban — Realtime event envelope and variants.
 //
 // This file is the canonical wire format for everything streamed over

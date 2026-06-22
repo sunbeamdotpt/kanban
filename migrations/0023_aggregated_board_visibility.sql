@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Add visibility levels to aggregated boards: private, internal, public.
 
 ALTER TABLE aggregated_boards

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/github.proto
 //
 // GitHubLinkService links Kanban cards to GitHub issues and PRs.

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- milestones: project-scoped milestone/phase catalog
 
 CREATE TABLE milestones (

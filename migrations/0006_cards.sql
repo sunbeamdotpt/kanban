@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Ported from apps/kanban-old/server/migrate.ts migration 6
 -- cards: work items with extended fields (revision, ref, blocking, milestones, cover, completed_at)
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kanban_protos = &[
         "proto/sunbeam/kanban/v1/auth.proto",

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- AggregatedBoard (meta board) tables.
 --
 -- An aggregated board is a view spanning an explicit list of source boards.

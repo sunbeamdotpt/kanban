@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- project_ref_counter: advisory-lock allocator for card refs (MF-3)
 -- Do NOT seed rows in this migration; CardService.CreateCard lazy-creates them
 

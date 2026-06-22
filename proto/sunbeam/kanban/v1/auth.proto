@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/auth.proto
 //
 // AuthService is the SSO integration surface for the Kanban FE.

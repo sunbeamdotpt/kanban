@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- event_log: transactional outbox for JetStream dispatch
 
 CREATE TABLE event_log (

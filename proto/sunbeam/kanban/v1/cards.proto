@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Sunbeam Kanban — Card value type and supporting enums/messages.
 //
 // This file defines the structural shapes carried by realtime events

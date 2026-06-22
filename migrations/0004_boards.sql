@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Ported from apps/kanban-old/server/migrate.ts migration 4
 -- boards: top-level container for columns and cards
 

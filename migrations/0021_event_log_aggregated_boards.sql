@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- event_log: support aggregated-board events alongside regular board events.
 --
 -- AggregatedBoard mutations also use the transactional outbox, but they are

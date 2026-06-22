@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- template seed: global Kanban templates (ported from kanban-old migration 8)
 
 INSERT INTO board_templates (name, description, columns, is_global, created_by)

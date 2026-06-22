@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- checklist_items: per-card ordered checklist (Stage 3c)
 
 CREATE TABLE checklist_items (

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- idempotency_keys: request deduplication with 24h TTL
 
 CREATE TABLE idempotency_keys (

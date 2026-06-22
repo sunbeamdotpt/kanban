@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Integration-test runner for the Kanban backend.
 #
 # The Rust test harness in src/test_support.rs uses testcontainers to start

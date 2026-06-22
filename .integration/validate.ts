@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // validate.ts — type-check `keto-namespaces.config.ts` against the Keto OPL
 // type definitions and render the relation/permission graph in plain English.
 //

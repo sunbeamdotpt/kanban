@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Reusable card templates (global or project-scoped).
 
 CREATE TABLE card_templates (

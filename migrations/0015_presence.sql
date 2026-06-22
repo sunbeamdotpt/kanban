@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- presence: user activity tracking per board
 
 CREATE TABLE presence (

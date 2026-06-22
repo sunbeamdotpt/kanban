@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Seed source: /tmp/kanban-mockup-extracted/src/data.jsx (mockup PROJECTS const)
 -- Run via: psql $DATABASE_URL -f apps/kanban/migrations/seeds/dev_fixtures.sql
 -- Idempotent on re-run via ON CONFLICT DO NOTHING.

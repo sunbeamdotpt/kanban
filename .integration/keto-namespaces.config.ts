@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Keto namespaces owned by apps/kanban. Mounted into the workspace keto via
 // `sunbeam.workspace.yaml` directory mount at `/etc/namespaces/`; Keto v26
 // merges every `*.config.ts` file in the directory without conflict (see

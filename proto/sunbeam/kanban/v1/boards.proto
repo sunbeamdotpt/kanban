@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/boards.proto
 //
 // Auth: every RPC in BoardService requires a valid bearer token. Keto checks

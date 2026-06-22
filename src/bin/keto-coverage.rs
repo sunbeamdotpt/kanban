@@ -1,13 +1,12 @@
-//! keto-coverage — CI coverage check binary.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! CI coverage check for the Keto dispatch matrix.
 //!
-//! Parses every `proto/sunbeam/kanban/v1/*.proto` file for RPC declarations
-//! and compares the resulting expected method set against the static
-//! `MATRIX` exported from `kanban::auth::keto_dispatch`.
+//! Reads every `proto/sunbeam/kanban/v1/*.proto` file, builds the expected set
+//! of RPC method paths, and compares it against the dispatch matrix exported by
+//! `kanban::auth::keto_dispatch`. Exits 0 when they match; otherwise it lists
+//! missing or extra matrix entries.
 //!
-//! Exit 0 if the sets are equal; non-zero if there are missing or extra
-//! entries.  Intended to run in CI after any proto or matrix change.
-//!
-//! Usage:
+//! Run with:
 //!   cargo run -p kanban --bin keto-coverage
 
 use std::collections::HashSet;
@@ -19,7 +18,7 @@ fn main() {
     process::exit(code);
 }
 
-/// Core coverage check. Returns the process exit code.
+/// Run the coverage check and return the process exit code.
 fn run() -> i32 {
     let workspace_root = workspace_root();
     let proto_dir = workspace_root.join("proto/sunbeam/kanban/v1");
@@ -92,13 +91,10 @@ fn run() -> i32 {
     }
 }
 
-/// Locate the workspace root by walking up from the binary's manifest dir
-/// until we find a `sunbeam.workspace.yaml` or `Cargo.toml` at the root.
+/// Find the workspace root starting from the binary's package directory.
 ///
-/// At runtime this binary is invoked via `cargo run -p kanban --bin
-/// keto-coverage` from the workspace root; `CARGO_MANIFEST_DIR` is set by
-/// Cargo to the package directory.  We walk up two levels to reach the
-/// workspace root (`apps/kanban` → `apps` → workspace root).
+/// Walks upward looking for `sunbeam.workspace.yaml` or, in the split repo,
+/// checks whether the proto directory sits directly under the package root.
 fn workspace_root() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR is set by Cargo at build time to the package
     // directory. In the monorepo this is apps/kanban; in the split repo it
@@ -129,8 +125,8 @@ fn workspace_root() -> std::path::PathBuf {
     }
 }
 
-/// Scan all `.proto` files under `dir` and return the set of fully-qualified
-/// gRPC method paths in the `sunbeam.kanban.v1` package.
+/// Scan all `.proto` files under `dir` and return the fully-qualified gRPC
+/// method paths declared in the `sunbeam.kanban.v1` package.
 fn scan_proto_methods(dir: &Path) -> HashSet<String> {
     let mut methods = HashSet::new();
 

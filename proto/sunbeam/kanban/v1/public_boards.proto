@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Sunbeam Kanban — Public read-only board access.
 //
 // These RPCs are intentionally NOT protected by JwtLayer or keto_dispatch.

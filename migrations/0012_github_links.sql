@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- github_links: soft-links to GitHub issues/PRs (not cascaded on card delete)
 
 CREATE TABLE github_links (

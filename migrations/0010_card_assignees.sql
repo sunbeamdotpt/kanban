@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
 -- card_assignees: join table for OIDC subjects assigned to cards
 
 CREATE TABLE card_assignees (

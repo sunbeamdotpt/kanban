@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Sunbeam Kanban — AggregatedBoard (meta board).
 //
 // An AggregatedBoard is a view spanning an explicit list of source boards,
