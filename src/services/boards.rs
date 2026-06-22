@@ -34,6 +34,7 @@ use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 use crate::auth::keto_dispatch::CheckedObjectId;
+use crate::auth::keto_retry::KetoRetryExt;
 use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::board_service_server::BoardService;
 use crate::pb::{
@@ -44,6 +45,7 @@ use crate::pb::{
 };
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
+use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -83,14 +85,26 @@ fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
 }
 
+fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.subject.clone())
+        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
 // ── Row → proto helpers ───────────────────────────────────────────────────────
 
-fn board_from_row(row: &sqlx::postgres::PgRow, columns_count: i32, cards_count: i32) -> Board {
+pub(crate) fn board_from_row(
+    row: &sqlx::postgres::PgRow,
+    columns_count: i32,
+    cards_count: i32,
+) -> Board {
     let id: Uuid = row.get("id");
     let project_id: Uuid = row.get("project_id");
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let icon: Option<String> = row.get("icon");
+    let visibility: String = row.get("visibility");
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
 
@@ -100,6 +114,7 @@ fn board_from_row(row: &sqlx::postgres::PgRow, columns_count: i32, cards_count: 
         name,
         description: description.unwrap_or_default(),
         icon: icon.unwrap_or_default(),
+        visibility: db_to_proto(&visibility),
         created_at: Some(to_proto_ts(created_at)),
         updated_at: Some(to_proto_ts(updated_at)),
         columns_count,
@@ -131,7 +146,7 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
 
 // ── Count helpers ─────────────────────────────────────────────────────────────
 
-async fn fetch_columns_count(pool: &PgPool, board_id: Uuid) -> i32 {
+pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Uuid) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM columns WHERE board_id = $1")
         .bind(board_id)
         .fetch_one(pool)
@@ -143,7 +158,7 @@ async fn fetch_columns_count(pool: &PgPool, board_id: Uuid) -> i32 {
         .unwrap_or(0)
 }
 
-async fn fetch_cards_count(pool: &PgPool, board_id: Uuid) -> i32 {
+pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Uuid) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM cards WHERE board_id = $1")
         .bind(board_id)
         .fetch_one(pool)
@@ -270,12 +285,27 @@ async fn revalidate_keto(
     board_id: &str,
 ) -> Result<bool, Status> {
     let subject = auth.subject.as_deref().unwrap_or("");
-    keto.check_permission("KanbanBoard", board_id, "view", subject)
+    keto.check_permission_with_retry("KanbanBoard", board_id, "view", subject)
         .await
         .map_err(|e| {
             warn!(board_id, subject, error = %e, "stream: Keto recheck failed");
             Status::internal("authorization check failed")
         })
+}
+
+/// Arguments for `build_subscribe_board_stream`.
+///
+/// Bundled into a struct so the function does not need to accept a long
+/// positional argument list.
+pub struct SubscribeBoardArgs {
+    pub registry: Arc<BoardSubscriberRegistry>,
+    pub keto: Arc<KetoClient>,
+    pub watermark: Arc<LogoutWatermark>,
+    pub auth: AuthContext,
+    pub board_id: String,
+    pub is_private: bool,
+    pub heartbeat_interval: Duration,
+    pub keto_recheck_interval: Duration,
 }
 
 /// Build the `SubscribeBoard` server-streaming response.
@@ -287,14 +317,19 @@ async fn revalidate_keto(
 /// TODO(4c.5): snapshot replay — SELECT current cards/columns + emit synthetic
 /// `CardCreated`/`ColumnAdded` with `nats_seq=0` before the `Cutover` envelope.
 pub async fn build_subscribe_board_stream(
-    registry: Arc<BoardSubscriberRegistry>,
-    keto: Arc<KetoClient>,
-    watermark: Arc<LogoutWatermark>,
-    auth: AuthContext,
-    board_id: String,
-    heartbeat_interval: Duration,
-    keto_recheck_interval: Duration,
+    args: SubscribeBoardArgs,
 ) -> Result<SubscribeBoardStream, Status> {
+    let SubscribeBoardArgs {
+        registry,
+        keto,
+        watermark,
+        auth,
+        board_id,
+        is_private,
+        heartbeat_interval,
+        keto_recheck_interval,
+    } = args;
+
     let s = stream! {
         // ── Step 1: emit Cutover immediately (empty replay, seq=0) ────────────
         // TODO(4c.5): snapshot replay — emit synthetic CardCreated/ColumnAdded
@@ -336,7 +371,10 @@ pub async fn build_subscribe_board_stream(
             }
 
             // ── Step B: Keto recheck (every keto_recheck_interval) ────────────
-            if last_keto_recheck.elapsed() >= keto_recheck_interval {
+            // Public/internal boards are visible to any authenticated caller, so
+            // there is no Keto permission to recheck. Private boards still recheck
+            // the explicit view relation.
+            if is_private && last_keto_recheck.elapsed() >= keto_recheck_interval {
                 match revalidate_keto(&keto, &auth, &board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -394,12 +432,13 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<ListBoardsRequest>,
     ) -> Result<Response<ListBoardsResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let subject = subject_from_request(&request)?;
+        let req = request.into_inner();
+        let project_id = Uuid::parse_str(&req.project_id)
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
-            "SELECT id, project_id, name, slug, description, icon, created_at, updated_at \
+            "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
              FROM boards WHERE project_id = $1 ORDER BY created_at ASC",
         )
         .bind(project_id)
@@ -407,9 +446,30 @@ impl BoardService for BoardServiceImpl {
         .await
         .map_err(|e| internal("failed to list boards", e))?;
 
+        // Private boards require an explicit Keto view relation; public/internal
+        // boards are visible to any authenticated user.
+        let allowed_private_ids = crate::auth::keto_expand::expand_objects(
+            &self.keto,
+            crate::auth::keto_expand::ExpandQuery {
+                namespace: KETO_NS_BOARD,
+                relation: "view",
+                subject: &subject,
+                max_page_size: 256,
+            },
+            10_000,
+        )
+        .await
+        .map_err(|e| internal("failed to expand viewable private boards", e))?;
+
         let mut boards = Vec::with_capacity(rows.len());
         for row in &rows {
             let bid: Uuid = row.get("id");
+            let visibility: String = row.get("visibility");
+            if !is_public_or_internal(&visibility)
+                && !allowed_private_ids.contains(&bid.to_string())
+            {
+                continue;
+            }
             let columns_count = fetch_columns_count(&self.pool, bid).await;
             let cards_count = fetch_cards_count(&self.pool, bid).await;
             boards.push(board_from_row(row, columns_count, cards_count));
@@ -427,12 +487,13 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<GetBoardRequest>,
     ) -> Result<Response<BoardDetail>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let subject = subject_from_request(&request)?;
+        let req = request.into_inner();
+        let board_id = Uuid::parse_str(&req.board_id)
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let row = sqlx::query(
-            "SELECT id, project_id, name, slug, description, icon, created_at, updated_at \
+            "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
              FROM boards WHERE id = $1",
         )
         .bind(board_id)
@@ -440,6 +501,21 @@ impl BoardService for BoardServiceImpl {
         .await
         .map_err(|e| internal("failed to fetch board", e))?
         .ok_or_else(|| Status::not_found("board not found"))?;
+
+        let visibility: String = row.get("visibility");
+        if !is_public_or_internal(&visibility) {
+            // Private board: require explicit Keto view relation.
+            let allowed = self
+                .keto
+                .check_permission_with_retry(KETO_NS_BOARD, &board_id.to_string(), "view", &subject)
+                .await
+                .map_err(|e| internal("failed to check board view permission", e))?;
+            if !allowed {
+                return Err(Status::permission_denied(
+                    "you do not have permission to view this board",
+                ));
+            }
+        }
 
         let columns = fetch_board_columns(&self.pool, board_id).await?;
         let cards_count = fetch_cards_count(&self.pool, board_id).await;
@@ -479,7 +555,7 @@ impl BoardService for BoardServiceImpl {
 
             if let Some(Some(board_id)) = cached {
                 let row = sqlx::query(
-                    "SELECT id, project_id, name, slug, description, icon, created_at, updated_at \
+                    "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
                      FROM boards WHERE id = $1",
                 )
                 .bind(board_id)
@@ -505,13 +581,14 @@ impl BoardService for BoardServiceImpl {
 
         let board_id = Uuid::new_v4();
         let slug = slug_from_name(&req.name);
+        let visibility = proto_to_db(req.visibility);
 
         // INSERT board.
         let row = sqlx::query(
             r#"
-            INSERT INTO boards (id, project_id, name, slug, description, icon)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, project_id, name, slug, description, icon, created_at, updated_at
+            INSERT INTO boards (id, project_id, name, slug, description, icon, visibility)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, project_id, name, slug, description, icon, visibility, created_at, updated_at
             "#,
         )
         .bind(board_id)
@@ -524,6 +601,7 @@ impl BoardService for BoardServiceImpl {
         } else {
             Some(req.icon.clone())
         })
+        .bind(visibility)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -539,7 +617,7 @@ impl BoardService for BoardServiceImpl {
         // KanbanBoard:{board_id}#parent@KanbanProject:{project_id}
         if let Err(e) = self
             .keto
-            .grant(
+            .grant_with_retry(
                 KETO_NS_BOARD,
                 &board_id.to_string(),
                 "parent",
@@ -580,6 +658,7 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<UpdateBoardRequest>,
     ) -> Result<Response<Board>, Status> {
+        let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = Uuid::parse_str(&object_id)
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
@@ -587,21 +666,52 @@ impl BoardService for BoardServiceImpl {
         let req = request.into_inner();
         let patch = req.board.unwrap_or_default();
 
+        let update_paths: std::collections::HashSet<&str> = req
+            .update_mask
+            .as_ref()
+            .map(|m| m.paths.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        let visibility_change = update_paths.contains("visibility");
+
+        if visibility_change {
+            // Changing visibility is a trust/safety operation; require manage.
+            let allowed = self
+                .keto
+                .check_permission_with_retry(
+                    KETO_NS_BOARD,
+                    &board_id.to_string(),
+                    "manage",
+                    &subject,
+                )
+                .await
+                .map_err(|e| internal("failed to check board manage permission", e))?;
+            if !allowed {
+                return Err(Status::permission_denied(
+                    "you do not have permission to change board visibility",
+                ));
+            }
+        }
+
+        let new_visibility = proto_to_db(patch.visibility);
+
         let row = sqlx::query(
             r#"
             UPDATE boards SET
                 name        = CASE WHEN $2 != '' THEN $2 ELSE name END,
                 description = CASE WHEN $3 != '' THEN $3 ELSE description END,
                 icon        = CASE WHEN $4 != '' THEN $4 ELSE icon END,
+                visibility  = CASE WHEN $5::boolean THEN $6 ELSE visibility END,
                 updated_at  = now()
             WHERE id = $1
-            RETURNING id, project_id, name, slug, description, icon, created_at, updated_at
+            RETURNING id, project_id, name, slug, description, icon, visibility, created_at, updated_at
             "#,
         )
         .bind(board_id)
         .bind(&patch.name)
         .bind(&patch.description)
         .bind(&patch.icon)
+        .bind(visibility_change)
+        .bind(new_visibility)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update board", e))?
@@ -988,23 +1098,33 @@ impl BoardService for BoardServiceImpl {
             .get::<AuthContext>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("missing auth context"))?;
-        let board_id = request
-            .extensions()
-            .get::<CheckedObjectId>()
-            .map(|c| c.0.clone())
-            .ok_or_else(|| Status::internal("missing CheckedObjectId"))?;
+        let req = request.into_inner();
+        let board_id = req.board_id;
         // since_seq is reserved for Stage 4c.5 resume protocol; ignored here.
-        let _since_seq = request.into_inner().since_seq;
+        let _since_seq = req.since_seq;
 
-        let stream = build_subscribe_board_stream(
-            Arc::clone(&self.registry),
-            Arc::clone(&self.keto),
-            Arc::clone(&self.watermark),
+        let visibility: String = sqlx::query_scalar("SELECT visibility FROM boards WHERE id = $1")
+            .bind(
+                Uuid::parse_str(&board_id)
+                    .map_err(|_| Status::invalid_argument("invalid board_id"))?,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to fetch board visibility", e))?
+            .ok_or_else(|| Status::not_found("board not found"))?;
+
+        let is_private = !is_public_or_internal(&visibility);
+
+        let stream = build_subscribe_board_stream(SubscribeBoardArgs {
+            registry: Arc::clone(&self.registry),
+            keto: Arc::clone(&self.keto),
+            watermark: Arc::clone(&self.watermark),
             auth,
             board_id,
-            Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
-        )
+            is_private,
+            heartbeat_interval: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+            keto_recheck_interval: Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
+        })
         .await?;
 
         Ok(Response::new(stream))
@@ -1023,6 +1143,8 @@ mod tests {
     use sunbeam_g2v::config::NatsConfig;
     use sunbeam_g2v::middleware::auth::AuthContext;
     use sunbeam_g2v::mq::NatsClient;
+
+    use prost_types::FieldMask;
 
     // ── Subscribe test helpers ───────────────────────────────────────────────
 
@@ -1097,18 +1219,19 @@ mod tests {
 
         // Grant view so the initial Keto recheck passes.
         let _ = keto
-            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
-        let mut stream = build_subscribe_board_stream(
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            Arc::clone(&keto),
+            keto: Arc::clone(&keto),
             watermark,
             auth,
-            board_id.clone(),
-            Duration::from_secs(15),
-            Duration::from_secs(30),
-        )
+            board_id: board_id.clone(),
+            is_private: true,
+            heartbeat_interval: Duration::from_secs(15),
+            keto_recheck_interval: Duration::from_secs(30),
+        })
         .await
         .expect("build_subscribe_board_stream failed");
 
@@ -1166,18 +1289,19 @@ mod tests {
             },
         ));
         let _ = keto
-            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
-        let mut stream = build_subscribe_board_stream(
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            Arc::clone(&keto),
-            Arc::clone(&watermark),
+            keto: Arc::clone(&keto),
+            watermark: Arc::clone(&watermark),
             auth,
-            board_id.clone(),
-            Duration::from_secs(15),
-            Duration::from_secs(30),
-        )
+            board_id: board_id.clone(),
+            is_private: true,
+            heartbeat_interval: Duration::from_secs(15),
+            keto_recheck_interval: Duration::from_secs(30),
+        })
         .await
         .expect("build failed");
 
@@ -1258,19 +1382,20 @@ mod tests {
             },
         ));
         let _ = keto
-            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
         // Use a 1s heartbeat interval so we don't need to sleep 15s.
-        let mut stream = build_subscribe_board_stream(
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            Arc::clone(&keto),
+            keto: Arc::clone(&keto),
             watermark,
             auth,
-            board_id.clone(),
-            Duration::from_secs(1),  // short interval for test
-            Duration::from_secs(60), // long keto recheck to avoid interference
-        )
+            board_id: board_id.clone(),
+            is_private: true,
+            heartbeat_interval: Duration::from_secs(1), // short interval for test
+            keto_recheck_interval: Duration::from_secs(60), // long keto recheck to avoid interference
+        })
         .await
         .expect("build failed");
 
@@ -1334,22 +1459,23 @@ mod tests {
             },
         ));
         let _ = keto
-            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
         // Use a 100ms heartbeat so the loop iterates rapidly and picks up the
         // watermark quickly.
         let wm_clone = Arc::clone(&watermark);
         let sub_clone = subject_str.clone();
-        let mut stream = build_subscribe_board_stream(
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            Arc::clone(&keto),
-            Arc::clone(&watermark),
+            keto: Arc::clone(&keto),
+            watermark: Arc::clone(&watermark),
             auth,
-            board_id.clone(),
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-        )
+            board_id: board_id.clone(),
+            is_private: true,
+            heartbeat_interval: Duration::from_millis(100),
+            keto_recheck_interval: Duration::from_secs(60),
+        })
         .await
         .expect("build failed");
 
@@ -1420,7 +1546,7 @@ mod tests {
         ));
         // Grant view so initial check passes.
         let _ = keto
-            .grant("KanbanBoard", &board_id, "view", &subject_str)
+            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
         let keto_clone = Arc::clone(&keto);
@@ -1428,15 +1554,16 @@ mod tests {
         let sub_clone = subject_str.clone();
 
         // Use a 1s Keto recheck interval so we don't need to wait 30s.
-        let mut stream = build_subscribe_board_stream(
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            Arc::clone(&keto),
+            keto: Arc::clone(&keto),
             watermark,
             auth,
-            board_id.clone(),
-            Duration::from_millis(100), // fast heartbeat to keep loop ticking
-            Duration::from_secs(1),     // 1s Keto recheck for test
-        )
+            board_id: board_id.clone(),
+            is_private: true,
+            heartbeat_interval: Duration::from_millis(100), // fast heartbeat to keep loop ticking
+            keto_recheck_interval: Duration::from_secs(1),  // 1s Keto recheck for test
+        })
         .await
         .expect("build failed");
 
@@ -1624,6 +1751,7 @@ mod tests {
                     description: "integration test board".to_string(),
                     icon: "rocket".to_string(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -1639,6 +1767,12 @@ mod tests {
         assert!(created.created_at.is_some());
 
         let board_id = created.id.clone();
+
+        // Grant explicit view — test Keto does not evaluate derived permissions
+        // from the parent project tuple.
+        let _ = keto
+            .grant_with_retry(KETO_NS_BOARD, &board_id, "view", &subject)
+            .await;
 
         let detail = svc
             .get_board(authed_request_with_object(
@@ -1671,35 +1805,51 @@ mod tests {
         let project_b = create_test_project(&pool, &subject).await;
 
         // Create 2 boards in project A, 1 in project B.
+        let mut board_ids_a = vec![];
         for name in &["Board A1", "Board A2"] {
-            svc.create_board(authed_request_with_object(
+            let board = svc
+                .create_board(authed_request_with_object(
+                    CreateBoardRequest {
+                        project_id: project_a.to_string(),
+                        name: name.to_string(),
+                        description: String::new(),
+                        icon: String::new(),
+                        idempotency_key: String::new(),
+                        visibility: crate::pb::BoardVisibility::Private as i32,
+                    },
+                    &subject,
+                    &project_a.to_string(),
+                ))
+                .await
+                .expect("create_board failed")
+                .into_inner();
+            board_ids_a.push(board.id);
+        }
+
+        let board_b = svc
+            .create_board(authed_request_with_object(
                 CreateBoardRequest {
-                    project_id: project_a.to_string(),
-                    name: name.to_string(),
+                    project_id: project_b.to_string(),
+                    name: "Board B1".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
-                &project_a.to_string(),
+                &project_b.to_string(),
             ))
             .await
-            .expect("create_board failed");
-        }
+            .expect("create_board failed")
+            .into_inner();
 
-        svc.create_board(authed_request_with_object(
-            CreateBoardRequest {
-                project_id: project_b.to_string(),
-                name: "Board B1".to_string(),
-                description: String::new(),
-                icon: String::new(),
-                idempotency_key: String::new(),
-            },
-            &subject,
-            &project_b.to_string(),
-        ))
-        .await
-        .expect("create_board failed");
+        // Grant explicit view on each board — test Keto does not evaluate
+        // derived permissions from the parent project tuple.
+        for board_id in board_ids_a.iter().chain(std::iter::once(&board_b.id)) {
+            let _ = keto
+                .grant_with_retry(KETO_NS_BOARD, board_id, "view", &subject)
+                .await;
+        }
 
         let list_a = svc
             .list_boards(authed_request_with_object(
@@ -1754,6 +1904,7 @@ mod tests {
                     description: "original desc".to_string(),
                     icon: "star".to_string(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -1775,6 +1926,7 @@ mod tests {
                         name: "Updated Name".to_string(),
                         description: String::new(),
                         icon: String::new(),
+                        visibility: crate::pb::BoardVisibility::Private as i32,
                         created_at: None,
                         updated_at: None,
                         columns_count: 0,
@@ -1816,6 +1968,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -1898,6 +2051,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -1984,6 +2138,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -2078,6 +2233,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -2156,6 +2312,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -2261,6 +2418,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_a.to_string(),
@@ -2277,6 +2435,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_b.to_string(),
@@ -2347,6 +2506,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
                 &project_id.to_string(),
@@ -2418,5 +2578,373 @@ mod tests {
         assert_eq!(d.position, 0, "D should be at position 0");
 
         cleanup_project(&pool, project_id).await;
+    }
+
+    // ── Visibility tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_board_allows_non_member_for_public_board() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&pool, &owner).await;
+
+        let board = svc
+            .create_board(authed_request_with_object(
+                CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Public Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Public as i32,
+                },
+                &owner,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("create_board failed")
+            .into_inner();
+
+        let detail = svc
+            .get_board(authed_request_with_object(
+                GetBoardRequest {
+                    board_id: board.id.clone(),
+                },
+                &stranger,
+                &board.id,
+            ))
+            .await
+            .expect("non-member should view public board")
+            .into_inner();
+
+        assert_eq!(detail.board.unwrap().id, board.id);
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn get_board_denies_non_member_for_private_board() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&pool, &owner).await;
+
+        let board = svc
+            .create_board(authed_request_with_object(
+                CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Private Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
+                },
+                &owner,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("create_board failed")
+            .into_inner();
+
+        let result = svc
+            .get_board(authed_request_with_object(
+                GetBoardRequest {
+                    board_id: board.id.clone(),
+                },
+                &stranger,
+                &board.id,
+            ))
+            .await;
+
+        assert!(result.is_err(), "non-member must not view private board");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "private board must return PermissionDenied"
+        );
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn list_boards_returns_public_internal_for_any_authenticated_user() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&pool, &owner).await;
+
+        // Public board.
+        svc.create_board(authed_request_with_object(
+            CreateBoardRequest {
+                project_id: project_id.to_string(),
+                name: "Public".to_string(),
+                description: String::new(),
+                icon: String::new(),
+                idempotency_key: String::new(),
+                visibility: crate::pb::BoardVisibility::Public as i32,
+            },
+            &owner,
+            &project_id.to_string(),
+        ))
+        .await
+        .expect("create public board failed");
+
+        // Internal board.
+        svc.create_board(authed_request_with_object(
+            CreateBoardRequest {
+                project_id: project_id.to_string(),
+                name: "Internal".to_string(),
+                description: String::new(),
+                icon: String::new(),
+                idempotency_key: String::new(),
+                visibility: crate::pb::BoardVisibility::Internal as i32,
+            },
+            &owner,
+            &project_id.to_string(),
+        ))
+        .await
+        .expect("create internal board failed");
+
+        // Private board.
+        let private_board = svc
+            .create_board(authed_request_with_object(
+                CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Private".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
+                },
+                &owner,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("create private board failed")
+            .into_inner();
+
+        // Grant stranger explicit view on the private board so it appears.
+        keto.grant_with_retry(KETO_NS_BOARD, &private_board.id, "view", &stranger)
+            .await
+            .expect("grant view failed");
+
+        let list = svc
+            .list_boards(authed_request_with_object(
+                ListBoardsRequest {
+                    project_id: project_id.to_string(),
+                },
+                &stranger,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("list_boards failed")
+            .into_inner();
+
+        let names: Vec<&str> = list.boards.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"Public"), "public board must be listed");
+        assert!(names.contains(&"Internal"), "internal board must be listed");
+        assert!(
+            names.contains(&"Private"),
+            "private board with view tuple must be listed"
+        );
+
+        // Revoke the explicit view and verify the private board disappears.
+        crate::auth::keto_compat::delete_relation_tuples(
+            &keto,
+            KETO_NS_BOARD,
+            Some("view"),
+            Some(&stranger),
+        )
+        .await
+        .ok();
+
+        let list_after = svc
+            .list_boards(authed_request_with_object(
+                ListBoardsRequest {
+                    project_id: project_id.to_string(),
+                },
+                &stranger,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("list_boards failed")
+            .into_inner();
+
+        let names_after: Vec<&str> = list_after.boards.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            !names_after.contains(&"Private"),
+            "private board must be hidden without view tuple"
+        );
+        assert_eq!(
+            names_after.len(),
+            2,
+            "only public and internal boards remain"
+        );
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn update_board_visibility_requires_manage_and_persists() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&pool, &owner).await;
+
+        let board = svc
+            .create_board(authed_request_with_object(
+                CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Visibility Patch".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
+                },
+                &owner,
+                &project_id.to_string(),
+            ))
+            .await
+            .expect("create_board failed")
+            .into_inner();
+
+        // Grant manage so the visibility change is authorized.
+        keto.grant_with_retry(KETO_NS_BOARD, &board.id, "manage", &owner)
+            .await
+            .expect("grant manage failed");
+
+        let updated = svc
+            .update_board(authed_request_with_object(
+                UpdateBoardRequest {
+                    board_id: board.id.clone(),
+                    board: Some(Board {
+                        id: String::new(),
+                        project_id: String::new(),
+                        name: String::new(),
+                        description: String::new(),
+                        icon: String::new(),
+                        visibility: crate::pb::BoardVisibility::Public as i32,
+                        created_at: None,
+                        updated_at: None,
+                        columns_count: 0,
+                        cards_count: 0,
+                    }),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["visibility".to_string()],
+                    }),
+                },
+                &owner,
+                &board.id,
+            ))
+            .await
+            .expect("update visibility failed")
+            .into_inner();
+
+        assert_eq!(
+            updated.visibility,
+            crate::pb::BoardVisibility::Public as i32,
+            "visibility must be persisted as public"
+        );
+
+        // Change back to private.
+        let updated_private = svc
+            .update_board(authed_request_with_object(
+                UpdateBoardRequest {
+                    board_id: board.id.clone(),
+                    board: Some(Board {
+                        id: String::new(),
+                        project_id: String::new(),
+                        name: String::new(),
+                        description: String::new(),
+                        icon: String::new(),
+                        visibility: crate::pb::BoardVisibility::Private as i32,
+                        created_at: None,
+                        updated_at: None,
+                        columns_count: 0,
+                        cards_count: 0,
+                    }),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["visibility".to_string()],
+                    }),
+                },
+                &owner,
+                &board.id,
+            ))
+            .await
+            .expect("update visibility failed")
+            .into_inner();
+
+        assert_eq!(
+            updated_private.visibility,
+            crate::pb::BoardVisibility::Private as i32,
+            "visibility must be persisted as private"
+        );
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_public_board_skips_keto_recheck() {
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+
+        let registry = make_registry(Arc::clone(&nats)).await;
+        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
+        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let auth = make_auth_with_future_exp(&subject_str);
+
+        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
+        let keto_url =
+            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
+            .unwrap_or_else(|_| "http://localhost:4467".to_string());
+        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
+            sunbeam_g2v::middleware::auth::keto::KetoConfig {
+                grpc_endpoint: keto_url,
+                write_grpc_endpoint: keto_write_url,
+            },
+        ));
+
+        // Intentionally do NOT grant a Keto view tuple: a public board stream
+        // must skip the Keto recheck and still emit the Cutover envelope.
+        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
+            registry,
+            keto: Arc::clone(&keto),
+            watermark,
+            auth,
+            board_id: board_id.clone(),
+            is_private: false,
+            heartbeat_interval: Duration::from_secs(15),
+            keto_recheck_interval: Duration::from_secs(30),
+        })
+        .await
+        .expect("build_subscribe_board_stream failed");
+
+        use tokio_stream::StreamExt;
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timeout waiting for first envelope")
+            .expect("stream ended without first envelope")
+            .expect("first envelope was an error");
+
+        match first.payload {
+            Some(Payload::Cutover(c)) => {
+                assert_eq!(
+                    c.last_replay_nats_seq, 0,
+                    "cutover seq must be 0 for empty replay"
+                );
+            }
+            other => panic!("expected Cutover, got {other:?}"),
+        }
     }
 }

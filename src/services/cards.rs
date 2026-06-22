@@ -2034,6 +2034,7 @@ impl CardService for CardServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost_types::FieldMask;
     use sqlx::postgres::PgPoolOptions;
     use std::time::Duration;
     use sunbeam_g2v::middleware::auth::AuthContext;
@@ -3007,6 +3008,414 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(count, 0, "comment should be deleted via admin path");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    // ── Read + remaining mutation RPCs ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_card_returns_created_card() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "GET").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Get me".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let fetched = svc
+            .get_card(authed_request_with_object(
+                GetCardRequest {
+                    card_id: card.id.clone(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(fetched.id, card.id);
+        assert_eq!(fetched.title, "Get me");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn batch_get_cards_filters_by_board() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "BATCH").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Batch".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let resp = svc
+            .batch_get_cards(authed_request_with_object(
+                BatchGetCardsRequest {
+                    board_id: bid.to_string(),
+                    card_ids: vec![card.id.clone(), Uuid::new_v4().to_string()],
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.cards.len(), 1);
+        assert_eq!(resp.cards[0].id, card.id);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn list_cards_by_board_paginates() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "LIST").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        for i in 0..3 {
+            svc.create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: format!("Card {i}"),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+
+        let resp = svc
+            .list_cards_by_board(authed_request_with_object(
+                ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 2,
+                    cursor: String::new(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.cards.len(), 2);
+        assert!(!resp.next_cursor.is_empty(), "expected next cursor");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn unassign_card_removes_assignee() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "UNA").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Assigned".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        svc.assign_card(authed_request_with_object(
+            AssignCardRequest {
+                card_id: card.id.clone(),
+                subject: "user:alice".to_string(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .unwrap();
+
+        let updated = svc
+            .unassign_card(authed_request_with_object(
+                UnassignCardRequest {
+                    card_id: card.id.clone(),
+                    subject: "user:alice".to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            updated.assignees.iter().all(|a| a.subject != "user:alice"),
+            "alice must be unassigned"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn update_checklist_item_persists_changes() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "CHKU").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Checklist".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let item = svc
+            .add_checklist_item(authed_request_with_object(
+                AddChecklistItemRequest {
+                    card_id: card.id.clone(),
+                    text: "step".to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let item_id = item.checklist.first().unwrap().id.clone();
+
+        let updated = svc
+            .update_checklist_item(authed_request_with_object(
+                UpdateChecklistItemRequest {
+                    card_id: card.id.clone(),
+                    item_id: item_id.clone(),
+                    item: Some(ChecklistItem {
+                        text: "done step".to_string(),
+                        done: true,
+                        ..Default::default()
+                    }),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["text".to_string(), "done".to_string()],
+                    }),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let updated_item = updated
+            .checklist
+            .iter()
+            .find(|i| i.id == item_id)
+            .expect("item not found");
+        assert_eq!(updated_item.text, "done step");
+        assert!(updated_item.done);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn remove_checklist_item_deletes_item() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "CHKR").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Checklist".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let item = svc
+            .add_checklist_item(authed_request_with_object(
+                AddChecklistItemRequest {
+                    card_id: card.id.clone(),
+                    text: "step".to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let item_id = item.checklist.first().unwrap().id.clone();
+
+        svc.remove_checklist_item(authed_request_with_object(
+            RemoveChecklistItemRequest {
+                card_id: card.id.clone(),
+                item_id: item_id.clone(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .unwrap();
+
+        let fetched = svc
+            .get_card(authed_request_with_object(
+                GetCardRequest {
+                    card_id: card.id.clone(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            fetched.checklist.iter().all(|i| i.id != item_id),
+            "item must be removed"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn list_comments_returns_comments() {
+        let pool = setup_pool().await;
+        let keto = setup_keto();
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "COMM").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Comments".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        svc.add_comment(authed_request_with_object(
+            AddCommentRequest {
+                card_id: card.id.clone(),
+                body: "first".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+            &subject,
+            &card.id,
+        ))
+        .await
+        .unwrap();
+
+        let resp = svc
+            .list_comments(authed_request_with_object(
+                ListCommentsRequest {
+                    card_id: card.id.clone(),
+                    limit: 10,
+                    cursor: String::new(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.comments.len(), 1);
+        assert_eq!(resp.comments[0].body, "first");
 
         cleanup_project(&pool, pid).await;
     }

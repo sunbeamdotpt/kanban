@@ -31,6 +31,7 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
+use crate::auth::keto_retry::KetoRetryExt;
 use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
@@ -226,13 +227,13 @@ impl ProjectService for ProjectServiceImpl {
 
         // Write Keto owner tuple.
         self.keto
-            .grant(KETO_NS, &project_id.to_string(), "owner", &subject)
+            .grant_with_retry(KETO_NS, &project_id.to_string(), "owner", &subject)
             .await
             .map_err(|e| internal("failed to write Keto owner tuple", e))?;
 
         // Also write a "view" tuple so ListProjects sees it.
         self.keto
-            .grant(KETO_NS, &project_id.to_string(), "view", &subject)
+            .grant_with_retry(KETO_NS, &project_id.to_string(), "view", &subject)
             .await
             .map_err(|e| internal("failed to write Keto view tuple", e))?;
 
@@ -436,7 +437,7 @@ impl ProjectService for ProjectServiceImpl {
 
         // Keto FIRST (mirror-table write order per plan / Pre-mortem 5).
         self.keto
-            .grant(
+            .grant_with_retry(
                 KETO_NS,
                 &project_id.to_string(),
                 &req.relation,
@@ -744,6 +745,9 @@ mod tests {
         let subject_a = format!("user:test-a-{}", Uuid::new_v4());
         let subject_b = format!("user:test-b-{}", Uuid::new_v4());
 
+        // Unique prefix suffix so repeated test runs (or retries) don't collide
+        // on the global shared Postgres instance.
+        let suffix = Uuid::new_v4().simple().to_string()[..6].to_uppercase();
         let mut project_ids_a = Vec::new();
 
         // User A creates 3 projects.
@@ -752,7 +756,7 @@ mod tests {
                 .create_project(authed_request(
                     CreateProjectRequest {
                         name: format!("Project A-{i}"),
-                        prefix: format!("A{i}"),
+                        prefix: format!("A{i}{suffix}"),
                         icon: String::new(),
                         color: String::new(),
                         description: String::new(),
@@ -771,7 +775,7 @@ mod tests {
             .create_project(authed_request(
                 CreateProjectRequest {
                     name: "Project B-0".to_string(),
-                    prefix: "B0".to_string(),
+                    prefix: format!("B0{suffix}"),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
@@ -996,7 +1000,7 @@ mod tests {
 
         // Verify Keto tuple was written.
         let keto_allowed = keto
-            .check_permission(KETO_NS, &project_id, "edit", &member)
+            .check_permission_with_retry(KETO_NS, &project_id, "edit", &member)
             .await
             .expect("keto check failed");
         assert!(keto_allowed, "Keto should have 'edit' tuple for member");
@@ -1073,7 +1077,7 @@ mod tests {
 
         // Keto tuple should be gone.
         let keto_allowed = keto
-            .check_permission(KETO_NS, &project_id, "view", &member)
+            .check_permission_with_retry(KETO_NS, &project_id, "view", &member)
             .await
             .unwrap_or(false);
         assert!(
