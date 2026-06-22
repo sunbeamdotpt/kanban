@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # `apps/kanban/.integration/`
 
 Authoritative source for kanban's Ory Keto OPL (Ory Permission Language)
