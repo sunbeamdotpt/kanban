@@ -40,4 +40,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
-[1.0.0-rc.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0-rc0
+[1.0.0-rc.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc.0
