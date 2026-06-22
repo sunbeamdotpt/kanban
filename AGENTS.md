@@ -134,10 +134,10 @@ kanban/
 
 ### Prerequisites
 
-All services run via the Sunbeam compose stack:
+All services run via the Sunbeam compose stack from the `sunbeam-split` workspace root:
 
 ```sh
-cd /Users/sienna/Development/sunbeam
+cd /Users/sienna/Development/sunbeam-split
 sunbeam ops compose up kanban   # Starts postgres, valkey, nats, keto, kratos, opensearch, seaweedfs
 sunbeam ops compose ps          # Verify health
 ```
@@ -167,17 +167,36 @@ cargo nextest run
 cargo run --bin keto-coverage
 ```
 
-**Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.
+**Recommended:** run `./test.sh` for a self-contained test stack. It is the easiest way to get consistent results across macOS (socktainer/Apple Container), Docker Desktop, OrbStack, and Podman.
+>
+> **Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.
 
-**Running tests with testcontainers (no compose stack required):**
+**Running tests locally without a compose stack:**
+Use the provided `test.sh` wrapper. It detects the available container runtime (`docker`, `podman`, or Apple Container's `container`), starts Postgres 16, NATS (JetStream), Valkey, Ory Keto, and MinIO on localhost ports, runs migrations, creates the MinIO bucket, exports the standard env vars, and runs the test suite:
 ```sh
-# macOS with socktainer
-DOCKER_HOST=unix://$HOME/.socktainer/container.sock cargo test
-
-# Linux / Docker Desktop / OrbStack / Podman — any Docker-compatible socket
-cargo test
+./test.sh                    # cargo nextest run
+./test.sh services::boards   # run a subset
+./test.sh --coverage         # cargo llvm-cov nextest
 ```
-The `containers` harness in `src/test_support.rs` starts Postgres, NATS (JetStream), Valkey, and Keto automatically. Alternatively, set `DATABASE_URL`, `NATS_URL`, `VALKEY_URL`, `KETO_GRPC_URL`, and `KETO_WRITE_GRPC_URL` to reuse an existing stack. On Apple-silicon hosts running containers through `socktainer`/`container`, first container startup may be slow while images are pulled; the harness uses a 10-minute startup timeout.
+Containers are stopped and removed automatically when the script exits.
+`test.sh` will locate `llvm-cov`/`llvm-profdata` from `llvm-tools-preview`, your `PATH`, or a Homebrew LLVM install; if they are missing it prints install instructions.
+
+The `containers` harness in `src/test_support.rs` is still available for ad-hoc testcontainer usage. Each test receives its own fresh pool and client handles so pools are never shared across per-test Tokio runtimes. Container handles are kept alive for the lifetime of the test process and are stopped automatically when the process exits.
+
+**Reusing an existing compose stack:**
+Set the standard service URLs instead of starting containers:
+```sh
+export DATABASE_URL='postgres://sunbeam:sunbeam@<pg-host>:5432/kanban'
+export NATS_URL='nats://<nats-host>:4222'
+export VALKEY_URL='redis://<valkey-host>:6379'
+export KETO_READ_ADDR='http://<keto-host>:4466'
+export KETO_WRITE_ADDR='http://<keto-host>:4467'
+# Aliases also accepted:
+# export KETO_GRPC_URL='http://<keto-host>:4466'
+# export KETO_WRITE_GRPC_URL='http://<keto-host>:4467'
+cargo nextest run
+```
+Attachments tests additionally require `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_BUCKET` (the harness starts a throwaway MinIO bucket if they are unset).
 
 ### Frontend
 
@@ -554,14 +573,20 @@ sunbeam ops restart keto
 | `VALKEY_URL` | `redis://localhost:6379` | Valkey (logout watermarks) |
 | `KETO_READ_ADDR` | `http://localhost:4466` | Keto read endpoint |
 | `KETO_WRITE_ADDR` | `http://localhost:4467` | Keto write endpoint |
+| `KETO_GRPC_URL` | alias for `KETO_READ_ADDR` | Keto read endpoint (test alias) |
+| `KETO_WRITE_GRPC_URL` | alias for `KETO_WRITE_ADDR` | Keto write endpoint (test alias) |
 | `JWT_SECRET` | `change-me` | JWT validation secret |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *unset* | OpenTelemetry OTLP endpoint |
 | `S3_ENDPOINT` | *unset* | S3-compatible endpoint |
+| `S3_REGION` | *unset* | S3 region |
+| `S3_ACCESS_KEY` | *unset* | S3 access key |
+| `S3_SECRET_KEY` | *unset* | S3 secret key |
+| `S3_BUCKET` | *unset* | S3 bucket name |
 | `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
 | `POD_NAME` | random UUID | Pod identity for NATS consumer naming |
 
 ## Pointers
 
-- **Workspace rules:** `/Users/sienna/Development/sunbeam/CLAUDE.md` (git hosting, deploy gates, testing policy).
+- **Workspace rules:** `/Users/sienna/Development/sunbeam-split/CLAUDE.md` (git hosting, deploy gates, testing policy).
 - **beam-ui:** `https://src.sunbeam.pt/sunbeam/beam-ui` (JSR `@sunbeam/beam-ui`).
 - **g2v:** `https://src.sunbeam.pt/sunbeam/sunbeam-g2v` (Cargo + npm; auth, NATS, OTel primitives).
