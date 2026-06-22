@@ -1,19 +1,17 @@
-//! BoardService — Stage 3b + 4c implementation.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! BoardService implementation.
 //!
-//! Mirror-table write order: Keto FIRST, then SQL. If the SQL insert fails
-//! after a successful Keto write, we log a `mirror_drift` warning and let
-//! the hourly reconciler (Stage 7a) catch it. This matches Pre-mortem 5.
+//! Handles boards, columns, and the live event stream. Permission changes
+//! are written to Keto first, then mirrored to SQL; any leftover drift is
+//! left for the background reconciler.
 //!
-//! Dynamic sqlx API (no compile-time macros) is used throughout so that
-//! `cargo check` does not require a live DATABASE_URL at build time.
+//! Uses the dynamic sqlx API (no macros) so the crate builds without a
+//! live DATABASE_URL.
 //!
-//! Stage 4c: `SubscribeBoard` is wired end-to-end. The stream:
-//!   1. Emits a synthetic `Cutover { last_replay_nats_seq: 0 }` immediately
-//!      (empty replay — Stage 4c.5 will add snapshot replay).
-//!   2. Subscribes to live events via `BoardSubscriberRegistry`.
-//!   3. Emits a `Heartbeat` every `heartbeat_interval` of inactivity.
-//!   4. Rechecks JWT+watermark on every yield; rechecks Keto every
-//!      `keto_recheck_interval`.
+//! `SubscribeBoard` is fully wired up: it sends a `Cutover` envelope,
+//! tails live events from the `BoardSubscriberRegistry`, emits periodic
+//! heartbeats, and revalidates the JWT/watermark and Keto permissions on
+//! every yield.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -183,7 +181,7 @@ async fn fetch_board_columns(pool: &PgPool, board_id: Uuid) -> Result<Vec<Column
     Ok(rows.iter().map(column_from_row).collect())
 }
 
-/// Derive a URL-safe slug from the board name (max 40 chars).
+/// Create a URL-safe slug from the board name, capped at 40 characters.
 fn slug_from_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
@@ -199,14 +197,14 @@ type SubscribeBoardStream =
 
 // ── Streaming intervals (overridable in tests via build_subscribe_board_stream) ─
 
-/// Production heartbeat interval (15s).
+/// Default heartbeat interval used in production.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
-/// Production Keto recheck interval (30s).
+/// Default Keto permission recheck interval used in production.
 pub const KETO_RECHECK_INTERVAL_MS: u64 = 30_000;
 
 // ── Stream helpers ────────────────────────────────────────────────────────────
 
-/// Synthesize a `Cutover` envelope at `last_replay_nats_seq`.
+/// Build a `Cutover` envelope pointing at the given NATS sequence.
 fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
     BoardEventEnvelope {
         board_id: String::new(),
@@ -222,7 +220,7 @@ fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
     }
 }
 
-/// Synthesize a `Heartbeat` envelope with current wall clock.
+/// Build a `Heartbeat` envelope carrying the current server time.
 fn heartbeat_envelope() -> BoardEventEnvelope {
     use std::time::{SystemTime, UNIX_EPOCH};
     let server_time_ms = SystemTime::now()
@@ -241,10 +239,11 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
     }
 }
 
-/// Validate JWT not expired and watermark not revoked.
+/// Check whether the caller's token is still valid.
 ///
-/// Returns `Ok(true)` if valid, `Ok(false)` if revoked, `Err` if the
-/// watermark store is unavailable (fail-closed).
+/// Returns `Ok(true)` while the JWT has not expired and the logout
+/// watermark has not been raised, `Ok(false)` if the token was revoked,
+/// and `Err` if Valkey is unavailable (fail-closed).
 async fn revalidate_token(watermark: &LogoutWatermark, auth: &AuthContext) -> Result<bool, Status> {
     let subject = auth.subject.as_deref().unwrap_or("");
 
@@ -275,10 +274,10 @@ async fn revalidate_token(watermark: &LogoutWatermark, auth: &AuthContext) -> Re
     }
 }
 
-/// Keto permission recheck for the live stream.
+/// Recheck Keto authorization for a live board stream.
 ///
-/// Returns `Ok(true)` if still authorized, `Ok(false)` if revoked,
-/// `Err(Status)` on Keto failure.
+/// Returns `Ok(true)` if the caller still has access, `Ok(false)` if the
+/// permission was revoked, and `Err` if the Keto check itself failed.
 async fn revalidate_keto(
     keto: &KetoClient,
     auth: &AuthContext,
@@ -295,7 +294,7 @@ async fn revalidate_keto(
 
 /// Arguments for `build_subscribe_board_stream`.
 ///
-/// Bundled into a struct so the function does not need to accept a long
+/// Grouped into a struct so the stream builder does not need a long
 /// positional argument list.
 pub struct SubscribeBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
@@ -310,12 +309,12 @@ pub struct SubscribeBoardArgs {
 
 /// Build the `SubscribeBoard` server-streaming response.
 ///
-/// `heartbeat_interval` and `keto_recheck_interval` are parameterised so tests
-/// can inject short durations without sleeping for 15s/30s.
+/// `heartbeat_interval` and `keto_recheck_interval` are configurable so
+/// tests can use short durations instead of the production defaults.
 ///
-/// # Stage 4c.5 TODO
-/// TODO(4c.5): snapshot replay — SELECT current cards/columns + emit synthetic
-/// `CardCreated`/`ColumnAdded` with `nats_seq=0` before the `Cutover` envelope.
+/// Snapshot replay is not implemented yet. When it lands, this should
+/// emit the current columns and cards as synthetic `ColumnAdded` and
+/// `CardCreated` events with `nats_seq=0` before the `Cutover` envelope.
 pub async fn build_subscribe_board_stream(
     args: SubscribeBoardArgs,
 ) -> Result<SubscribeBoardStream, Status> {
@@ -1194,7 +1193,7 @@ mod tests {
 
     // ── Stage 4c subscribe tests ─────────────────────────────────────────────
 
-    /// First envelope from SubscribeBoard must be Cutover with last_replay_nats_seq=0.
+    /// The first envelope on a new subscription is a `Cutover` with an empty replay.
     #[tokio::test]
     async fn subscribe_emits_cutover_immediately_on_empty_replay() {
         let nats = connect_nats().await;
@@ -1262,8 +1261,8 @@ mod tests {
         .await;
     }
 
-    /// After subscribing, a live JetStream event published for the board must
-    /// arrive on the stream within 2s.
+    /// A live JetStream event published for the board should reach the
+    /// subscription within two seconds.
     #[tokio::test]
     async fn subscribe_forwards_live_event_published_to_jetstream() {
         use crate::realtime::jetstream_bootstrap::board_subject;
@@ -1349,17 +1348,17 @@ mod tests {
         .await;
     }
 
-    /// An event whose event_id was emitted during replay must be deduped when
-    /// it arrives again on the live tail.
+    /// Events that were already emitted during replay must be dropped when
+    /// they reappear on the live tail.
     ///
     // NOTE: replay-vs-live dedup test will be added when snapshot replay
     // lands (the empty-replay path is exercised by
     // `subscribe_emits_cutover_immediately_on_empty_replay`).
 
-    /// After `heartbeat_interval` of inactivity, the stream must emit a
-    /// Heartbeat envelope.
+    /// When no live event arrives for `heartbeat_interval`, the stream emits
+    /// a `Heartbeat` envelope.
     ///
-    /// Uses a 1s interval override to avoid sleeping 15s.
+    /// Uses a one-second interval override so the test does not wait 15 s.
     #[tokio::test]
     async fn subscribe_emits_heartbeat_after_inactivity() {
         let nats = connect_nats().await;
@@ -1431,11 +1430,11 @@ mod tests {
         .await;
     }
 
-    /// When the subject's logout watermark is signalled, the stream must close
-    /// with Status::Unauthenticated within 2s.
+    /// When the caller's logout watermark is raised, the stream closes with
+    /// `Status::Unauthenticated`.
     ///
-    /// Uses a very short Keto recheck interval (no Keto revocation needed for
-    /// this test) and a 1s token revalidation cadence driven by the loop.
+    /// Uses a short Keto recheck interval and a one-second token
+    /// revalidation cadence so the test does not wait for the defaults.
     #[tokio::test]
     async fn subscribe_closes_with_unauthenticated_when_token_revoked() {
         let nats = connect_nats().await;
@@ -1519,10 +1518,11 @@ mod tests {
         .await;
     }
 
-    /// When Keto revokes the subject's view permission mid-stream, the stream
-    /// must close with Status::PermissionDenied.
+    /// When Keto revokes the caller's view permission mid-stream, the stream
+    /// closes with `Status::PermissionDenied`.
     ///
-    /// Uses a 1s Keto recheck interval override.
+    /// Uses a one-second Keto recheck interval override so the test does not
+    /// wait 30 s.
     #[tokio::test]
     async fn subscribe_closes_with_permission_denied_when_keto_revokes() {
         let nats = connect_nats().await;
@@ -1650,9 +1650,8 @@ mod tests {
 
     /// Build a `BoardServiceImpl` for integration tests.
     ///
-    /// All callers are under `#[ignore = "needs shared compose (postgres + keto)"]`
-    /// so NATS and Valkey are available when this runs. The registry and
-    /// watermark are constructed here so the struct fields are always populated.
+    /// Connects to NATS and Valkey using the standard environment variables
+    /// so the registry and watermark fields are always populated.
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> BoardServiceImpl {
         let nats = connect_nats().await;
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test"));
@@ -1666,7 +1665,7 @@ mod tests {
         }
     }
 
-    /// Build an authenticated request carrying a subject in extensions.
+    /// Create an authenticated request that only carries the caller subject.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
         req.extensions_mut()
@@ -1674,7 +1673,7 @@ mod tests {
         req
     }
 
-    /// Build an authenticated request that also carries a `CheckedObjectId`.
+    /// Create an authenticated request that also carries a `CheckedObjectId`.
     fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
         let mut req = authed_request(body, subject);
         req.extensions_mut()
@@ -1682,7 +1681,7 @@ mod tests {
         req
     }
 
-    /// Seed a project row directly for test setup (bypasses ProjectService).
+    /// Insert a project row directly for a test, bypassing ProjectService.
     async fn create_test_project(pool: &PgPool, subject: &str) -> Uuid {
         let pid = Uuid::new_v4();
         let slug = format!("tp-{}", &pid.to_string()[..8]);
@@ -1699,7 +1698,7 @@ mod tests {
         pid
     }
 
-    /// Seed a card row for test setup.
+    /// Insert a card row directly for a test.
     async fn create_test_card(
         pool: &PgPool,
         project_id: Uuid,

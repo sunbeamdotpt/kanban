@@ -1,4 +1,5 @@
-//! Authentication and authorization middleware.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Authentication and authorization middleware for the Kanban service.
 
 pub mod keto_compat;
 pub mod keto_dispatch;

@@ -1,16 +1,12 @@
-//! CardService — Stage 3c implementation.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Card service implementation.
 //!
-//! Implements all 17 RPCs defined in `proto/sunbeam/kanban/v1/cards.proto`.
-//!
-//! Patterns inherited from Wave 1+2 (projects.rs, boards.rs):
-//!   - Dynamic sqlx (no compile-time macros) — `cargo check` works without
-//!     a live DATABASE_URL.
-//!   - CheckedObjectId sourced from request extensions, never from the body.
-//!   - Idempotency keys stored in the `idempotency_keys` table.
-//!   - event_log outbox: one INSERT per mutation in the same transaction;
-//!     Stage 4 dispatcher publishes to NATS (not done here).
-//!   - Advisory lock via `pg_advisory_xact_lock(hashtext($project_id))` for
-//!     the card-ref allocator (MF-3).
+//! Exposes the card RPCs from `proto/sunbeam/kanban/v1/cards.proto`. The
+//! handlers use the dynamic `sqlx` API so `cargo check` does not need a live
+//! database, read the target object id from request extensions, store
+//! idempotency keys, and write card mutations to the `event_log` outbox in
+//! the same transaction. Card reference allocation uses a per-project
+//! advisory lock (`pg_advisory_xact_lock(hashtext($project_id))`).
 
 use std::sync::Arc;
 
@@ -273,7 +269,7 @@ pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32
         .unwrap_or(0)
 }
 
-/// Fetch a fully-hydrated `Card` by id.
+/// Load a complete card, including its relationships, by id.
 async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
@@ -378,11 +374,10 @@ async fn insert_event_log(
 
 // ── Idempotency helpers ───────────────────────────────────────────────────────
 
-/// Check idempotency key; if a prior response payload exists, deserialise and
-/// return it. The caller passes the key and a closure that fetches the stored
-/// entity by id.
+/// Look up an idempotency key and return the stored card id if the request
+/// was already processed.
 ///
-/// Returns `Ok(Some(card_id))` when the key was seen before, `Ok(None)` when new.
+/// Returns `Ok(Some(card_id))` for a replayed key and `Ok(None)` for a new key.
 async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Uuid>, Status> {
     if key.is_empty() {
         return Ok(None);

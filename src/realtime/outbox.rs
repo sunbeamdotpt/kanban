@@ -1,23 +1,24 @@
-//! Transactional outbox dispatcher — Stage 4d.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Transactional outbox dispatcher.
 //!
 //! Drains the `event_log` table to NATS JetStream.
 //!
 //! # Design
 //!
-//! Each mutation handler (cards.rs, boards.rs, …) inserts one `event_log` row
-//! in the same database transaction as the entity write. The row starts with
-//! `nats_seq IS NULL`. This dispatcher runs as a background tokio task and:
+//! Each mutation handler inserts one `event_log` row in the same database
+//! transaction as the entity write. The row starts with `nats_seq IS NULL`.
+//! This dispatcher runs as a background tokio task and:
 //!
-//!   1. SELECTs undispatched rows in id order, bounded by `batch_size`.
-//!   2. Builds a `BoardEventEnvelope` from each row.
-//!   3. Publishes the encoded proto bytes to the board's JetStream subject.
-//!   4. On success: marks `nats_seq` + `dispatched_at` on the row.
-//!   5. On failure: leaves the row alone — the next loop pass retries.
+//! - SELECTs undispatched rows in `id` order, bounded by `batch_size`.
+//! - Builds a `BoardEventEnvelope` from each row.
+//! - Publishes the encoded proto bytes to the board's JetStream subject.
+//! - On success, marks `nats_seq` and `dispatched_at` on the row.
+//! - On failure, leaves the row alone; the next loop pass retries.
 //!
 //! The loop is idempotent on restart: rows with `nats_seq IS NOT NULL` are
-//! never re-published (the SELECT filter excludes them).
+//! never re-published.
 //!
-//! # Payload mapping (event_type → oneof)
+//! # Payload mapping (`event_type` → oneof)
 //!
 //! | event_type string | oneof variant        |
 //! |-------------------|----------------------|
@@ -33,25 +34,24 @@
 //! | (anything else)   | oneof left empty (envelope fields populated) |
 //!
 //! The JSONB `payload` column contains the raw field values inserted by the
-//! mutation handler. Full deserialization into the nested proto message types
-//! is deferred to Stage 4d.5 — for now the envelope fields are populated and
-//! the oneof is left empty for unrecognised types, or built with card_id
-//! carried in the existing JSONB for recognized types.
+//! mutation handler. Recognized card event types are mapped to the nested
+//! proto messages here; other event types leave the oneof empty so the
+//! envelope can still be dispatched.
 //!
-//! Tradeoff: JSONB is debuggable in `psql` (`SELECT payload FROM event_log`)
-//! while protobuf BYTEA would be faster to deserialize. JSONB is the right
-//! choice for this service's scale.
+//! JSONB is easy to inspect in `psql` (`SELECT payload FROM event_log`) while
+//! protobuf BYTEA would deserialize faster. JSONB is the right trade-off for
+//! this service's scale.
 //!
 //! # LISTEN/NOTIFY
 //!
 //! TODO: add `LISTEN 'kanban_event_log'` via `sqlx::PgListener` to wake the
-//! loop immediately when handlers commit. For now polling at 250ms is adequate
-//! (JetStream publish round-trip is ~1–5ms; 250ms poll latency dominates).
+//! loop immediately when handlers commit. For now polling at 250 ms is adequate:
+//! JetStream publish round-trips are ~1–5 ms, so poll latency dominates.
 //!
 //! # Shutdown
 //!
 //! TODO: graceful shutdown — plumb a `CancellationToken` or `oneshot::Receiver`
-//! into the spawn loop so the pod drains in-flight rows before SIGTERM exits.
+//! into the spawned loop so the pod drains in-flight rows before SIGTERM exits.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -277,9 +277,9 @@ impl OutboxDispatcher {
 
 /// Build a `BoardEventEnvelope` from a raw `event_log` row.
 ///
-/// The envelope fields are always populated. The oneof payload is built from
-/// the JSONB column for the event types that cards.rs emits. For unknown types
-/// the oneof is left empty — Stage 4d.5 will fill in any remaining variants.
+/// The envelope fields are always populated. The oneof payload is built for
+/// the card event types emitted by `cards.rs`; unknown event types leave the
+/// oneof empty until their proto shapes are wired in.
 fn build_envelope(
     row_id: Uuid,
     board_id: Uuid,
@@ -320,9 +320,8 @@ fn build_envelope(
     }
 }
 
-/// Map an event_type string to the correct `board_event_envelope::Payload`
-/// oneof variant. Returns `None` (empty oneof) for unknown types — Stage 4d.5
-/// will fill those in once we confirm the nested proto shapes.
+/// Map an `event_type` string to the matching `board_event_envelope::Payload`
+/// oneof variant. Returns `None` (empty oneof) for unknown event types.
 fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
     let card_id = json
         .get("card_id")

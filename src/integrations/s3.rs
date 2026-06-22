@@ -1,15 +1,21 @@
-//! SeaweedFS S3-compatible client with hand-ported AWS Signature V4.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! S3-compatible client for attachment storage (SeaweedFS, MinIO, AWS S3, etc.).
 //!
-//! Ported from apps/kanban-old/server/s3.ts and s3-presign.ts.
-//! Pure-Rust: hmac + sha2 + hex. No subprocess. No aws-sdk dependency.
+//! This module implements AWS Signature V4 from scratch using only `hmac`,
+//! `sha2` and `hex`, so it can presign and sign requests without spawning a
+//! subprocess or pulling in the full AWS SDK.
 //!
-//! The SigV4 presign algorithm:
-//!   1. Build canonical query string (sorted params) with X-Amz-* fields.
-//!   2. Build canonical request: METHOD\npath\nqs\ncanonical_headers\nsigned_headers\nUNSIGNED-PAYLOAD
-//!   3. Build string-to-sign: algorithm\ndatestamp\nscope\nsha256(canonical_request)
-//!   4. Derive signing key: HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"), "aws4_request")
-//!   5. Signature = hex(HMAC(signing_key, string_to_sign))
-//!   6. Append X-Amz-Signature to URL.
+//! The presign flow follows the standard SigV4 query-string auth steps:
+//!
+//!   1. Collect and sort the `X-Amz-*` query parameters.
+//!   2. Build the canonical request:
+//!      `METHOD\npath\nquery\ncanonical_headers\nsigned_headers\nUNSIGNED-PAYLOAD`
+//!   3. Build the string to sign:
+//!      `algorithm\ndatestamp\nscope\nsha256(canonical_request)`
+//!   4. Derive the signing key:
+//!      `HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"), "aws4_request")`
+//!   5. Sign the string and hex-encode the result.
+//!   6. Append `X-Amz-Signature` to the URL.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,12 +26,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-/// Configuration loaded from environment variables.
+/// S3 connection settings, normally read from environment variables.
 #[derive(Clone, Debug)]
 pub struct S3Config {
-    /// e.g. "http://seaweedfs-filer.storage.svc.cluster.local:8333"
+    /// S3-compatible endpoint, e.g. `http://localhost:9000`.
     pub endpoint: String,
-    /// e.g. "us-east-1"
+    /// AWS region, e.g. `us-east-1`.
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
@@ -33,7 +39,7 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// Load from `S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`.
+    /// Load configuration from the standard `S3_*` environment variables.
     pub fn from_env() -> Self {
         Self {
             endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| {
@@ -71,7 +77,7 @@ impl S3Client {
         }
     }
 
-    /// Object key path: `/{bucket}/{key}`
+    /// Build the full URL for an object key: `/{bucket}/{key}`.
     fn object_url(&self, key: &str) -> String {
         format!(
             "{}/{}/{}",
@@ -83,17 +89,17 @@ impl S3Client {
 
     // ── Presign helpers ───────────────────────────────────────────────────────
 
-    /// Generate a SigV4 presigned PUT URL. Valid for `expires_in` seconds.
+    /// Generate a presigned PUT URL that is valid for `expires_in` seconds.
     pub fn presign_put(&self, key: &str, mime_type: &str, expires_in: u64) -> String {
         self.presign("PUT", key, expires_in, Some(("content-type", mime_type)))
     }
 
-    /// Generate a SigV4 presigned GET URL. Valid for `expires_in` seconds.
+    /// Generate a presigned GET URL that is valid for `expires_in` seconds.
     pub fn presign_get(&self, key: &str, expires_in: u64) -> String {
         self.presign("GET", key, expires_in, None)
     }
 
-    /// Core SigV4 presign: builds a signed URL using query-string auth.
+    /// Build a SigV4 signed URL using query-string authentication.
     fn presign(
         &self,
         method: &str,
@@ -200,7 +206,7 @@ impl S3Client {
 
     // ── Real HTTP operations ──────────────────────────────────────────────────
 
-    /// HEAD the object; returns size + content-type if it exists.
+    /// Send a HEAD request for an object and return its size and content type.
     pub async fn head_object(&self, key: &str) -> Result<HeadResult, S3Error> {
         let url = self.object_url(key);
         let signed_headers = self.sign_request_headers("HEAD", key, "");
@@ -234,7 +240,7 @@ impl S3Client {
         }
     }
 
-    /// DELETE the object from S3.
+    /// Delete an object from S3.
     pub async fn delete_object(&self, key: &str) -> Result<(), S3Error> {
         let url = self.object_url(key);
         let path = format!("/{}/{}", self.config.bucket, key);
@@ -258,8 +264,7 @@ impl S3Client {
         }
     }
 
-    /// Create the configured bucket. Idempotent — 409 BucketAlreadyExists is
-    /// treated as success.
+    /// Create the configured bucket. Treats "already exists" (409) as success.
     pub async fn create_bucket(&self) -> Result<(), S3Error> {
         let url = format!(
             "{}/{}",
@@ -286,9 +291,11 @@ impl S3Client {
         }
     }
 
-    /// Build Authorization header + x-amz-date/x-amz-content-sha256 for a
-    /// standard (non-presigned) request. Returns key-value pairs to add to
-    /// the request.
+    /// Build the `Authorization`, `x-amz-date` and `x-amz-content-sha256`
+    /// headers for a normal (non-presigned) request.
+    ///
+    /// Returns header key/value pairs that should be added to the outgoing
+    /// request.
     fn sign_request_headers(
         &self,
         method: &str,
@@ -299,7 +306,7 @@ impl S3Client {
         self.sign_request(method, &path, body_hash)
     }
 
-    /// Core SigV4 signer for an arbitrary path.
+    /// Sign an arbitrary request path with SigV4.
     fn sign_request(&self, method: &str, path: &str, body_hash: &str) -> Vec<(String, String)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -403,8 +410,7 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     hex::encode(hmac_sha256(key, data))
 }
 
-/// Derive the SigV4 signing key:
-/// HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"), "aws4_request")
+/// Derive the SigV4 signing key from the secret key, date and region.
 fn derive_signing_key(secret: &str, short_date: &str, region: &str) -> Vec<u8> {
     let k_secret = format!("AWS4{secret}");
     let k_date = hmac_sha256(k_secret.as_bytes(), short_date.as_bytes());
@@ -413,7 +419,7 @@ fn derive_signing_key(secret: &str, short_date: &str, region: &str) -> Vec<u8> {
     hmac_sha256(&k_service, b"aws4_request")
 }
 
-/// Format unix seconds as "YYYYMMDDTHHmmssZ" (ISO 8601 basic format for SigV4).
+/// Format a Unix timestamp in SigV4's ISO 8601 basic form: `YYYYMMDDTHHmmssZ`.
 fn format_iso8601(secs: u64) -> String {
     // Manual implementation — no chrono needed here, and avoids a format
     // dependency in the crypto path.
@@ -428,7 +434,7 @@ fn format_iso8601(secs: u64) -> String {
     dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-/// Extract the host (and port if non-standard) from an endpoint URL.
+/// Return the host (and optional port) portion of an endpoint URL.
 fn endpoint_host(endpoint: &str) -> String {
     // Parse just enough to get host:port without pulling in the url crate.
     // Strip scheme prefix then take up to the first '/'.
@@ -442,8 +448,10 @@ fn endpoint_host(endpoint: &str) -> String {
         .to_string()
 }
 
-/// Percent-encode a string per RFC 3986 (used in SigV4 canonical query strings).
-/// Encodes everything except unreserved chars: A-Z a-z 0-9 - _ . ~
+/// Percent-encode a string according to RFC 3986.
+///
+/// Keeps unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`)
+/// untouched and escapes everything else.
 fn uri_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for byte in s.bytes() {
@@ -462,8 +470,9 @@ fn uri_encode(s: &str) -> String {
 
 // ── Filename sanitization ────────────────────────────────────────────────────
 
-/// Strip path separators and control characters from a filename.
-/// Returns a safe filename component.
+/// Remove path separators and control characters from a filename.
+///
+/// The result is safe to use as a single path component.
 pub fn sanitize_filename(name: &str) -> String {
     name.chars()
         .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0')

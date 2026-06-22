@@ -1,12 +1,14 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! JetStream stream bootstrap for the Kanban realtime spine.
 //!
-//! Single source of truth for stream + consumer naming and configuration.
-//! Called at service startup (`server.rs`) with `?` — fatal on failure.
+//! Single source of truth for stream and consumer naming and configuration.
+//! Called at service startup (`server.rs`) with `?`, so a failure is fatal.
 //!
 //! # Stream layout
 //!
-//! One stream `KANBAN_BOARD_EVENTS` covers all boards via the wildcard subject
-//! `kanban.board.>`. Each board publishes to `kanban.board.<board_id>.events`.
+//! One stream, `KANBAN_BOARD_EVENTS`, covers all boards via the wildcard
+//! subject `kanban.board.>`. Each board publishes to
+//! `kanban.board.<board_id>.events`.
 //!
 //! # Consumer naming (MF-6)
 //!

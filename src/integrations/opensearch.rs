@@ -1,16 +1,12 @@
-//! OpenSearch HTTP client — thin wrapper over `reqwest`.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! OpenSearch HTTP client — a thin wrapper over `reqwest`.
 //!
-//! Only the `search` method is exposed here.  Document indexing (PUT /_doc/:id)
-//! is intentionally absent from this module:
+//! This module exposes search and index management helpers for the card
+//! search index. The canonical index name is [`KANBAN_CARDS_INDEX`].
 //!
-//!   Stage 3.5 — TODO: index cards on CreateCard/UpdateCard from
-//!   `services/cards.rs`.  Call `OpenSearchClient::index_card` after the
-//!   Postgres INSERT/UPDATE commits.  Tracked as Stage 3.5.
+//! # Field mapping
 //!
-//! # Index
-//!
-//! The canonical index name is `sunbeam-kanban-cards-v1`.
-//! Field schema (matches `apps/kanban-old/server/opensearch.ts`):
+//! The mapping mirrors the legacy Kanban OpenSearch schema:
 //!
 //!   id             keyword   — card UUID
 //!   board_id       keyword
@@ -38,12 +34,12 @@ pub const KANBAN_CARDS_INDEX: &str = "sunbeam-kanban-cards-v1";
 
 #[derive(Clone, Debug)]
 pub struct OpenSearchConfig {
-    /// e.g. "http://localhost:9200"
+    /// OpenSearch base URL, e.g. `http://localhost:9200`.
     pub url: String,
 }
 
 impl OpenSearchConfig {
-    /// Load from `OPENSEARCH_URL`; defaults to `http://localhost:9200`.
+    /// Load the URL from `OPENSEARCH_URL`, defaulting to `http://localhost:9200`.
     pub fn from_env() -> Self {
         Self {
             url: std::env::var("OPENSEARCH_URL")
@@ -54,7 +50,7 @@ impl OpenSearchConfig {
 
 // ── Response types ────────────────────────────────────────────────────────────
 
-/// Subset of the OpenSearch `_search` response we actually use.
+/// Subset of the OpenSearch `_search` response that the client uses.
 #[derive(Debug, Deserialize)]
 pub struct SearchResponse {
     pub hits: HitsWrapper,
@@ -79,11 +75,11 @@ pub struct SearchHit {
     pub score: Option<f64>,
     #[serde(rename = "_source")]
     pub source: CardDocument,
-    /// Present when a `sort` clause is in the query; used for `search_after`.
+    /// Present when the query includes a `sort` clause; used for `search_after`.
     pub sort: Option<Vec<Value>>,
 }
 
-/// The indexed document shape (mirrors `apps/kanban-old/server/opensearch.ts`).
+/// Shape of a card document stored in the search index.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CardDocument {
     pub id: String,
@@ -105,7 +101,7 @@ pub struct CardDocument {
 
 // ── Error sentinel ────────────────────────────────────────────────────────────
 
-/// Returned when we can structurally detect "index_not_found_exception".
+/// Error body returned by OpenSearch, used to detect a missing index.
 #[derive(Debug, Deserialize)]
 struct OpenSearchError {
     error: Option<ErrorBody>,
@@ -133,11 +129,10 @@ impl OpenSearchClient {
         }
     }
 
-    /// POST `/<index>/_search` with `body`.
+    /// Run `POST /<index>/_search` with the given query body.
     ///
-    /// Returns `Ok(None)` when OpenSearch returns 404 with
-    /// `index_not_found_exception` — callers should treat this as an empty
-    /// result set rather than an error.
+    /// Returns `Ok(None)` when the target index does not exist, so callers
+    /// can treat a missing index as an empty result set.
     pub async fn search(&self, index: &str, body: &Value) -> Result<Option<SearchResponse>> {
         let url = format!("{}/{}/_search", self.base_url, index);
 
@@ -189,9 +184,9 @@ impl OpenSearchClient {
 
     // ── Index management (used by integration tests) ─────────────────────────
 
-    /// Create `index` with the kanban card field mapping.
+    /// Create an index with the standard Kanban card mapping.
     ///
-    /// Silently succeeds if the index already exists.
+    /// Succeeds silently if the index already exists.
     pub async fn create_cards_index(&self, index: &str) -> Result<()> {
         let url = format!("{}/{}", self.base_url, index);
 
@@ -242,7 +237,7 @@ impl OpenSearchClient {
         Ok(())
     }
 
-    /// Index a single card document (PUT `/<index>/_doc/<id>`).
+    /// Index or replace a single card document at `/<index>/_doc/<id>`.
     pub async fn index_card(&self, index: &str, doc: &CardDocument) -> Result<()> {
         let url = format!("{}/{}/_doc/{}", self.base_url, index, doc.id);
 
@@ -264,8 +259,9 @@ impl OpenSearchClient {
         Ok(())
     }
 
-    /// Refresh an index so indexed docs are immediately searchable.
-    /// Used in tests after bulk indexing.
+    /// Refresh an index so newly indexed documents become searchable.
+    ///
+    /// Mostly used by tests after bulk indexing.
     pub async fn refresh(&self, index: &str) -> Result<()> {
         let url = format!("{}/{}/_refresh", self.base_url, index);
         let resp = self
@@ -284,7 +280,7 @@ impl OpenSearchClient {
         Ok(())
     }
 
-    /// Delete an index (used in test teardown).
+    /// Delete an index. Used by test teardown.
     pub async fn delete_index(&self, index: &str) -> Result<()> {
         let url = format!("{}/{}", self.base_url, index);
         let resp = self

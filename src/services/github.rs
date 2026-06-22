@@ -1,4 +1,5 @@
-//! GithubLinkService stub — Stage 3 fills in real logic.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Stub implementation of the GitHub issue link service.
 
 use tonic::{Request, Response, Status};
 

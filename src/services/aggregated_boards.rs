@@ -1,11 +1,12 @@
-//! AggregatedBoardService — meta board spanning multiple source boards.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Aggregated board service.
 //!
-//! An AggregatedBoard is a view over an explicit list of source boards. It does
-//! not own cards; card/column mutations are delegated to BoardService /
-//! CardService using the source board_id carried in each card/column.
+//! An aggregated board is a read-only view over a set of source boards. It does
+//! not own its own cards; any card or column changes go through the source
+//! board's own service using the `board_id` carried on each item.
 //!
-//! GetAggregatedBoard is server-streaming and yields chunks so large aggregates
-//! do not require pagination.
+//! `GetAggregatedBoard` streams chunks back to the client, so large aggregates
+//! can be returned without pagination.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -50,9 +51,9 @@ const KETO_NS: &str = "KanbanAggregatedBoard";
 const MAX_AGGREGATES: usize = 10_000;
 const CARD_BATCH_SIZE: usize = 100;
 
-/// Production heartbeat interval (15s).
+/// Heartbeat interval for live streams (15 seconds).
 const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
-/// Production Keto recheck interval (30s).
+/// How often to recheck Keto permissions for live streams (30 seconds).
 const KETO_RECHECK_INTERVAL_MS: u64 = 30_000;
 
 // ── Service struct ───────────────────────────────────────────────────────────
@@ -226,7 +227,7 @@ async fn fetch_source_board_ids(
     Ok(rows.iter().map(|r| r.get::<Uuid, _>("board_id")).collect())
 }
 
-/// Return the subset of board IDs that are public or internal.
+/// Keep only the board ids that are public or internal.
 async fn fetch_public_internal_board_ids(
     pool: &PgPool,
     board_ids: &[Uuid],
@@ -1019,7 +1020,7 @@ impl AggregatedBoardServiceImpl {
 
 // ── Streaming implementation ──────────────────────────────────────────────────
 
-/// Arguments for `build_subscribe_aggregated_board_stream`.
+/// Configuration passed to `build_subscribe_aggregated_board_stream`.
 pub struct SubscribeAggregatedBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
     pub keto: Arc<KetoClient>,
@@ -1256,8 +1257,7 @@ mod tests {
             .await;
     }
 
-    /// Create a source board via BoardService and add a default column so card
-    /// tests can create cards immediately.
+    /// Create a source board and add a default column so tests can create cards right away.
     async fn create_source_board(
         svc: &BoardServiceImpl,
         project_id: Uuid,
@@ -1320,18 +1320,18 @@ mod tests {
         board_id
     }
 
-    /// Grant an explicit `view` tuple on a board.
+    /// Grant an explicit `view` tuple on a board in tests.
     ///
-    /// The testcontainers Keto uses legacy namespace declarations, so derived
-    /// permissions (e.g. board `view` via project parent) are not evaluated.
-    /// Tests that call `get_board` must write the view tuple themselves.
+    /// The Keto instance used in tests does not evaluate derived permissions,
+    /// so tests that read a board must grant `view` directly instead of relying
+    /// on the project parent.
     async fn grant_board_view(keto: &KetoClient, board_id: Uuid, subject: &str) {
         keto.grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
             .await
             .expect("grant board view failed");
     }
 
-    /// Helper to collect a GetAggregatedBoard stream.
+    /// Drain a `GetAggregatedBoard` stream into a vector of chunks.
     async fn collect_aggregate_stream(
         mut stream: AggregatedBoardStream,
     ) -> Vec<AggregatedBoardChunk> {

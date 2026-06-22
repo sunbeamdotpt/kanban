@@ -1,5 +1,7 @@
-//! Generated protobuf message and service definitions for kanban v1.
-//! Re-exports from the tonic-prost-build OUT_DIR.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Protobuf message and service definitions for the kanban v1 API.
+//!
+//! The generated code is re-exported from tonic-prost-build's output directory.
 
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]

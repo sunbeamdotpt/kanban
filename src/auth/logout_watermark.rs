@@ -1,8 +1,8 @@
-//! Logout watermark — server-side gate that cuts subscriptions and rejects
-//! requests for tokens issued before a user's most recent logout signal.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Logout watermark — server-side gate that rejects requests and cuts
+//! subscriptions for tokens issued before a user's most recent logout signal.
 //!
-//! MF-4 server-side wiring. The watermark is set by `AuthService.SignalLogout`
-//! and consulted by:
+//! The watermark is set by `AuthService.SignalLogout` and consulted by:
 //!   - `keto_dispatch` middleware on every RPC (after JWT validation, before Keto check).
 //!   - The realtime stream tail (`BoardSubscriberRegistry`) on every yield.
 //!
@@ -10,8 +10,7 @@
 //! TTL: 24 hours (longer than any reasonable JWT lifetime).
 //!
 //! Local cache: 5-second per-pod cache of (subject, watermark_ms) to avoid
-//! hammering Valkey on every yield (`feedback_grpc_first_for_g2v.md`-style
-//! discipline: keep the hot path light).
+//! hammering Valkey on every yield and keep the hot path light.
 //!
 //! # Fail-closed policy
 //!
@@ -22,11 +21,8 @@
 //! `kanban_logout_watermark_errors_total` firing in Alertmanager before users
 //! notice broad 503s.
 //!
-//! Note: the plan's Critic (v2 §1058) originally flagged that the
-//! `Ok(Some(...))` pattern implies fail-open; this implementation explicitly
-//! chooses fail-closed per the task spec and Pre-mortem Scenario 2 mitigation.
-//! If the team later decides fail-open is preferable (degraded revocation vs
-//! full outage), change the `?` in `watermark_for` to a fallback of `Ok(0)`.
+//! If the team later prefers degraded revocation over a full outage, change
+//! the `?` in `watermark_for` to a fallback of `Ok(0)`.
 
 use anyhow::Result;
 use parking_lot::RwLock;

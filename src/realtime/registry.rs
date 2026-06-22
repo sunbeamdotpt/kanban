@@ -1,24 +1,22 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! `BoardSubscriberRegistry` — per-pod ephemeral NATS push consumer + broadcast fanout.
 //!
 //! # Concurrency invariants
 //!
-//! 1. **`boards` is the single source of truth.** No state about board channels
-//!    lives outside this map. Constructing or tearing down a channel always goes
-//!    through the map under a write lock.
-//!
-//! 2. **Refcounts ride the write lock.** `subscribe` increments under a write
-//!    lock; `StreamHandle::drop` decrements under a write lock. The refcount is
-//!    never mutated without holding the write lock.
-//!
-//! 3. **`broadcast::Sender::send` is fire-and-forget.** A `send` failure (all
-//!    receivers have dropped) is not an error from the pump task's perspective —
-//!    the subsequent `StreamHandle::drop` will abort the task. Lagged receivers
-//!    receive `RecvError::Lagged` and the `SubscribeBoard` handler is expected
-//!    to reconnect with `last_seq`.
-//!
-//! 4. **No lock is held across `.await` points.** All async work happens outside
-//!    the lock. The lock is acquired, the state is read/mutated, and the lock is
-//!    released before any async call.
+//! - **`boards` is the single source of truth.** No channel state lives outside
+//!   this map. Constructing or tearing down a channel always goes through the
+//!   map under a write lock.
+//! - **Refcounts ride the write lock.** `subscribe` increments under a write
+//!   lock; `StreamHandle::drop` decrements under a write lock. The refcount is
+//!   never mutated without holding the write lock.
+//! - **`broadcast::Sender::send` is fire-and-forget.** A `send` failure (all
+//!   receivers have dropped) is not an error from the pump task's perspective —
+//!   the subsequent `StreamHandle::drop` will abort the task. Lagged receivers
+//!   receive `RecvError::Lagged` and the `SubscribeBoard` handler is expected
+//!   to reconnect with `last_seq`.
+//! - **No lock is held across `.await` points.** All async work happens outside
+//!   the lock. The lock is acquired, the state is read or mutated, and the lock
+//!   is released before any async call.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,12 +1,10 @@
-//! SearchService — Stage 3f implementation.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Search over cards.
 //!
-//! `SearchCards` runs a multi-field full-text query against OpenSearch index
-//! `sunbeam-kanban-cards-v1`, then post-filters results via Keto to ensure the
-//! caller only sees cards in boards they can view.
-//!
-//! OQ8 resolution — Keto-aware OpenSearch filter plugin is v2; post-filter is
-//! v1's compromise.  The handler calls `expand_objects(KanbanBoard, view,
-//! subject)` and drops any hit whose `board_id` is not in the returned set.
+//! `SearchCards` runs a full-text query against the `sunbeam-kanban-cards-v1`
+//! OpenSearch index, then removes any hit whose board the caller cannot view.
+//! Visibility is checked by expanding the subject's viewable boards with Keto
+//! (`expand_objects(KanbanBoard, view, subject)`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -29,8 +27,8 @@ use crate::pb::{CardSearchHit, SearchCardsRequest, SearchCardsResponse};
 const DEFAULT_LIMIT: i32 = 20;
 const MAX_LIMIT: i32 = 100;
 
-/// Maximum number of boards the post-filter expand will retrieve.
-/// Prevents runaway Keto pagination for users with very wide access.
+/// Upper bound on the number of boards returned by the Keto expand.
+/// Keeps the post-filter from paging indefinitely for users with very broad access.
 const MAX_BOARD_EXPAND: usize = 50_000;
 
 // ── Service struct ────────────────────────────────────────────────────────────
@@ -39,7 +37,7 @@ pub struct SearchServiceImpl {
     pub pool: sqlx::PgPool,
     pub keto: Arc<KetoClient>,
     pub opensearch: Arc<OpenSearchClient>,
-    /// Optional index override for tests. Defaults to `KANBAN_CARDS_INDEX`.
+    /// Index name used in tests; when unset the production index is used.
     pub index_name: Option<String>,
 }
 
@@ -57,7 +55,7 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
 }
 
-/// Return the subset of board IDs that are public or internal.
+/// Filter a list of board ids down to those with public or internal visibility.
 async fn fetch_public_internal_board_ids(
     pool: &sqlx::PgPool,
     board_ids: &[Uuid],
@@ -79,15 +77,16 @@ async fn fetch_public_internal_board_ids(
 
 // ── Query builder ─────────────────────────────────────────────────────────────
 
-/// Build the OpenSearch query body from the request.
+/// Assemble the OpenSearch request body from the search parameters.
 ///
-/// Structure:
-///   bool.must  — multi_match on title, description, ref (when query is non-empty)
-///   bool.filter — terms filters for project_ids, board_ids, label_names,
-///                 assignee_subjects (only when non-empty)
-///   sort       — [_score desc, id asc] for stable search_after pagination
-///   search_after — decoded from cursor (when non-empty)
-///   size       — clamped limit
+/// The resulting query has:
+///   * `bool.must` — a `multi_match` on title, description, and ref when a text
+///     query is present.
+///   * `bool.filter` — term filters for projects, boards, labels, and assignees
+///     when any are supplied.
+///   * `sort` — `_score` descending then `id` ascending for stable pagination.
+///   * `search_after` — the decoded cursor, when one is provided.
+///   * `size` — the clamped page limit.
 fn build_query(req: &SearchCardsRequest) -> Result<Value, Status> {
     let limit = {
         let l = if req.limit <= 0 {
@@ -160,7 +159,7 @@ fn build_query(req: &SearchCardsRequest) -> Result<Value, Status> {
 
 // ── Cursor codec ──────────────────────────────────────────────────────────────
 
-/// Encode the last hit's sort key as a base64-JSON cursor.
+/// Turn a hit's sort key into a base64-encoded JSON cursor.
 fn encode_cursor(sort: &[Value]) -> String {
     let json_bytes = serde_json::to_vec(sort).unwrap_or_default();
     let mut buf = String::new();
@@ -169,7 +168,7 @@ fn encode_cursor(sort: &[Value]) -> String {
     buf
 }
 
-/// Decode a cursor produced by `encode_cursor`.
+/// Decode a cursor created by `encode_cursor`.
 fn decode_cursor(cursor: &str) -> anyhow::Result<Value> {
     let bytes = base64_decode(cursor)?;
     let v: Value = serde_json::from_slice(&bytes)?;
@@ -544,7 +543,7 @@ mod tests {
         }))
     }
 
-    /// Unique index per test run to avoid cross-test interference.
+    /// Generate a unique OpenSearch index name for this test run.
     fn test_index() -> String {
         format!(
             "sunbeam-kanban-cards-test-{}-{}",
@@ -1681,7 +1680,7 @@ mod tests {
 
     // ── Additional mock OpenSearch service-level tests ─────────────────────────
 
-    /// Start a mock OpenSearch server that always returns the given status/body.
+    /// Start a mock OpenSearch server that replies with the provided status and body.
     async fn start_mock_response_server(
         status: StatusCode,
         body: Value,
@@ -1883,7 +1882,7 @@ mod tests {
         .ok();
     }
 
-    /// Start a mock server that returns `n` identical hits for the same board.
+    /// Start a mock OpenSearch server that returns repeated hits for one board.
     async fn start_mock_multi_hit_server(
         card_ids: Vec<String>,
         board_id: String,

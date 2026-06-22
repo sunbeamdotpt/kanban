@@ -1,29 +1,29 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Per-RPC Keto authorization dispatcher.
 //!
-//! MF-1 resolution: `KetoLayer` in sunbeam-g2v takes a fixed (namespace,
-//! relation) pair at construction time, which cannot enforce 49 heterogeneous
-//! RPCs.  This middleware performs per-method dispatch in-process via a static
-//! matrix.
+//! The `KetoLayer` in sunbeam-g2v is configured with a single fixed
+//! (namespace, relation) pair, which is not enough for the many different
+//! permission checks the Kanban API needs. This middleware instead looks up
+//! each RPC in a static dispatch matrix and runs the right Keto check for
+//! that method.
 //!
-//! # T-N1 (Architect v2): object-id header threading
+//! # Object-id header threading
 //!
-//! The object ID is sourced from the `x-sunbeam-object-id` request header. The
-//! FE sets it explicitly per call — this middleware does **not** inspect or
-//! deserialize request bodies (which breaks server-streaming).  After a
-//! successful Keto `check_permission` call, we insert
-//! `Extension<CheckedObjectId>` into `req.extensions_mut()` so handlers always
-//! consume the *checked* id rather than anything from the body.  This closes
-//! the header-vs-body bypass: a handler that reads from the body instead of the
-//! extension can only obtain an id that has already been authorized.
+//! The object ID comes from the `x-sunbeam-object-id` request header. The
+//! frontend sets it explicitly on every call, and this middleware never
+//! inspects or deserializes request bodies — that would break server-streaming.
+//! After Keto grants permission, the middleware inserts
+//! `Extension<CheckedObjectId>` into the request extensions so handlers use
+//! the already-authorized ID instead of anything from the body. This prevents
+//! a header-vs-body bypass: a handler reading from the body would only get an
+//! ID that has already passed authorization.
 //!
-//! # IAT units (Architect v2 punch-list item 2)
+//! # IAT units
 //!
-//! `JwtClaims.iat` is an `i64` in **seconds** (standard JWT).  The logout
-//! watermark (`LogoutWatermark`) stores and compares values in **milliseconds**.
-//! We convert here: `iat_ms = (claims.iat as u64) * 1000`.  All comparisons
-//! inside `LogoutWatermark::is_token_valid` use milliseconds consistently.  We
-//! do *not* use seconds in the watermark path — the conversion happens once,
-//! here, and is documented by name.
+//! `JwtClaims.iat` is an `i64` in **seconds**, as defined by the JWT standard.
+//! The logout watermark stores and compares values in **milliseconds**. We
+//! convert once here: `iat_ms = (claims.iat as u64) * 1000`. All comparisons
+//! inside `LogoutWatermark::is_token_valid` use milliseconds.
 
 use std::{fmt, sync::Arc};
 
@@ -37,35 +37,34 @@ use crate::auth::logout_watermark::LogoutWatermark;
 // Public types
 // ============================================================================
 
-/// The object id that was presented in the `x-sunbeam-object-id` header and
-/// subsequently verified by a successful Keto `check_permission` call.
+/// Object id extracted from the `x-sunbeam-object-id` header and verified by
+/// a successful Keto permission check.
 ///
-/// Inserted into request extensions after authorization passes; handlers must
-/// source their object id from this extension rather than from the request body
-/// to ensure the authorized id is the one they act on.
+/// Handlers should read this extension instead of parsing the request body,
+/// so they always act on the ID that Keto already authorized.
 #[derive(Clone, Debug)]
 pub struct CheckedObjectId(pub String);
 
-/// Where the object id for a given RPC comes from.
+/// Tells the dispatcher where to get the object id for a given RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectIdSource {
     /// Read from the `x-sunbeam-object-id` request header.
     ///
-    /// The dispatcher will:
-    /// 1. Return `400 Bad Request` if the header is absent.
-    /// 2. Call `KetoClient::check_permission(namespace, object_id, relation, subject)`.
-    /// 3. Return `403 Forbidden` if Keto denies.
-    /// 4. Insert `Extension<CheckedObjectId>` on success.
+    /// The dispatcher:
+    /// 1. Returns `400 Bad Request` if the header is absent.
+    /// 2. Calls `KetoClient::check_permission(namespace, object_id, relation, subject)`.
+    /// 3. Returns `403 Forbidden` if Keto denies.
+    /// 4. Inserts `Extension<CheckedObjectId>` on success.
     Header,
-    /// No specific object check required.
+    /// No specific object check is required.
     ///
-    /// Used for RPCs that are accessible to any authenticated user (e.g.
-    /// `ListProjects`, `WhoAmI`, `SearchCards`), where post-call filtering
-    /// inside the handler restricts the result set via `keto_expand`.
+    /// Used for RPCs that are open to any authenticated user (e.g.
+    /// `ListProjects`, `WhoAmI`, `SearchCards`), where the handler filters
+    /// the result set afterwards via `keto_expand`.
     None,
 }
 
-/// A single entry in the static dispatch matrix.
+/// One row in the static dispatch matrix.
 #[derive(Clone, Debug)]
 pub struct DispatchEntry {
     /// Fully-qualified gRPC method path, e.g.
@@ -85,8 +84,7 @@ pub struct DispatchEntry {
 // State
 // ============================================================================
 
-/// Shared state threaded through the dispatch middleware via
-/// `Extension<Arc<DispatchState>>`.
+/// Shared state carried by `Extension<Arc<DispatchState>>`.
 pub struct DispatchState {
     pub keto: Arc<KetoClient>,
     pub watermark: Arc<LogoutWatermark>,
@@ -98,10 +96,10 @@ pub struct DispatchState {
 
 /// Return the static dispatch matrix.
 ///
-/// The set of method paths in this matrix must equal the set of RPC method
-/// paths emitted by the proto compiler for every service in
-/// `proto/sunbeam/kanban/v1/*.proto`.  The `keto-coverage` binary (at
-/// `apps/kanban/src/bin/keto-coverage.rs`) enforces this invariant at CI time.
+/// The method paths in this matrix must exactly match the RPC method paths
+/// emitted by the proto compiler for every service in
+/// `proto/sunbeam/kanban/v1/*.proto`. The `keto-coverage` binary enforces
+/// this invariant at CI time.
 pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
@@ -550,7 +548,7 @@ pub const BYPASSED_METHODS: &[&str] = &[
 // ============================================================================
 
 /// Return a short hex digest of the first 8 bytes of `subject` for log
-/// correlation.  This is deliberately low-fidelity: it lets an operator match
+/// correlation. This is deliberately low-fidelity: it lets an operator match
 /// log lines across a single request without exposing the full subject string.
 fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
     use std::hash::{Hash, Hasher};
@@ -570,7 +568,7 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 /// Per-RPC authorization dispatcher.
 ///
 /// Must run *after* `JwtLayer` (which inserts `Extension<AuthContext>`) and
-/// *before* the connect-rust service handlers.
+/// *before* the Connect-RPC service handlers.
 ///
 /// Register with:
 /// ```rust,ignore
@@ -588,9 +586,9 @@ pub async fn dispatch(
 }
 
 /// Inner authorization check, separated from the Tower middleware shell so it
-/// can be unit-tested without spinning up an axum Router.  Returns the request
-/// (with `CheckedObjectId` inserted on Header-source RPCs) when authorized;
-/// returns the same `(StatusCode, String)` the middleware would surface on
+/// can be unit-tested without spinning up an Axum router. Returns the request
+/// (with `CheckedObjectId` inserted for Header-source RPCs) when authorized,
+/// or the same `(StatusCode, String)` the middleware would return on
 /// rejection.
 pub(crate) async fn dispatch_check(
     state: Arc<DispatchState>,
@@ -729,7 +727,7 @@ mod tests {
     /// Every proto RPC must appear in the matrix exactly once.
     ///
     /// The expected set is built by scanning the proto files with a simple
-    /// regex over raw bytes — no proto codegen dependency required.
+    /// line-oriented regex — no proto codegen dependency required.
     #[test]
     fn matrix_covers_all_rpcs() {
         let expected: HashSet<String> = expected_methods_from_protos()
@@ -761,7 +759,7 @@ mod tests {
         );
     }
 
-    /// Namespace must be one of the known values (or empty for None-source entries).
+    /// Namespaces must be one of the known values (or empty for None-source entries).
     #[test]
     fn matrix_uses_only_known_namespaces() {
         let known = [
@@ -888,19 +886,12 @@ mod tests {
         // for a pure unit test that does not hit Valkey.
     }
 
-    /// Pure unit test: verify that dispatch short-circuits with 400 when the
-    /// header is missing, *before* any Keto or Valkey call.
+    /// Verify that `GetBoard` uses `ObjectIdSource::None`.
     ///
-    /// We test this by calling the inner logic directly rather than via the
-    /// full `dispatch` fn (which requires wired extensions + live Valkey for
-    /// the watermark step that precedes the header check).
+    /// This is a stand-in for the missing-header-400 path: the real header-missing
+    /// test needs a live Valkey because the watermark check runs first, so we at
+    /// least confirm the method in question does not require a header.
     ///
-    /// The object-id-missing check lives in `ObjectIdSource::Header` branch.
-    /// Since the watermark step runs first, a pure unit test for the 400 path
-    /// requires mocking the watermark — which we cannot do per CLAUDE.md rules.
-    ///
-    /// Resolution: the `dispatch_returns_400_when_header_missing_for_header_source`
-    /// integration test covers this with `#[ignore = "needs shared valkey"]`.
     #[test]
     fn object_id_source_none_entry_exists_for_get_board() {
         let entry = MATRIX
@@ -1214,9 +1205,10 @@ mod tests {
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
-    /// Run the production `dispatch_check` against a request and return either
-    /// 200 (would proceed to the handler) or the rejection status code.
-    /// Extensions for `Arc<DispatchState>` and `AuthContext` must be inserted
+    /// Run `dispatch_check` against a request and return either 200 (would proceed
+    /// to the handler) or the rejection status code.
+    ///
+    /// `Arc<DispatchState>` and `AuthContext` extensions must already be inserted
     /// on the request before calling.
     async fn dispatch_raw(mut req: HttpRequest<Body>) -> StatusCode {
         let state = req
@@ -1239,8 +1231,8 @@ mod tests {
     /// Scan all proto files under `proto/sunbeam/kanban/v1/` and build the
     /// expected set of fully-qualified method paths.
     ///
-    /// The proto package is `sunbeam.kanban.v1`; service names and RPC names
-    /// are extracted with a simple line-oriented regex (no codegen dependency).
+    /// Service names and RPC names are extracted with a simple line-oriented regex
+    /// (no proto codegen dependency).
     pub(crate) fn expected_methods_from_protos() -> HashSet<String> {
         let proto_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/proto/sunbeam/kanban/v1");
 

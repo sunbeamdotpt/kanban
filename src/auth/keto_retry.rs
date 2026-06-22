@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Retry wrappers for Keto read/write operations.
 //!
 //! The in-memory SQLite Keto image used in integration tests serializes writes
@@ -18,7 +19,7 @@ use tokio::time::sleep;
 
 const MAX_RETRIES: usize = 8;
 
-/// Return `true` if a Keto error message looks like a transient SQLite
+/// Returns `true` if a Keto error message looks like a transient SQLite
 /// serialization conflict.
 fn is_retryable(e: &str) -> bool {
     let msg = e.to_lowercase();
@@ -44,9 +45,9 @@ where
     Err(last_err.unwrap_or_else(|| ServiceError::Internal("keto retry exhausted".to_string())))
 }
 
-/// Retry-enabled Keto operations.
+/// Keto operations with retry on transient serialization conflicts.
 pub trait KetoRetryExt {
-    /// Write a relation tuple, retrying on transient serialization conflicts.
+    /// Writes a relation tuple, retrying on transient serialization conflicts.
     fn grant_with_retry<'a>(
         &'a self,
         namespace: &'a str,
@@ -55,7 +56,7 @@ pub trait KetoRetryExt {
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>>;
 
-    /// Check a permission, retrying on transient serialization conflicts.
+    /// Checks a permission, retrying on transient serialization conflicts.
     fn check_permission_with_retry<'a>(
         &'a self,
         namespace: &'a str,

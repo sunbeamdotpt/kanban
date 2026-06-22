@@ -1,8 +1,12 @@
-//! AuthService implementation — Stage 3g.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! AuthService implementation.
 //!
-//! TODO Stage 3g.5 — call Kratos `/sessions/whoami` to enrich beyond JWT claims
-//! (avatar URL, traits not in token). Tracked in
-//! `.omc/plans/kanban-plan-v2.md` follow-ups.
+//! Exposes `WhoAmI` to return the caller's identity from the JWT, and
+//! `SignalLogout` to record a logout watermark in Valkey so that later
+//! requests with an older `iat` are rejected.
+//!
+//! Future improvement: call Kratos `/sessions/whoami` to enrich the response
+//! with profile data (avatar URL, traits) that may not be present in the JWT.
 
 use std::sync::Arc;
 

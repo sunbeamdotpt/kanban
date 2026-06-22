@@ -1,19 +1,16 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Keto Expand helper — enumerate object IDs a subject has a relation on.
 //!
-//! Used by `ListProjects`, `ListBoards`, `ListCardsByBoard`-as-fallback to
-//! filter to "rows the user can see" without a Postgres join on Keto state.
-//!
-//! MF-7 resolution: kanban-local first; upstream to sunbeam-g2v in v2 if a
-//! second consumer appears (per `feedback_beam_ui_first.md`-analog).
+//! Used by `ListProjects`, `ListBoards`, and `ListCardsByBoard` (as a fallback)
+//! to filter results to "rows the user can see" without joining Keto state in
+//! Postgres.
 //!
 //! # Transport note
 //!
 //! `KetoClient` does not expose a public `ReadService` channel, so this helper
-//! calls the `list_relation_tuples` method added to `KetoClient` in
-//! `libs/sunbeam-g2v/src/middleware/auth/keto.rs`.  That method was added as
-//! part of this stage (Stage 1.5a) and uses `ReadService.ListRelationTuples`
-//! over gRPC on the read endpoint (port 4466).  No side-channel transport is
-//! introduced here.
+//! calls `list_relation_tuples` from `crate::auth::keto_compat`, which talks to
+//! Keto's `ReadService.ListRelationTuples` over gRPC on the read endpoint
+//! (port 4466). No side-channel transport is introduced here.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -29,15 +26,14 @@ pub struct ExpandQuery<'a> {
     pub namespace: &'a str,
     /// Keto relation, e.g. `"view"`.
     pub relation: &'a str,
-    /// Keto subject string, e.g. `"user:sienna"`.
-    /// Not logged (PII).
+    /// Keto subject string, e.g. `"user:sienna"`. Not logged (PII).
     pub subject: &'a str,
     /// Page size hint passed to Keto per request. Tune for throughput vs.
     /// latency; 256 is a reasonable default.
     pub max_page_size: u32,
 }
 
-/// Return `true` if a Keto error looks like a transient SQLite serialization
+/// Returns `true` if a Keto error looks like a transient SQLite serialization
 /// conflict from the in-memory test Keto image.
 fn is_keto_retryable(e: &str) -> bool {
     let msg = e.to_lowercase();
@@ -47,7 +43,7 @@ fn is_keto_retryable(e: &str) -> bool {
 /// Return the sorted, deduplicated set of object IDs for which `subject` holds
 /// `relation` in `namespace`.
 ///
-/// Pagination is handled internally.  If the running total would exceed
+/// Pagination is handled internally. If the running total would exceed
 /// `max_results` before the next page is fetched, the function returns
 /// `Err` rather than fetching more data.
 ///
@@ -142,9 +138,10 @@ mod tests {
 
     use crate::auth::keto_retry::KetoRetryExt;
 
-    /// Keto namespace for kanban integration tests.
-    /// Must be declared in the keto namespace config for the dev instance.
-    /// KanbanProject is present in both the production OPL config and the
+    /// Keto namespace used for these integration tests.
+    ///
+    /// Must be declared in the Keto namespace config for the dev instance.
+    /// `KanbanProject` is present in both the production OPL config and the
     /// legacy in-memory config used by `test.sh`.
     const NS: &str = "KanbanProject";
     const RELATION: &str = "view";
@@ -153,9 +150,9 @@ mod tests {
         client: KetoClient,
     }
 
-    /// Attempt to reach the shared dev Keto. Returns `None` and prints a
-    /// message if unreachable so tests skip gracefully (no panic on CI when
-    /// the compose stack is down).
+    /// Try to reach the shared dev Keto. Returns `None` and prints a message if
+    /// it is unreachable, so tests skip gracefully instead of panicking when
+    /// the compose stack is down.
     async fn probe() -> Option<KetoCtx> {
         let grpc_endpoint =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
@@ -183,7 +180,7 @@ mod tests {
     }
 
     /// Seed `n` tuples for `subject` in `NS`/`RELATION`, each with a unique
-    /// object derived from `base_id`.  Returns the set of seeded object IDs.
+    /// object derived from `base_id`. Returns the list of seeded object IDs.
     async fn seed_tuples(ctx: &KetoCtx, subject: &str, base_id: &str, n: u32) -> Vec<String> {
         let mut objects = Vec::with_capacity(n as usize);
         for i in 0..n {
@@ -211,7 +208,7 @@ mod tests {
         }
     }
 
-    /// A subject with no tuples → empty set, no error.
+    /// A subject with no tuples gets an empty set and no error.
     #[tokio::test]
     async fn expand_returns_empty_set_for_unknown_subject() {
         let Some(ctx) = probe().await else { return };
@@ -234,7 +231,7 @@ mod tests {
         assert!(result.is_empty(), "expected empty set, got {result:?}");
     }
 
-    /// 5 tuples with page_size=2 → 3 pages, all 5 objects returned.
+    /// Five tuples with page_size=2 spans three pages and returns all objects.
     #[tokio::test]
     async fn expand_paginates_when_results_exceed_page() {
         let Some(ctx) = probe().await else { return };
@@ -263,7 +260,7 @@ mod tests {
         cleanup(&ctx, &subject).await;
     }
 
-    /// 5 tuples, max_results=3 → Err before fetching beyond the ceiling.
+    /// Five tuples with max_results=3 errors before fetching beyond the ceiling.
     #[tokio::test]
     async fn expand_errors_when_exceeds_ceiling() {
         let Some(ctx) = probe().await else { return };
@@ -294,7 +291,7 @@ mod tests {
         cleanup(&ctx, &subject).await;
     }
 
-    /// max_results=0 errors immediately without fetching.
+    /// max_results=0 errors immediately without fetching anything.
     #[tokio::test]
     async fn expand_errors_when_max_results_is_zero() {
         let Some(ctx) = probe().await else { return };
@@ -323,7 +320,7 @@ mod tests {
         );
     }
 
-    /// page sizes above Keto's 1000 cap are truncated internally.
+    /// Page sizes above Keto's 1000 cap are truncated internally.
     #[tokio::test]
     async fn expand_caps_page_size_at_1000() {
         let Some(ctx) = probe().await else { return };

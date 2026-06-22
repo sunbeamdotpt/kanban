@@ -1,13 +1,14 @@
-//! TemplatesService — reusable board and card templates.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Board and card templates.
 //!
-//! Templates are project-owned resources. Global templates (no `project_id`) are
-//! read-only and visible to every authenticated user. Project-scoped templates
-//! inherit the parent project's KanbanProject permissions:
-//!   * `view`  → list / get
-//!   * `manage` → create / update / delete
+//! Templates are project-owned resources. Global templates have no
+//! `project_id`, are read-only, and are visible to every authenticated user.
+//! Project-scoped templates reuse the parent project's permissions:
+//!   * `view`  → list and get
+//!   * `manage` → create, update, and delete
 //!
-//! Dynamic sqlx API is used throughout so `cargo check` does not require a live
-//! `DATABASE_URL`.
+//! The dynamic `sqlx` API is used throughout, so `cargo check` works without a
+//! live database connection.
 
 use std::sync::Arc;
 
@@ -718,7 +719,7 @@ mod tests {
         }
     }
 
-    /// Build an authenticated request carrying a subject in extensions.
+    /// Build a request with an authenticated subject in its extensions.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
         req.extensions_mut()
@@ -726,7 +727,7 @@ mod tests {
         req
     }
 
-    /// Seed a minimal project row and grant the test subject manage/view on it.
+    /// Create a minimal project and grant the test subject manage and view on it.
     async fn create_test_project(pool: &PgPool, keto: &KetoClient, subject: &str) -> Uuid {
         let project_id = Uuid::new_v4();
         let slug = format!("tp-{}", &project_id.to_string()[..8]);

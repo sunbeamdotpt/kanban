@@ -1,7 +1,9 @@
-//! Compatibility helpers for KetoClient methods missing from sunbeam-g2v 0.1.1.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Compatibility helpers for KetoClient methods not yet available in the
+//! published sunbeam-g2v crate.
 //!
-//! The crates.io release of sunbeam-g2v does not include `list_relation_tuples`
-//! or `delete_relation_tuples`, so we implement them here using the generated
+//! The current crates.io release of sunbeam-g2v omits `list_relation_tuples`
+//! and `delete_relation_tuples`, so we provide them here using the generated
 //! gRPC clients from our local proto build.
 
 use crate::keto_proto::{
@@ -14,7 +16,7 @@ use tonic::transport::Channel;
 
 use crate::auth::keto_retry::retry;
 
-/// List relation tuples from Keto ReadService.
+/// List relation tuples from Keto's ReadService.
 pub async fn list_relation_tuples(
     client: &KetoClient,
     namespace: &str,
@@ -55,7 +57,7 @@ pub async fn list_relation_tuples(
     Ok((resp.relation_tuples, resp.next_page_token))
 }
 
-/// Delete relation tuples from Keto WriteService.
+/// Delete relation tuples from Keto's WriteService.
 pub async fn delete_relation_tuples(
     client: &KetoClient,
     namespace: &str,

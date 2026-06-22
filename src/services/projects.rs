@@ -1,18 +1,18 @@
-//! ProjectService — Stage 3a + 4c implementation.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! ProjectService implementation.
 //!
-//! Stage 4c: `SubscribeProject` returns `unimplemented` pending Stage 4c.5
-//! (per-project multi-board merge via `tokio_stream::StreamExt::merge` /
-//! `select_all` over per-board streams enumerated from
-//! `keto_expand_objects(KanbanBoard, view, subject)`).
+//! Handles project lifecycle and membership. All permission changes are
+//! written to Keto first, then mirrored to the `project_members` table.
+//! If the SQL write fails after Keto succeeds, we log a `mirror_drift`
+//! warning so the background reconciler can catch up.
 //!
 // (original doc below)
 //!
-//! Mirror-table write order: Keto FIRST, then SQL. If the SQL insert fails
-//! after a successful Keto write, we log a `mirror_drift` warning and let
-//! the hourly reconciler (Stage 7a) catch it. This matches Pre-mortem 5.
+//! `SubscribeProject` is intentionally left unimplemented for now; it will
+//! eventually merge live streams from every board visible to the caller.
 //!
-//! Dynamic sqlx API (no compile-time macros) is used throughout so that
-//! `cargo check` does not require a live DATABASE_URL at build time.
+//! Uses the dynamic sqlx API (no macros) so the crate builds without a
+//! live DATABASE_URL.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -86,7 +86,7 @@ fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
 }
 
-/// Build a `Project` proto from a raw sqlx Row.
+/// Convert a Postgres row into a `Project` proto.
 fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
     let id: Uuid = row.get("id");
     let name: String = row.get("name");
@@ -108,7 +108,7 @@ fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
     }
 }
 
-/// Build a `ProjectMember` proto from a raw sqlx Row.
+/// Convert a Postgres row into a `ProjectMember` proto.
 fn member_from_row(row: &sqlx::postgres::PgRow) -> ProjectMember {
     let project_id: Uuid = row.get("project_id");
     let user_id: String = row.get("user_id");
@@ -642,7 +642,7 @@ mod tests {
         }
     }
 
-    /// Build an authenticated request carrying a subject in extensions.
+    /// Create an authenticated request that only carries the caller subject.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
         req.extensions_mut()
@@ -650,7 +650,7 @@ mod tests {
         req
     }
 
-    /// Build an authenticated request that also carries a `CheckedObjectId`.
+    /// Create an authenticated request that also carries a `CheckedObjectId`.
     fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
         let mut req = authed_request(body, subject);
         req.extensions_mut()
@@ -658,7 +658,7 @@ mod tests {
         req
     }
 
-    /// Clean up Keto tuples seeded for a test subject across all relations.
+    /// Remove every Keto relation tuple a test may have created for a subject.
     async fn cleanup_keto_for_subject(keto: &KetoClient, subject: &str) {
         for relation in &["owner", "view", "edit", "manage", "administer"] {
             let _ = crate::auth::keto_compat::delete_relation_tuples(
@@ -671,7 +671,7 @@ mod tests {
         }
     }
 
-    /// Delete a project row directly for test cleanup.
+    /// Delete a project row directly during test cleanup.
     async fn cleanup_project(pool: &PgPool, project_id: Uuid) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
@@ -1239,7 +1239,7 @@ mod tests {
 
     // ── Stage 4c SubscribeProject tests ──────────────────────────────────────
 
-    /// SubscribeProject returns Unimplemented (pending Stage 4c.5).
+    /// SubscribeProject is not implemented yet and returns `Unimplemented`.
     #[tokio::test]
     async fn subscribe_project_returns_unimplemented_pending_stage_4c5() {
         let pool = setup_pool().await;

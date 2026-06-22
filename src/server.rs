@@ -1,17 +1,12 @@
-//! Kanban service bootstrap — Stage 2c.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Bootstrap for the Kanban service.
 //!
-//! Boot sequence:
-//!   1. Load config from env.
-//!   2. Init OTel tracing + metrics.
-//!   3. Connect to Postgres; run sqlx migrations.
-//!   4. Connect to NATS; bootstrap KANBAN_BOARD_EVENTS stream (fatal on failure).
-//!   5. Connect to Valkey; construct LogoutWatermark.
-//!   6. Connect to Keto; synthetic readiness tuple write-if-absent.
-//!   7. Declare Prometheus metrics.
-//!   8. Build axum Router with health, metrics, and tonic gRPC fallback.
-//!   9. Apply middleware stack (outer→inner): tracing → prometheus → JwtLayer →
-//!      keto_dispatch → service routing.
-//!  10. Bind to KANBAN_PORT; serve until SIGTERM.
+//! This is where the whole process comes together: load configuration from the
+//! environment, set up OpenTelemetry tracing, connect to Postgres and run
+//! migrations, bootstrap the NATS JetStream board-events stream, start the
+//! Valkey-backed logout watermark, warm up the Keto readiness tuple, register
+//! Prometheus metrics, build the axum router, and finally start listening on
+//! `KANBAN_PORT` until the process receives a shutdown signal.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,19 +59,19 @@ use crate::services::{
 #[derive(Clone)]
 pub struct KanbanMetrics {
     pub registry: Arc<Registry>,
-    /// `kanban_keto_check_total{result}` — result ∈ {allow, deny, error}
+    /// Counter for Keto permission checks, labeled `result` (allow, deny, or error).
     pub keto_check_total: CounterVec,
-    /// `kanban_logout_watermark_errors_total`
+    /// Total errors while reading the logout watermark from Valkey.
     pub logout_watermark_errors_total: prometheus::Counter,
-    /// `kanban_subscribe_active_streams`
+    /// Number of active board subscription streams.
     pub subscribe_active_streams: prometheus::Gauge,
-    /// `kanban_jet_stream_lag_seconds`
+    /// JetStream consumer lag in seconds, labeled by board.
     pub jet_stream_lag_seconds: GaugeVec,
-    /// `kanban_mirror_drift_ratio`
+    /// Fraction of `project_member_view` rows that differ from Keto.
     pub mirror_drift_ratio: prometheus::Gauge,
-    /// `kanban_rpc_duration_seconds{service,method}`
+    /// Histogram of gRPC handler durations, labeled by service and method.
     pub rpc_duration_seconds: HistogramVec,
-    /// `kanban_rpc_total{service,method,status}`
+    /// Total gRPC requests, labeled by service, method, and status.
     pub rpc_total: CounterVec,
 }
 
@@ -165,8 +160,8 @@ async fn healthz_live() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// `/healthz/ready` — 200 only after the synthetic `_kanban_health` Keto tuple
-/// check passes. 503 otherwise.
+/// Ready probe. Returns 200 once Keto confirms the synthetic `_kanban_health`
+/// tuple is present; otherwise returns 503.
 async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
     match state
         .keto
@@ -190,7 +185,7 @@ async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// `/metrics` — render Prometheus text format.
+/// Serve Prometheus metrics in text format.
 async fn metrics_handler(State(state): State<AppState>) -> (StatusCode, String) {
     let encoder = TextEncoder::new();
     let mf = state.metrics.registry.gather();
@@ -548,10 +543,10 @@ fn init_otel_tracing() -> Result<()> {
 
 // ── Keto health tuple ────────────────────────────────────────────────────────
 
-/// Ensure the synthetic `_kanban_health` readiness tuple exists.
+/// Make sure the synthetic `_kanban_health` readiness tuple exists in Keto.
 ///
-/// Tries to read first; if absent, writes once. If write fails, returns Err
-/// (which panics the service — correct per the plan's fatal-on-failure policy).
+/// Reads first and writes only if the tuple is missing. A write failure is
+/// treated as fatal and stops startup.
 async fn ensure_keto_health_tuple(keto: &KetoClient) -> Result<()> {
     let present = keto
         .check_permission(
@@ -747,12 +742,17 @@ mod tests {
 
         let handle = tokio::spawn(async move { run_with_config(config, listener, shutdown).await });
 
-        // Wait for migrations + service startup.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        let resp = reqwest::get(format!("http://{local_addr}/healthz/live"))
-            .await
-            .expect("should reach health endpoint");
+        // Wait for migrations + service startup, polling the health endpoint.
+        let health_url = format!("http://{local_addr}/healthz/live");
+        let mut resp = None;
+        for _ in 0..50 {
+            if let Ok(r) = reqwest::get(&health_url).await {
+                resp = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let resp = resp.expect("should reach health endpoint within 10s");
         assert_eq!(resp.status(), StatusCode::OK);
 
         tx.send(()).ok();

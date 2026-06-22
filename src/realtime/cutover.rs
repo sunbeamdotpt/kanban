@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Cutover state machine for `SubscribeBoard` streams.
 //!
 //! Tracks the replay → live transition for a single board subscription and
@@ -5,30 +6,30 @@
 //!
 //! ## Stream lifecycle
 //!
-//! 1. **Replay phase**: server emits snapshot events with `nats_seq = 0`
+//! 1. **Replay phase**: the server emits snapshot events with `nats_seq = 0`
 //!    (synthetic). Each event carries a stable ULID `event_id`.
-//! 2. **Cutover envelope**: server emits `Cutover { last_replay_nats_seq }`.
+//! 2. **Cutover envelope**: the server emits `Cutover { last_replay_nats_seq }`.
 //!    The caller drives this by calling [`CutoverTracker::cutover_to_live`].
-//! 3. **Live phase**: server emits real JetStream events with monotone
+//! 3. **Live phase**: the server emits real JetStream events with monotone
 //!    `nats_seq`. The server guarantees `nats_seq` is strictly increasing
 //!    within a well-behaved stream; [`Outcome::OutOfOrder`] surfaces
 //!    violations.
 //!
 //! ## Dedupe policy
 //!
-//! The tracker maintains a bounded set of the last 1 024 `event_id`s seen
-//! (ring buffer). If an `event_id` arrives that is already in the set, the
-//! event is dropped ([`Outcome::Drop`]). This covers:
+//! The tracker keeps the last 1 024 `event_id`s seen in a ring buffer. If an
+//! `event_id` arrives that is already in the set, the event is dropped
+//! ([`Outcome::Drop`]). This covers:
 //!
 //! - Snapshot events replayed a second time on reconnect.
-//! - Live events whose `nats_seq` falls within the snapshot window
-//!   (Pre-mortem 3 / optimistic-mutation + stream-replay drift).
+//! - Live events whose `nats_seq` falls within the snapshot window caused by
+//!   optimistic mutations racing with stream replay.
 //!
 //! ## Note on `observe_live` during Replay phase
 //!
 //! Calling `observe_live` before `cutover_to_live` returns
-//! [`Outcome::OutOfOrder`]. The Stage 4c handler must buffer or discard
-//! live-tail messages that arrive during snapshot emission.
+//! [`Outcome::OutOfOrder`]. The subscription handler must buffer or discard
+//! live-tail messages that arrive while the snapshot is being emitted.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -334,8 +335,8 @@ mod tests {
     /// `observe_live` called during the Replay phase returns OutOfOrder.
     ///
     /// Rationale: live-tail messages that arrive while the snapshot is still
-    /// being emitted must not be forwarded to the client; the Stage 4c handler
-    /// is expected to buffer them until after `cutover_to_live`.
+    /// being emitted must not be forwarded to the client; the handler is
+    /// expected to buffer them until after `cutover_to_live`.
     #[test]
     fn phase_replay_rejects_observe_live() {
         let mut t = CutoverTracker::new();

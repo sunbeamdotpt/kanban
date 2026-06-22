@@ -1,16 +1,17 @@
-//! Shared visibility helpers for boards and aggregated boards.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Visibility helpers shared by boards and aggregated boards.
 //!
-//! Visibility is stored in Postgres as a lowercase string and exposed in Protobuf
-//! as `BoardVisibility`. This module keeps the mapping in one place.
+//! Postgres stores visibility as a lowercase string, while protobuf represents it
+//! as `BoardVisibility`. This module keeps the two representations in sync.
 
 const VIS_PRIVATE: &str = "private";
 const VIS_INTERNAL: &str = "internal";
 const VIS_PUBLIC: &str = "public";
 
-/// Default visibility for newly created boards / aggregates.
+/// Default visibility for new boards and aggregated boards.
 pub const DEFAULT_VISIBILITY: &str = VIS_PRIVATE;
 
-/// Convert a proto `BoardVisibility` enum value to the Postgres string.
+/// Map a protobuf `BoardVisibility` value to its Postgres string.
 pub fn proto_to_db(v: i32) -> &'static str {
     match v {
         2 => VIS_INTERNAL,
@@ -19,7 +20,7 @@ pub fn proto_to_db(v: i32) -> &'static str {
     }
 }
 
-/// Convert a Postgres visibility string to a proto `BoardVisibility` enum value.
+/// Map a Postgres visibility string back to a protobuf `BoardVisibility` value.
 pub fn db_to_proto(s: &str) -> i32 {
     match s {
         VIS_INTERNAL => 2,
@@ -28,12 +29,12 @@ pub fn db_to_proto(s: &str) -> i32 {
     }
 }
 
-/// True when the visibility level is visible to any authenticated user.
+/// Returns true if the visibility is public or internal.
 pub fn is_public_or_internal(s: &str) -> bool {
     s == VIS_PUBLIC || s == VIS_INTERNAL
 }
 
-/// True when the visibility level is public (visible without authentication).
+/// Returns true if the visibility is public.
 pub fn is_public(s: &str) -> bool {
     s == VIS_PUBLIC
 }

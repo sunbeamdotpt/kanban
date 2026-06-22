@@ -1,18 +1,19 @@
-//! AttachmentService — Stage 3d implementation.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Attachment uploads and downloads.
 //!
-//! Upload flow:
-//!   1. RequestPresignedUpload → INSERT pending row, return SigV4 PUT URL.
-//!   2. Client PUTs file directly to SeaweedFS.
-//!   3. ConfirmUpload → HEAD S3 object, UPDATE row to ready.
+//! Flow:
+//!   1. `RequestPresignedUpload` creates a pending row and returns a SigV4 PUT URL.
+//!   2. The client uploads the file directly to S3.
+//!   3. `ConfirmUpload` checks the object exists and marks the row ready.
 //!
-//! Auth: the x-sunbeam-object-id header carries the *card_id*. The dispatch
-//! matrix authorises the card. Handlers that receive an attachment_id in the
-//! body verify that attachment.card_id == CheckedObjectId (card_id), closing
-//! the header-vs-body bypass class.
+//! Authorization uses the `x-sunbeam-object-id` header to carry the card id.
+//! The Keto dispatch matrix checks that card, and handlers receiving an
+//! `attachment_id` in the body also verify the attachment belongs to that
+//! card so the body cannot override the header.
 //!
-//! Schema note: the card_attachments table uses `mimetype`, `size`, `created_at`
-//! (not `mime_type`, `size_bytes`, `uploaded_at`) — all SQL queries use the
-//! actual column names.
+//! The `card_attachments` table stores `mimetype`, `size`, and `created_at`
+//! (not `mime_type`, `size_bytes`, or `uploaded_at`), so all SQL uses the
+//! real column names.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,9 +40,9 @@ use crate::pb::{
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Presigned PUT URL validity: 15 minutes.
+/// Lifetime of a presigned PUT URL (15 minutes).
 const UPLOAD_EXPIRES_SECS: u64 = 900;
-/// Presigned GET URL validity: 5 minutes.
+/// Lifetime of a presigned GET URL (5 minutes).
 const DOWNLOAD_EXPIRES_SECS: u64 = 300;
 
 // ── Service struct ───────────────────────────────────────────────────────────
@@ -431,9 +432,8 @@ mod tests {
             .await;
     }
 
-    /// Seeds project → board → column → card chain and returns the card_id.
-    /// Delegates to `test_support::seed_card_chain`; extracts card_id for
-    /// backwards compatibility with existing test call sites.
+    /// Create a project, board, column, and card for tests and return the card id.
+    /// Wraps `test_support::seed_card_chain` so existing tests can call it directly.
     async fn seed_card_chain(pool: &PgPool) -> Uuid {
         let (_project_id, _board_id, _column_id, card_id) =
             crate::test_support::seed_card_chain(pool).await;

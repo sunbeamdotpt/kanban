@@ -1,7 +1,9 @@
-//! Stage-3 stub service implementations.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Service module exports.
 //!
-//! Every service returns `Unimplemented` until Stage 3 fills them in.
-//! The stubs live here so the server can register them and the binary compiles.
+//! Each submodule implements one of the kanban gRPC services defined in
+//! `proto/sunbeam/kanban/v1`. This file simply re-exports them so the
+//! server can register them with Tonic.
 
 pub mod aggregated_boards;
 pub mod attachments;

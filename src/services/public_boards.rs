@@ -1,9 +1,9 @@
-//! PublicBoardService — unauthenticated read-only access to public boards.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Public, unauthenticated read access to boards.
 //!
-//! This service is mounted on a separate Axum router that does not run the
-//! `JwtLayer` or `keto_dispatch` middleware. Every handler must independently
-//! verify that the requested board's visibility is exactly `public` before
-//! returning it.
+//! Mounted on its own Axum router without `JwtLayer` or `keto_dispatch`, so
+//! every handler must confirm the requested board's visibility is exactly
+//! `public` before returning anything.
 
 use sqlx::Row;
 use tonic::{Request, Response, Status};
