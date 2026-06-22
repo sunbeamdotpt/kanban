@@ -7,7 +7,7 @@ targets:
   build:
     exec: "cargo build --release"
   test:
-    exec: [cargo, nextest, run]
+    exec: [cargo, test]
   lint:
     exec: "cargo clippy -- -D warnings"
   fmt:
