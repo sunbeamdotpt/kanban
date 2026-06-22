@@ -2,3 +2,11 @@
 **/*.rs.bk
 .env
 .DS_Store
+
+# Coverage artifacts (cargo-llvm-cov / lcov)
+*.profraw
+*.profdata
+*.lcov
+coverage/
+coverage-html/
+
