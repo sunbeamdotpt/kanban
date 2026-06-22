@@ -1,25 +1,25 @@
-//! Shared test helpers for kanban integration tests.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Shared helpers for integration tests.
 //!
-//! All helpers here are `#[cfg(test)]` — they are compiled only during
-//! `cargo test`. The module is declared as `#[cfg(test)] pub(crate) mod
-//! test_support` in `lib.rs` so every service module can re-use the seeders
-//! without duplicating the FK-chain SQL.
+//! These helpers are only compiled during `cargo test`. They live in a
+//! `#[cfg(test)]` module so every service can reuse seeders without copying the
+//! foreign-key SQL needed to set up a test row.
 //!
 //! # Seeder contract
 //!
-//! Each `seed_*` function allocates fresh UUIDs so parallel test tasks
-//! (nextest runs each test in isolation) never collide on unique constraints.
+//! Every `seed_*` function generates fresh UUIDs, so tests running in parallel
+//! (for example under nextest) never collide on unique constraints.
 //!
 //! # Teardown
 //!
-//! Tests are responsible for their own cleanup. The seeders do not run
-//! inside a transaction that gets rolled back — we hit a shared dev
-//! Postgres instance and rely on unique UUIDs to keep tests independent.
+//! Tests clean up after themselves. The seeders do not wrap inserts in a
+//! transaction that gets rolled back; instead we rely on random UUIDs to keep
+//! tests isolated on a shared Postgres instance.
 
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-/// Seed a minimal project row. Returns the new `project_id`.
+/// Create a minimal project and return its id.
 pub(crate) async fn seed_project(pool: &PgPool) -> Uuid {
     let project_id = Uuid::new_v4();
     let suffix = project_id.simple().to_string();
@@ -38,7 +38,7 @@ pub(crate) async fn seed_project(pool: &PgPool) -> Uuid {
     project_id
 }
 
-/// Seed a minimal board row under `project_id`. Returns the new `board_id`.
+/// Create a minimal board under `project_id` and return its id.
 pub(crate) async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
     let board_id = Uuid::new_v4();
     let suffix = board_id.simple().to_string();
@@ -58,7 +58,7 @@ pub(crate) async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
     board_id
 }
 
-/// Seed a minimal column row under `board_id`. Returns the new `column_id`.
+/// Create a minimal column under `board_id` and return its id.
 pub(crate) async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
     let column_id = Uuid::new_v4();
 
@@ -75,8 +75,8 @@ pub(crate) async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
     column_id
 }
 
-/// Seed a minimal card row under `board_id` / `column_id` / `project_id`.
-/// Returns the new `card_id`.
+/// Create a minimal card under `board_id`, `column_id`, and `project_id` and
+/// return its id.
 pub(crate) async fn seed_card(
     pool: &PgPool,
     board_id: Uuid,
@@ -104,10 +104,10 @@ pub(crate) async fn seed_card(
     card_id
 }
 
-/// Seed a full project → board → column → card chain.
-/// Returns `(project_id, board_id, column_id, card_id)`.
+/// Create a complete project → board → column → card chain.
 ///
-/// Each call is independent (fresh UUIDs) so parallel tests don't collide.
+/// Returns `(project_id, board_id, column_id, card_id)` with fresh UUIDs so
+/// parallel tests stay independent.
 pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
     let project_id = seed_project(pool).await;
     let board_id = seed_board(pool, project_id).await;
@@ -118,7 +118,7 @@ pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
 
 /// Insert a raw `event_log` row for testing the outbox dispatcher.
 ///
-/// Returns the inserted row's `id` (UUID).
+/// Returns the inserted row's id.
 pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Uuid, event_type: &str) -> Uuid {
     let row = sqlx::query(
         "INSERT INTO event_log (id, board_id, event_type, payload, created_at)
@@ -134,8 +134,9 @@ pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Uuid, event_type: &s
     row.get("id")
 }
 
-/// Insert a raw `event_log` row that is already dispatched (nats_seq set).
-/// Returns the inserted row's `id`.
+/// Insert a raw `event_log` row that is already marked as dispatched.
+///
+/// Returns the inserted row's id.
 pub(crate) async fn seed_event_log_dispatched(
     pool: &PgPool,
     board_id: Uuid,
@@ -158,14 +159,15 @@ pub(crate) async fn seed_event_log_dispatched(
     row.get("id")
 }
 
-/// Standard DATABASE_URL resolver for integration tests.
-/// Falls back to a sensible dev-compose default.
+/// Return the `DATABASE_URL` for integration tests, falling back to a sensible
+/// dev-compose default.
 pub(crate) fn database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
 }
 
-/// Standard NATS URL resolver for integration tests.
+/// Return the `NATS_URL` for integration tests, falling back to a sensible
+/// dev-compose default.
 pub(crate) fn nats_url() -> String {
     std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
 }
@@ -198,13 +200,13 @@ pub(crate) mod containers {
     use testcontainers::core::{ContainerPort, IntoContainerPort};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use tokio::sync::OnceCell;
+    use tokio::sync::Mutex;
     use tokio::time::sleep;
 
     use crate::auth::logout_watermark::LogoutWatermark;
     use crate::integrations::s3::{S3Client, S3Config};
 
-    /// Container images used by the harness. Override via environment variables.
+    /// Default container images for the harness. Override them with environment variables if needed.
     const POSTGRES_IMAGE: &str = match option_env!("KANBAN_TEST_POSTGRES_IMAGE") {
         Some(s) => s,
         None => "mirror.gcr.io/library/postgres:16-alpine",
@@ -232,7 +234,7 @@ pub(crate) mod containers {
 
     const MINIO_BUCKET: &str = "sunbeam-kanban";
 
-    /// Live dependency clients used by a single integration test.
+    /// Clients for a single test's dependencies.
     ///
     /// A fresh `TestInfra` is returned on every call so that each test owns
     /// its own Postgres pool and clients. The heavy container handles are kept
@@ -260,21 +262,122 @@ pub(crate) mod containers {
         _opensearch: Option<ContainerAsync<GenericImage>>,
     }
 
-    static SHARED: OnceCell<SharedInfra> = OnceCell::const_new();
+    /// Clonable snapshot of the shared service URLs.
+    struct SharedUrls {
+        database_url: String,
+        nats_url: String,
+        valkey_url: String,
+        keto_read_url: String,
+        keto_write_url: String,
+    }
 
-    /// Build or reuse the shared test infrastructure and return a fresh
-    /// `TestInfra` for the calling test.
+    impl SharedInfra {
+        fn urls(&self) -> SharedUrls {
+            SharedUrls {
+                database_url: self.database_url.clone(),
+                nats_url: self.nats_url.clone(),
+                valkey_url: self.valkey_url.clone(),
+                keto_read_url: self.keto_read_url.clone(),
+                keto_write_url: self.keto_write_url.clone(),
+            }
+        }
+    }
+
+    static SHARED: Mutex<Option<SharedInfra>> = Mutex::const_new(None);
+    static CONTAINER_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Set up the shared test infrastructure and return a fresh `TestInfra`
+    /// for the calling test.
     pub async fn setup() -> TestInfra {
-        let shared = SHARED
-            .get_or_init(|| async {
-                if let Some(infra) = from_env().await {
-                    return infra;
-                }
-                start_containers().await
-            })
-            .await;
+        let urls = {
+            let mut guard = SHARED.lock().await;
+            if guard.is_none() {
+                let infra = if let Some(infra) = from_env().await {
+                    infra
+                } else {
+                    start_containers().await
+                };
+                *guard = Some(infra);
+            }
+            let infra = guard.as_ref().expect("shared infra initialized above");
+            infra.urls()
+        };
 
-        build_test_infra(shared).await
+        build_test_infra(
+            &urls.database_url,
+            &urls.nats_url,
+            &urls.valkey_url,
+            &urls.keto_read_url,
+            &urls.keto_write_url,
+        )
+        .await
+    }
+
+    /// Stop and remove every container started by this harness.
+    ///
+    /// This is synchronous so it can be called from `#[ctor::dtor]` at process
+    /// exit. Containers are removed with `container rm -f` (falling back to
+    /// `docker rm -f`) so the runtime's async context does not matter.
+    pub fn teardown() {
+        let ids: Vec<String> = match CONTAINER_IDS.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+
+        for id in ids {
+            remove_container(&id);
+        }
+    }
+
+    fn remove_container(id: &str) {
+        // Prefer the Docker-compatible API over the local CLI. The Apple
+        // Container `container` binary uses UUIDs in its UI that do not match
+        // the ids returned by testcontainers, but the unix socket still speaks
+        // the Docker Engine API and accepts the id we have.
+        if let Ok(docker_host) = std::env::var("DOCKER_HOST") {
+            if docker_host.starts_with("unix://") {
+                let path = &docker_host["unix://".len()..];
+                if api_remove(path, id) {
+                    eprintln!("[testcontainers] removed container {id}");
+                    return;
+                }
+            }
+        }
+
+        // Fall back to whichever container CLI is available.
+        for binary in ["container", "docker"] {
+            let output = std::process::Command::new(binary)
+                .args(["rm", "-f", id])
+                .output();
+            if let Ok(output) = output {
+                if output.status.success() {
+                    eprintln!("[testcontainers] removed container {id}");
+                    return;
+                }
+            }
+        }
+        eprintln!("[testcontainers] failed to remove container {id}");
+    }
+
+    fn api_remove(socket_path: &str, id: &str) -> bool {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let request = format!(
+            "DELETE /containers/{id}?force=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let mut stream = match UnixStream::connect(socket_path) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut response = String::new();
+        if stream.read_to_string(&mut response).is_err() {
+            return false;
+        }
+        response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.1 404")
     }
 
     /// Use externally-provided services when the standard env vars are set.
@@ -339,6 +442,16 @@ pub(crate) mod containers {
         let opensearch = start_opensearch(startup_timeout).await;
         let opensearch_ip = bridge_ip(&opensearch).await;
         let opensearch_url = format!("http://{opensearch_ip}:9200");
+
+        {
+            let mut ids = CONTAINER_IDS.lock().unwrap();
+            ids.push(pg.id().to_string());
+            ids.push(nats.id().to_string());
+            ids.push(valkey.id().to_string());
+            ids.push(keto.id().to_string());
+            ids.push(minio.id().to_string());
+            ids.push(opensearch.id().to_string());
+        }
 
         // Export the service URLs as environment variables so that tests that
         // spin up their own clients (e.g. auth::keto_dispatch integration tests)
@@ -694,15 +807,20 @@ serve:
 
     /// Build a fresh `TestInfra` from the shared URLs so each test owns its own
     /// connections and is isolated from other parallel tests.
-    async fn build_test_infra(shared: &SharedInfra) -> TestInfra {
-        let pool = connect_pool(&shared.database_url).await;
-        let nats = connect_nats(&shared.nats_url).await;
-        let watermark =
-            Arc::new(LogoutWatermark::new(&shared.valkey_url).expect("LogoutWatermark::new"));
+    async fn build_test_infra(
+        database_url: &str,
+        nats_url: &str,
+        valkey_url: &str,
+        keto_read_url: &str,
+        keto_write_url: &str,
+    ) -> TestInfra {
+        let pool = connect_pool(database_url).await;
+        let nats = connect_nats(nats_url).await;
+        let watermark = Arc::new(LogoutWatermark::new(valkey_url).expect("LogoutWatermark::new"));
         let keto = Arc::new(KetoClient::new(
             sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: shared.keto_read_url.clone(),
-                write_grpc_endpoint: shared.keto_write_url.clone(),
+                grpc_endpoint: keto_read_url.to_string(),
+                write_grpc_endpoint: keto_write_url.to_string(),
             },
         ));
 

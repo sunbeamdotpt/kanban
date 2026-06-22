@@ -1,4 +1,5 @@
-//! Kanban service library.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Library for the Sunbeam Kanban backend.
 #![recursion_limit = "512"]
 #![deny(dead_code)]
 #![deny(unused)]
@@ -25,15 +26,28 @@ pub mod services;
 pub(crate) mod test_support;
 
 #[cfg(test)]
+static TEST_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 #[ctor::ctor]
 fn init_test_containers() {
     // Start the shared testcontainers stack once per test process. This sets
     // the standard service env vars (DATABASE_URL, NATS_URL, VALKEY_URL, ...)
-    // before any test reads them.
-    let rt = tokio::runtime::Runtime::new().expect("test runtime");
+    // before any test reads them. Keep the runtime alive in a static so the
+    // container handles (which are bound to it) can be stopped cleanly at exit.
+    let rt = TEST_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"));
     rt.block_on(async {
         let _ = crate::test_support::containers::setup().await;
     });
+}
+
+#[cfg(test)]
+#[ctor::dtor]
+fn teardown_test_containers() {
+    // Stop and remove the containers started by `setup()` so the host is not
+    // left with dangling containers after the test process exits. The removal
+    // runs the container CLI directly, so it does not need a Tokio runtime.
+    crate::test_support::containers::teardown();
 }
 
 #[cfg(test)]
