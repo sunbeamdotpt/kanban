@@ -48,3 +48,65 @@ impl GithubLinkService for GitHubServiceImpl {
         Err(Status::unimplemented("Stage 3 stub"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unimplemented_status<T>(result: Result<Response<T>, Status>) -> String {
+        match result {
+            Err(e) => e.message().to_string(),
+            Ok(_) => panic!("expected unimplemented status"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_issue_returns_unimplemented() {
+        let svc = GitHubServiceImpl;
+        let status = unimplemented_status(
+            svc.link_issue(Request::new(LinkGitHubIssueRequest::default()))
+                .await,
+        );
+        assert!(status.contains("Stage 3 stub"));
+    }
+
+    #[tokio::test]
+    async fn unlink_issue_returns_unimplemented() {
+        let svc = GitHubServiceImpl;
+        let status = unimplemented_status(
+            svc.unlink_issue(Request::new(UnlinkGitHubIssueRequest::default()))
+                .await,
+        );
+        assert!(status.contains("Stage 3 stub"));
+    }
+
+    #[tokio::test]
+    async fn list_links_by_card_returns_unimplemented() {
+        let svc = GitHubServiceImpl;
+        let status = unimplemented_status(
+            svc.list_links_by_card(Request::new(ListGitHubLinksByCardRequest::default()))
+                .await,
+        );
+        assert!(status.contains("Stage 3 stub"));
+    }
+
+    #[tokio::test]
+    async fn search_github_issues_returns_unimplemented() {
+        let svc = GitHubServiceImpl;
+        let status = unimplemented_status(
+            svc.search_github_issues(Request::new(SearchGithubIssuesRequest::default()))
+                .await,
+        );
+        assert!(status.contains("Stage 3 stub"));
+    }
+
+    #[tokio::test]
+    async fn resync_link_returns_unimplemented() {
+        let svc = GitHubServiceImpl;
+        let status = unimplemented_status(
+            svc.resync_link(Request::new(ResyncGitHubLinkRequest::default()))
+                .await,
+        );
+        assert!(status.contains("Stage 3 stub"));
+    }
+}
