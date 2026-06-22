@@ -3,10 +3,12 @@
 # Multi-stage, multi-architecture build for the Kanban backend.
 #
 # Build for a single platform:
-#   docker buildx build --platform linux/amd64 -f Dockerfile -t src.sunbeam.pt/studio/kanban:latest .
+#   docker buildx build --platform linux/amd64 -f Dockerfile -t ghcr.io/sunbeamdotpt/sunbeam/kanban:v1.0-rc0 .
 #
 # Build for both platforms:
-#   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t src.sunbeam.pt/studio/kanban:latest .
+#   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/sunbeam/kanban:v1.0-rc0 .
+
+ARG VERSION=0.1.0
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 
@@ -48,11 +50,14 @@ RUN --mount=type=cache,target=/root/.cargo/git/db \
 # Runtime image: distroless with root CA certs and a non-root user.
 FROM gcr.io/distroless/cc-debian12:nonroot
 
+ARG VERSION
+
 # OCI annotations so GHCR autolinks the image to the repository.
 LABEL org.opencontainers.image.title="kanban" \
       org.opencontainers.image.description="Sunbeam Kanban backend service" \
       org.opencontainers.image.url="https://github.com/sunbeamdotpt/sunbeam/tree/mainline/apps/kanban" \
       org.opencontainers.image.source="https://github.com/sunbeamdotpt/sunbeam.git" \
+      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 COPY --from=builder /app/kanban /usr/local/bin/kanban
