@@ -728,4 +728,111 @@ mod tests {
 
         cleanup(&pool, board_id, project_id).await;
     }
+
+    // ── Pure helper tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn build_envelope_populates_fields() {
+        let row_id = Uuid::new_v4();
+        let board_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let payload = serde_json::json!({
+            "card_id": "card-1",
+            "actor_subject": "user:alice"
+        });
+
+        let env = build_envelope(row_id, board_id, "CardCreated", &payload, created_at);
+
+        assert_eq!(env.board_id, board_id.to_string());
+        assert_eq!(env.event_id, row_id.to_string());
+        assert_eq!(env.actor_subject, "user:alice");
+        assert!(env.emitted_at.is_some());
+    }
+
+    #[test]
+    fn build_payload_card_created() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "column_id": "col-1",
+            "position": 5,
+            "idempotency_key": "idem-1"
+        });
+        let payload = build_payload("CardCreated", &json).unwrap();
+        match payload {
+            Payload::CardCreated(ev) => {
+                assert_eq!(ev.column_id, "col-1");
+                assert_eq!(ev.position, 5);
+                assert_eq!(ev.idempotency_key, "idem-1");
+            }
+            _ => panic!("expected CardCreated variant"),
+        }
+    }
+
+    #[test]
+    fn build_payload_card_updated() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "prev_revision": 3,
+            "new_revision": 4,
+            "idempotency_key": "idem-2"
+        });
+        let payload = build_payload("CardUpdated", &json).unwrap();
+        match payload {
+            Payload::CardUpdated(ev) => {
+                assert_eq!(ev.card_id, "card-1");
+                assert_eq!(ev.prev_revision, 3);
+                assert_eq!(ev.new_revision, 4);
+                assert_eq!(ev.idempotency_key, "idem-2");
+            }
+            _ => panic!("expected CardUpdated variant"),
+        }
+    }
+
+    #[test]
+    fn build_payload_card_moved() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "from_column_id": "col-a",
+            "column_id": "col-b",
+            "position": 2,
+            "prev_revision": 7,
+            "new_revision": 8,
+            "idempotency_key": "idem-3"
+        });
+        let payload = build_payload("CardMoved", &json).unwrap();
+        match payload {
+            Payload::CardMoved(ev) => {
+                assert_eq!(ev.from_column, "col-a");
+                assert_eq!(ev.to_column, "col-b");
+                assert_eq!(ev.to_position, 2);
+                assert_eq!(ev.prev_revision, 7);
+                assert_eq!(ev.new_revision, 8);
+            }
+            _ => panic!("expected CardMoved variant"),
+        }
+    }
+
+    #[test]
+    fn build_payload_card_deleted() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "prev_revision": 9,
+            "idempotency_key": "idem-4"
+        });
+        let payload = build_payload("CardDeleted", &json).unwrap();
+        match payload {
+            Payload::CardDeleted(ev) => {
+                assert_eq!(ev.card_id, "card-1");
+                assert_eq!(ev.prev_revision, 9);
+            }
+            _ => panic!("expected CardDeleted variant"),
+        }
+    }
+
+    #[test]
+    fn build_payload_unknown_type_returns_none() {
+        let json = serde_json::json!({ "card_id": "card-1" });
+        assert!(build_payload("BoardRenamed", &json).is_none());
+        assert!(build_payload("", &json).is_none());
+    }
 }
