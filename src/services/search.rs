@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tonic::{Request, Response, Status};
 use tracing::error;
+use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -35,8 +36,11 @@ const MAX_BOARD_EXPAND: usize = 50_000;
 // ── Service struct ────────────────────────────────────────────────────────────
 
 pub struct SearchServiceImpl {
+    pub pool: sqlx::PgPool,
     pub keto: Arc<KetoClient>,
     pub opensearch: Arc<OpenSearchClient>,
+    /// Optional index override for tests. Defaults to `KANBAN_CARDS_INDEX`.
+    pub index_name: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -51,6 +55,26 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
+/// Return the subset of board IDs that are public or internal.
+async fn fetch_public_internal_board_ids(
+    pool: &sqlx::PgPool,
+    board_ids: &[Uuid],
+) -> Result<BTreeSet<Uuid>, sqlx::Error> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        "SELECT id FROM boards WHERE id = ANY($1) AND visibility IN ('public', 'internal')",
+    )
+    .bind(board_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.try_get::<Uuid, _>("id").ok())
+        .collect())
 }
 
 // ── Query builder ─────────────────────────────────────────────────────────────
@@ -241,9 +265,10 @@ impl SearchService for SearchServiceImpl {
         let query_body = build_query(&req)?;
 
         // ── 2. Execute search ────────────────────────────────────────────────
+        let index = self.index_name.as_deref().unwrap_or(KANBAN_CARDS_INDEX);
         let search_resp = self
             .opensearch
-            .search(KANBAN_CARDS_INDEX, &query_body)
+            .search(index, &query_body)
             .await
             .map_err(|e| internal("opensearch search failed", e))?;
 
@@ -270,12 +295,13 @@ impl SearchService for SearchServiceImpl {
             }));
         }
 
-        // ── 3. Post-filter via Keto expand (OQ8 resolution) ─────────────────
+        // ── 3. Post-filter via visibility + Keto expand (OQ8 resolution) ────
         //
-        // OQ8 resolution — Keto-aware OpenSearch filter plugin is v2; post-filter
-        // is v1's compromise.  We expand all board IDs the subject can "view",
-        // then drop hits whose board_id isn't in that set.
-        let allowed_boards: BTreeSet<String> = expand_objects(
+        // Public and internal boards are visible to any authenticated user.
+        // Private boards require an explicit Keto view relation. We expand the
+        // private board IDs the subject can view, then also allow any board
+        // whose Postgres visibility is public or internal.
+        let allowed_private_boards: BTreeSet<String> = expand_objects(
             &self.keto,
             ExpandQuery {
                 namespace: "KanbanBoard",
@@ -287,6 +313,24 @@ impl SearchService for SearchServiceImpl {
         )
         .await
         .map_err(|e| internal("keto expand failed during search post-filter", e))?;
+
+        let board_ids: Vec<Uuid> = raw_hits
+            .iter()
+            .filter_map(|h| Uuid::parse_str(&h.source.board_id).ok())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let public_internal_ids = fetch_public_internal_board_ids(&self.pool, &board_ids)
+            .await
+            .map_err(|e| internal("failed to fetch board visibilities for search", e))?;
+
+        let allowed_boards: BTreeSet<String> = board_ids
+            .iter()
+            .filter(|id| public_internal_ids.contains(*id))
+            .map(|id| id.to_string())
+            .chain(allowed_private_boards)
+            .collect();
 
         // Track last-hit sort key for cursor (only from authorized hits).
         let mut last_sort: Option<Vec<Value>> = None;
@@ -354,60 +398,142 @@ mod tests {
     use super::*;
     use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
 
+    use crate::auth::keto_retry::KetoRetryExt;
     use crate::integrations::opensearch::{CardDocument, OpenSearchClient, OpenSearchConfig};
+    use crate::test_support::containers;
+
+    // Mock-server support for service-level tests.
+    use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use std::net::SocketAddr;
+
+    // ── Unit tests for pure helpers ────────────────────────────────────────────
+
+    #[test]
+    fn subject_from_request_returns_subject() {
+        let mut req = Request::new(SearchCardsRequest::default());
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:alice".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(subject_from_request(&req).unwrap(), "user:alice");
+    }
+
+    #[test]
+    fn subject_from_request_missing_returns_unauthenticated() {
+        let req = Request::new(SearchCardsRequest::default());
+        let err = subject_from_request(&req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn build_query_uses_default_limit_when_invalid() {
+        let req = SearchCardsRequest {
+            limit: -5,
+            ..Default::default()
+        };
+        let body = build_query(&req).unwrap();
+        assert_eq!(body["size"], 20);
+    }
+
+    #[test]
+    fn build_query_clamps_limit_to_max() {
+        let req = SearchCardsRequest {
+            limit: 500,
+            query: "q".to_string(),
+            ..Default::default()
+        };
+        let body = build_query(&req).unwrap();
+        assert_eq!(body["size"], 100);
+    }
+
+    #[test]
+    fn build_query_empty_query_uses_match_all() {
+        let req = SearchCardsRequest {
+            query: "   ".to_string(),
+            ..Default::default()
+        };
+        let body = build_query(&req).unwrap();
+        assert_eq!(body["query"]["bool"]["must"][0], json!({ "match_all": {} }));
+    }
+
+    #[test]
+    fn build_query_adds_facet_filters() {
+        let req = SearchCardsRequest {
+            query: "bug".to_string(),
+            project_ids: vec!["p1".to_string()],
+            board_ids: vec!["b1".to_string()],
+            label_names: vec!["bug".to_string()],
+            assignee_subjects: vec!["user:alice".to_string()],
+            limit: 10,
+            ..Default::default()
+        };
+        let body = build_query(&req).unwrap();
+        let filters = body["query"]["bool"]["filter"].as_array().unwrap();
+        assert!(filters.iter().any(|f| f["terms"]["project_id"] == json!(["p1"])));
+        assert!(filters.iter().any(|f| f["terms"]["board_id"] == json!(["b1"])));
+        assert!(filters.iter().any(|f| f["terms"]["labels"] == json!(["bug"])));
+        assert!(filters.iter().any(|f| f["terms"]["assignees"] == json!(["user:alice"])));
+    }
+
+    #[test]
+    fn build_query_rejects_invalid_cursor() {
+        let req = SearchCardsRequest {
+            cursor: "not-base64!!!".to_string(),
+            ..Default::default()
+        };
+        let err = build_query(&req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn base64_cursor_roundtrip() {
+        let sort = vec![json!(1.5), json!("card-id")];
+        let cursor = encode_cursor(&sort);
+        let decoded = decode_cursor(&cursor).unwrap();
+        assert_eq!(decoded, json!(sort));
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_characters() {
+        let result = decode_cursor("!@#$");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn internal_returns_internal_status() {
+        let err = internal("boom", std::io::Error::new(std::io::ErrorKind::Other, "ouch"));
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("boom"));
+    }
+
+    // ── Integration helpers ────────────────────────────────────────────────────
+
+    fn os_client() -> Arc<OpenSearchClient> {
+        Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()))
+    }
+
+    fn keto_client() -> Arc<KetoClient> {
+        let grpc = std::env::var("KETO_READ_ADDR")
+            .unwrap_or_else(|_| "http://localhost:4466".to_string());
+        let write_grpc = std::env::var("KETO_WRITE_ADDR")
+            .unwrap_or_else(|_| "http://localhost:4467".to_string());
+        Arc::new(KetoClient::new(KetoConfig {
+            grpc_endpoint: grpc,
+            write_grpc_endpoint: write_grpc,
+        }))
+    }
+
 
     /// Unique index per test run to avoid cross-test interference.
     fn test_index() -> String {
         format!(
-            "sunbeam-kanban-cards-test-{}",
+            "sunbeam-kanban-cards-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            uuid::Uuid::new_v4()
         )
-    }
-
-    /// Probe OpenSearch. Returns `None` (skip) if unreachable.
-    async fn probe_opensearch() -> Option<Arc<OpenSearchClient>> {
-        let cfg = OpenSearchConfig::from_env();
-        let client = Arc::new(OpenSearchClient::new(cfg));
-
-        // Try a simple HEAD request to the root.
-        let url = format!(
-            "{}/",
-            std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string())
-        );
-        match reqwest::get(&url).await {
-            Ok(r) if r.status().is_success() || r.status().as_u16() == 401 => Some(client),
-            _ => {
-                eprintln!("[search] OpenSearch not reachable; skipping integration test.");
-                None
-            }
-        }
-    }
-
-    /// Probe Keto. Returns `None` (skip) if unreachable.
-    async fn probe_keto() -> Option<Arc<KetoClient>> {
-        let grpc =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let write_grpc = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-
-        let client = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: grpc,
-            write_grpc_endpoint: write_grpc,
-        }));
-
-        match client
-            .check_permission("_search_probe", "probe", "view", "user:_probe")
-            .await
-        {
-            Ok(_) => Some(client),
-            Err(e) => {
-                eprintln!("[search] Keto not reachable ({e}); skipping integration test.");
-                None
-            }
-        }
     }
 
     fn sample_card(
@@ -435,12 +561,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_empty_when_index_missing() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
-        let Some(keto) = probe_keto().await else {
-            return;
-        };
+        let os = os_client();
+        let keto = keto_client();
 
         // Deliberately use a non-existent index name.
         let nonexistent = "sunbeam-kanban-cards-test-does-not-exist-ever";
@@ -483,12 +605,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_card_by_title_match() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
-        let Some(keto) = probe_keto().await else {
-            return;
-        };
+        let os = os_client();
+        let keto = keto_client();
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -499,7 +617,7 @@ mod tests {
         let subject = format!("user:test-{}", uuid::Uuid::new_v4());
 
         // Grant Keto view on the board.
-        keto.grant("KanbanBoard", &board_id, "view", &subject)
+        keto.grant_with_retry("KanbanBoard", &board_id, "view", &subject)
             .await
             .expect("keto grant");
 
@@ -554,9 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_project_id() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
+        let os = os_client();
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -627,9 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_label_name() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
+        let os = os_client();
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -690,12 +804,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_post_filters_via_keto_expand() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
-        let Some(keto) = probe_keto().await else {
-            return;
-        };
+        let os = os_client();
+        let keto = keto_client();
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -706,7 +816,7 @@ mod tests {
         let subject = format!("user:test-postfilter-{}", uuid::Uuid::new_v4());
 
         // Grant view only on board_allowed.
-        keto.grant("KanbanBoard", &board_allowed, "view", &subject)
+        keto.grant_with_retry("KanbanBoard", &board_allowed, "view", &subject)
             .await
             .expect("keto grant allowed board");
 
@@ -803,9 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_paginates_via_next_cursor() {
-        let Some(os) = probe_opensearch().await else {
-            return;
-        };
+        let os = os_client();
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -889,5 +997,991 @@ mod tests {
         assert_eq!(seen.len(), 5, "expected 5 distinct ids across both pages");
 
         os.delete_index(&index).await.ok();
+    }
+
+    // ── Visibility post-filter tests ───────────────────────────────────────────
+
+    async fn insert_test_board(pool: &sqlx::PgPool, board_id: Uuid, visibility: &str) {
+        let project_id = crate::test_support::seed_project(pool).await;
+        let slug = format!("bd-{}", &board_id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
+             VALUES ($1, $2, $3, $4, '', '', $5)",
+        )
+        .bind(board_id)
+        .bind(project_id)
+        .bind(format!("Test Board {board_id}"))
+        .bind(&slug)
+        .bind(visibility)
+        .execute(pool)
+        .await
+        .expect("failed to insert test board");
+    }
+
+    fn search_request(query: &str) -> Request<SearchCardsRequest> {
+        let mut req = Request::new(SearchCardsRequest {
+            query: query.to_string(),
+            project_ids: vec![],
+            board_ids: vec![],
+            label_names: vec![],
+            assignee_subjects: vec![],
+            limit: 10,
+            cursor: String::new(),
+        });
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-search".to_string()),
+            ..Default::default()
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn search_returns_public_board_hit_without_keto_relation() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let card_id = format!("{}", uuid::Uuid::new_v4());
+        let subject = format!("user:test-public-search-{}", uuid::Uuid::new_v4());
+
+        insert_test_board(&infra.pool, board_id, "public").await;
+
+        let doc = CardDocument {
+            id: card_id.clone(),
+            board_id: board_id.to_string(),
+            project_id: Uuid::new_v4().to_string(),
+            card_ref: format!("KB-{}", &card_id[..4]),
+            title: "Public Visibility Hit".to_string(),
+            description: "Find me".to_string(),
+            priority: "medium".to_string(),
+            labels: vec![],
+            assignees: vec![],
+            completed_at: None,
+        };
+        os.index_card(&index, &doc).await.expect("index card");
+        os.refresh(&index).await.expect("refresh");
+
+        let mut req = search_request("Public Visibility Hit");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some(subject),
+            ..Default::default()
+        });
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc
+            .search_cards(req)
+            .await
+            .expect("search_cards failed")
+            .into_inner();
+
+        assert_eq!(resp.hits.len(), 1, "public board hit must be returned");
+        assert_eq!(resp.hits[0].card_id, card_id);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_hides_private_board_hit_without_keto_relation() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let card_id = format!("{}", uuid::Uuid::new_v4());
+        let subject = format!("user:test-private-search-{}", uuid::Uuid::new_v4());
+
+        insert_test_board(&infra.pool, board_id, "private").await;
+
+        let doc = CardDocument {
+            id: card_id.clone(),
+            board_id: board_id.to_string(),
+            project_id: Uuid::new_v4().to_string(),
+            card_ref: format!("KB-{}", &card_id[..4]),
+            title: "Private Visibility Hit".to_string(),
+            description: "Hide me".to_string(),
+            priority: "medium".to_string(),
+            labels: vec![],
+            assignees: vec![],
+            completed_at: None,
+        };
+        os.index_card(&index, &doc).await.expect("index card");
+        os.refresh(&index).await.expect("refresh");
+
+        let mut req = search_request("Private Visibility Hit");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some(subject.clone()),
+            ..Default::default()
+        });
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc
+            .search_cards(req)
+            .await
+            .expect("search_cards failed")
+            .into_inner();
+
+        assert!(
+            resp.hits.is_empty(),
+            "private board hit must be hidden without Keto view relation"
+        );
+
+        // Grant explicit view and verify the hit now appears.
+        infra
+            .keto
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", &subject)
+            .await
+            .expect("grant view failed");
+
+        let mut req2 = search_request("Private Visibility Hit");
+        req2.extensions_mut().insert(AuthContext {
+            subject: Some(subject.clone()),
+            ..Default::default()
+        });
+
+        let resp2 = svc
+            .search_cards(req2)
+            .await
+            .expect("search_cards failed")
+            .into_inner();
+
+        assert_eq!(
+            resp2.hits.len(),
+            1,
+            "private board hit must appear after granting view relation"
+        );
+        assert_eq!(resp2.hits[0].card_id, card_id);
+
+        os.delete_index(&index).await.ok();
+        crate::auth::keto_compat::delete_relation_tuples(
+            &infra.keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject),
+        )
+        .await
+        .ok();
+    }
+
+    // ── Handler-level filter tests (exercise search_cards end-to-end) ───────────
+
+    #[tokio::test]
+    async fn search_handler_returns_empty_when_query_matches_nothing() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        insert_test_board(&infra.pool, board_id, "public").await;
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let mut req = search_request("no-such-card-xyz");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-empty".to_string()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert!(resp.hits.is_empty());
+        assert_eq!(resp.total, 0);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_handler_filters_by_project_id() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        insert_test_board_with_project(&infra.pool, board_id, project_a, "public").await;
+
+        let card_a = index_public_card(&os, &index, board_id, project_a, "Card A", vec![], vec![]).await;
+        let _card_b = index_public_card(&os, &index, board_id, project_b, "Card B", vec![], vec![]).await;
+        os.refresh(&index).await.unwrap();
+
+        let mut req = search_request("Card");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-project-filter".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().project_ids = vec![project_a.to_string()];
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_a);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_handler_filters_by_board_id() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_a = Uuid::new_v4();
+        let board_b = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        insert_test_board_with_project(&infra.pool, board_a, project_id, "public").await;
+        insert_test_board_with_project(&infra.pool, board_b, project_id, "public").await;
+
+        let card_a = index_public_card(&os, &index, board_a, project_id, "Card A", vec![], vec![]).await;
+        let _card_b = index_public_card(&os, &index, board_b, project_id, "Card B", vec![], vec![]).await;
+        os.refresh(&index).await.unwrap();
+
+        let mut req = search_request("Card");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-board-filter".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().board_ids = vec![board_a.to_string()];
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_a);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_handler_filters_by_label_name() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let card_bug = index_public_card(
+            &os,
+            &index,
+            board_id,
+            project_id,
+            "Bug card",
+            vec!["bug"],
+            vec![],
+        )
+        .await;
+        let _card_feat = index_public_card(
+            &os,
+            &index,
+            board_id,
+            project_id,
+            "Feature card",
+            vec!["feature"],
+            vec![],
+        )
+        .await;
+        os.refresh(&index).await.unwrap();
+
+        let mut req = search_request("card");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-label-filter".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().label_names = vec!["bug".to_string()];
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_bug);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_handler_filters_by_assignee_subject() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let card_alice = index_public_card(
+            &os,
+            &index,
+            board_id,
+            project_id,
+            "Assigned card",
+            vec![],
+            vec!["user:alice"],
+        )
+        .await;
+        let _card_bob = index_public_card(
+            &os,
+            &index,
+            board_id,
+            project_id,
+            "Other card",
+            vec![],
+            vec!["user:bob"],
+        )
+        .await;
+        os.refresh(&index).await.unwrap();
+
+        let mut req = search_request("card");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-assignee-filter".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().assignee_subjects = vec!["user:alice".to_string()];
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_alice);
+
+        os.delete_index(&index).await.ok();
+    }
+
+    #[tokio::test]
+    async fn search_handler_maps_completed_status() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let doc = CardDocument {
+            id: Uuid::new_v4().to_string(),
+            board_id: board_id.to_string(),
+            project_id: project_id.to_string(),
+            card_ref: "KB-DONE".to_string(),
+            title: "Done card".to_string(),
+            description: "Desc".to_string(),
+            priority: "low".to_string(),
+            labels: vec![],
+            assignees: vec![],
+            completed_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        os.index_card(&index, &doc).await.unwrap();
+        os.refresh(&index).await.unwrap();
+
+        let mut req = search_request("Done card");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-status".to_string()),
+            ..Default::default()
+        });
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].status, "completed");
+
+        os.delete_index(&index).await.ok();
+    }
+
+    async fn insert_test_board_with_project(
+        pool: &sqlx::PgPool,
+        board_id: Uuid,
+        project_id: Uuid,
+        visibility: &str,
+    ) {
+        let slug = format!("bd-{}", &board_id.to_string()[..8]);
+
+        // Ensure the parent project exists; callers that already seeded one will
+        // hit ON CONFLICT DO NOTHING.
+        sqlx::query(
+            "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'user:test', now(), now()) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(project_id)
+        .bind(format!("test-proj-{project_id}"))
+        .bind(format!("{project_id}"))
+        .execute(pool)
+        .await
+        .expect("failed to insert test project");
+
+        sqlx::query(
+            "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
+             VALUES ($1, $2, $3, $4, '', '', $5)",
+        )
+        .bind(board_id)
+        .bind(project_id)
+        .bind(format!("Test Board {board_id}"))
+        .bind(&slug)
+        .bind(visibility)
+        .execute(pool)
+        .await
+        .expect("failed to insert test board");
+    }
+
+    async fn index_public_card(
+        os: &Arc<OpenSearchClient>,
+        index: &str,
+        board_id: Uuid,
+        project_id: Uuid,
+        title: &str,
+        labels: Vec<&str>,
+        assignees: Vec<&str>,
+    ) -> String {
+        let card_id = Uuid::new_v4().to_string();
+        let doc = CardDocument {
+            id: card_id.clone(),
+            board_id: board_id.to_string(),
+            project_id: project_id.to_string(),
+            card_ref: format!("KB-{}", &card_id[..4]),
+            title: title.to_string(),
+            description: format!("Description for {title}"),
+            priority: "medium".to_string(),
+            labels: labels.into_iter().map(|s| s.to_string()).collect(),
+            assignees: assignees.into_iter().map(|s| s.to_string()).collect(),
+            completed_at: None,
+        };
+        os.index_card(index, &doc).await.expect("index card");
+        card_id
+    }
+
+    // ── Mock OpenSearch service-level tests ────────────────────────────────────
+
+    async fn start_mock_search_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/{index}/_search",
+            post(
+                |Path(index): Path<String>, Json(_body): Json<serde_json::Value>| async move {
+                    if index == "missing" {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": {"type": "index_not_found_exception"}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "hits": {
+                                "total": { "value": 0 },
+                                "hits": []
+                            }
+                        })),
+                    )
+                        .into_response()
+                },
+            ),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_empty_when_opensearch_index_missing() {
+        let (addr, _handle) = start_mock_search_server().await;
+        let infra = containers::setup().await;
+
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("anything");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-missing".to_string()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert!(resp.hits.is_empty());
+        assert_eq!(resp.total, 0);
+        assert!(resp.next_cursor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_public_board_hit_via_mock_opensearch() {
+        let infra = containers::setup().await;
+
+        let project_id = crate::test_support::seed_project(&infra.pool).await;
+        let board_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4().to_string();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let (addr, _handle) = start_mock_hit_server(&card_id, &board_id.to_string()).await;
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("find me");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-public-mock".to_string()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_id);
+        assert_eq!(resp.hits[0].status, "open");
+    }
+
+    async fn start_mock_hit_server(
+        card_id: &str,
+        board_id: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let card_id = card_id.to_string();
+        let board_id = board_id.to_string();
+        let app = Router::new().route(
+            "/{index}/_search",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let card_id = card_id.clone();
+                let board_id = board_id.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "hits": {
+                                "total": { "value": 1 },
+                                "hits": [{
+                                    "_id": card_id,
+                                    "_score": 1.0,
+                                    "_source": {
+                                        "id": card_id,
+                                        "board_id": board_id,
+                                        "project_id": Uuid::new_v4().to_string(),
+                                        "ref": "KB-1",
+                                        "title": "Mock hit",
+                                        "description": "Desc",
+                                        "priority": "medium",
+                                        "labels": [],
+                                        "assignees": [],
+                                        "completed_at": null
+                                    },
+                                    "sort": [1.0, card_id]
+                                }]
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    // ── Additional mock OpenSearch service-level tests ─────────────────────────
+
+    /// Start a mock OpenSearch server that always returns the given status/body.
+    async fn start_mock_response_server(
+        status: StatusCode,
+        body: Value,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/{index}/_search",
+            post(move |Json(_body): Json<Value>| {
+                let status = status;
+                let body = body.clone();
+                async move { (status, Json(body)).into_response() }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_internal_error_when_opensearch_500() {
+        let infra = containers::setup().await;
+
+        let (addr, _handle) = start_mock_response_server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "shard failure"}),
+        )
+        .await;
+
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("anything");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-500".to_string()),
+            ..Default::default()
+        });
+
+        let err = svc.search_cards(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_internal_error_when_opensearch_404_non_index_missing() {
+        let infra = containers::setup().await;
+
+        let (addr, _handle) = start_mock_response_server(
+            StatusCode::NOT_FOUND,
+            json!({"error": {"type": "resource_not_found_exception"}}),
+        )
+        .await;
+
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("anything");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-404".to_string()),
+            ..Default::default()
+        });
+
+        let err = svc.search_cards(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_empty_when_opensearch_hits_are_empty() {
+        let infra = containers::setup().await;
+
+        let (addr, _handle) = start_mock_response_server(
+            StatusCode::OK,
+            json!({
+                "hits": {
+                    "total": { "value": 0 },
+                    "hits": []
+                }
+            }),
+        )
+        .await;
+
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("anything");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-empty-hits".to_string()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert!(resp.hits.is_empty());
+        assert_eq!(resp.total, 0);
+        assert!(resp.next_cursor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_cards_drops_private_board_hit_without_keto_relation() {
+        let infra = containers::setup().await;
+
+        let project_id = crate::test_support::seed_project(&infra.pool).await;
+        let board_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4().to_string();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "private").await;
+
+        let (addr, _handle) = start_mock_hit_server(&card_id, &board_id.to_string()).await;
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let subject = format!("user:test-private-drop-{}", Uuid::new_v4());
+        let mut req = search_request("find me");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some(subject.clone()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert!(resp.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_cards_returns_private_board_hit_with_keto_relation() {
+        let infra = containers::setup().await;
+
+        let project_id = crate::test_support::seed_project(&infra.pool).await;
+        let board_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4().to_string();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "private").await;
+
+        let subject = format!("user:test-private-allow-{}", Uuid::new_v4());
+        infra
+            .keto
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", &subject)
+            .await
+            .expect("grant view failed");
+
+        let (addr, _handle) = start_mock_hit_server(&card_id, &board_id.to_string()).await;
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("find me");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some(subject.clone()),
+            ..Default::default()
+        });
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert_eq!(resp.hits[0].card_id, card_id);
+
+        crate::auth::keto_compat::delete_relation_tuples(
+            &infra.keto,
+            "KanbanBoard",
+            Some("view"),
+            Some(&subject),
+        )
+        .await
+        .ok();
+    }
+
+    /// Start a mock server that returns `n` identical hits for the same board.
+    async fn start_mock_multi_hit_server(
+        card_ids: Vec<String>,
+        board_id: String,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/{index}/_search",
+            post(move |Json(_body): Json<Value>| {
+                let card_ids = card_ids.clone();
+                let board_id = board_id.clone();
+                async move {
+                    let project_id = Uuid::new_v4().to_string();
+                    let hits: Vec<Value> = card_ids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, card_id)| {
+                            json!({
+                                "_id": card_id,
+                                "_score": 1.0,
+                                "_source": {
+                                    "id": card_id,
+                                    "board_id": board_id,
+                                    "project_id": project_id,
+                                    "ref": format!("KB-{i}"),
+                                    "title": "Mock hit",
+                                    "description": "Desc",
+                                    "priority": "medium",
+                                    "labels": [],
+                                    "assignees": [],
+                                    "completed_at": null
+                                },
+                                "sort": [1.0, card_id]
+                            })
+                        })
+                        .collect();
+
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "hits": {
+                                "total": { "value": hits.len() as i64 },
+                                "hits": hits
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn search_cards_emits_next_cursor_when_authorized_hits_equal_limit() {
+        let infra = containers::setup().await;
+
+        let project_id = crate::test_support::seed_project(&infra.pool).await;
+        let board_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4().to_string();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let (addr, _handle) =
+            start_mock_multi_hit_server(vec![card_id.clone()], board_id.to_string()).await;
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("find me");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-cursor-full".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().limit = 1;
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert!(!resp.next_cursor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_cards_emits_empty_next_cursor_when_authorized_hits_below_limit() {
+        let infra = containers::setup().await;
+
+        let project_id = crate::test_support::seed_project(&infra.pool).await;
+        let board_id = Uuid::new_v4();
+        let card_id = Uuid::new_v4().to_string();
+        insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
+
+        let (addr, _handle) =
+            start_mock_multi_hit_server(vec![card_id.clone()], board_id.to_string()).await;
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+            url: format!("http://{addr}"),
+        }));
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            keto: Arc::clone(&infra.keto),
+            opensearch: Arc::clone(&os),
+            index_name: None,
+        };
+
+        let mut req = search_request("find me");
+        req.extensions_mut().insert(AuthContext {
+            subject: Some("user:test-cursor-partial".to_string()),
+            ..Default::default()
+        });
+        req.get_mut().limit = 2;
+
+        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        assert_eq!(resp.hits.len(), 1);
+        assert!(resp.next_cursor.is_empty());
     }
 }
