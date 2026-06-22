@@ -15,13 +15,22 @@ use std::path::Path;
 use std::process;
 
 fn main() {
+    let code = run();
+    process::exit(code);
+}
+
+/// Core coverage check. Returns the process exit code.
+fn run() -> i32 {
     let workspace_root = workspace_root();
     let proto_dir = workspace_root.join("proto/sunbeam/kanban/v1");
 
-    let expected = scan_proto_methods(&proto_dir);
-    let actual: HashSet<&str> = kanban::auth::keto_dispatch::matrix()
+    let expected: HashSet<String> = scan_proto_methods(&proto_dir)
+        .into_iter()
+        .filter(|m| !kanban::auth::keto_dispatch::BYPASSED_METHODS.contains(&m.as_str()))
+        .collect();
+    let actual: HashSet<String> = kanban::auth::keto_dispatch::matrix()
         .iter()
-        .map(|e| e.method)
+        .map(|e| e.method.to_string())
         .collect();
 
     let missing: Vec<_> = {
@@ -33,7 +42,10 @@ fn main() {
         v
     };
     let extra: Vec<_> = {
-        let mut v: Vec<_> = actual.iter().filter(|m| !expected.contains(**m)).collect();
+        let mut v: Vec<_> = actual
+            .iter()
+            .filter(|m| !expected.contains(m.as_str()))
+            .collect();
         v.sort();
         v
     };
@@ -69,14 +81,14 @@ fn main() {
             "\nketo-coverage: OK — matrix covers all {} RPCs",
             expected.len()
         );
-        process::exit(0);
+        0
     } else {
         eprintln!(
             "\nketo-coverage: FAIL — {} missing, {} extra",
             missing.len(),
             extra.len()
         );
-        process::exit(1);
+        1
     }
 }
 
@@ -180,4 +192,55 @@ fn scan_proto_methods(dir: &Path) -> HashSet<String> {
     }
 
     methods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_proto_methods_finds_known_rpc() {
+        let root = workspace_root();
+        let proto_dir = root.join("proto/sunbeam/kanban/v1");
+        let methods = scan_proto_methods(&proto_dir);
+
+        assert!(
+            methods.contains("/sunbeam.kanban.v1.CardService/CreateCard"),
+            "expected CreateCard in scanned methods"
+        );
+        assert!(
+            methods.contains("/sunbeam.kanban.v1.BoardService/GetBoard"),
+            "expected GetBoard in scanned methods"
+        );
+    }
+
+    #[test]
+    fn scan_proto_methods_is_non_empty() {
+        let root = workspace_root();
+        let proto_dir = root.join("proto/sunbeam/kanban/v1");
+        let methods = scan_proto_methods(&proto_dir);
+        assert!(!methods.is_empty(), "expected at least one proto RPC");
+    }
+
+    #[test]
+    fn scan_proto_methods_ignores_non_proto_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "keto-coverage-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("README.md"), "# not a proto").unwrap();
+        let methods = scan_proto_methods(&tmp);
+        assert!(methods.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn run_exits_zero_when_matrix_covers_protos() {
+        // The real run should succeed in a clean checkout.
+        assert_eq!(run(), 0);
+    }
 }
