@@ -24,6 +24,7 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
+use crate::auth::keto_retry::KetoRetryExt;
 use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::aggregated_board_service_server::AggregatedBoardService;
 use crate::pb::{
@@ -41,6 +42,7 @@ use crate::services::cards::{
     card_from_row, fetch_assignees, fetch_attachments_count, fetch_checklist, fetch_comments_count,
     fetch_labels, to_proto_ts,
 };
+use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -92,6 +94,7 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let icon: Option<String> = row.get("icon");
+    let visibility: String = row.get("visibility");
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
 
@@ -100,6 +103,7 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
         name,
         description: description.unwrap_or_default(),
         icon: icon.unwrap_or_default(),
+        visibility: db_to_proto(&visibility),
         created_at: Some(to_proto_ts(created_at)),
         updated_at: Some(to_proto_ts(updated_at)),
     }
@@ -220,6 +224,26 @@ async fn fetch_source_board_ids(
     .map_err(|e| internal("failed to fetch source board ids", e))?;
 
     Ok(rows.iter().map(|r| r.get::<Uuid, _>("board_id")).collect())
+}
+
+/// Return the subset of board IDs that are public or internal.
+async fn fetch_public_internal_board_ids(
+    pool: &PgPool,
+    board_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, Status> {
+    if board_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let rows = sqlx::query(
+        "SELECT id FROM boards WHERE id = ANY($1) AND visibility IN ('public', 'internal')",
+    )
+    .bind(board_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| internal("failed to fetch source board visibilities", e))?;
+
+    Ok(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect())
 }
 
 // ── Card helpers ──────────────────────────────────────────────────────────────
@@ -347,7 +371,7 @@ async fn revalidate_keto(
     aggregated_board_id: &str,
 ) -> Result<bool, Status> {
     let subject = auth.subject.as_deref().unwrap_or("");
-    keto.check_permission(KETO_NS, aggregated_board_id, "view", subject)
+    keto.check_permission_with_retry(KETO_NS, aggregated_board_id, "view", subject)
         .await
         .map_err(|e| {
             warn!(aggregated_board_id, subject, error = %e, "aggregate stream: Keto recheck failed");
@@ -375,6 +399,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         }
 
         let aggregated_board_id = Uuid::new_v4();
+        let visibility = proto_to_db(req.visibility);
 
         let mut tx = self
             .pool
@@ -383,14 +408,15 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .map_err(|e| internal("failed to begin transaction", e))?;
 
         let row = sqlx::query(
-            "INSERT INTO aggregated_boards (id, name, description, icon, created_by) \
-             VALUES ($1, $2, $3, $4, $5) \
-             RETURNING id, name, description, icon, created_at, updated_at",
+            "INSERT INTO aggregated_boards (id, name, description, icon, visibility, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             RETURNING id, name, description, icon, visibility, created_at, updated_at",
         )
         .bind(aggregated_board_id)
         .bind(&req.name)
         .bind(&req.description)
         .bind(&req.icon)
+        .bind(visibility)
         .bind(&subject)
         .fetch_one(&mut *tx)
         .await
@@ -414,13 +440,13 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         // Keto FIRST: owner tuple.
         self.keto
-            .grant(KETO_NS, &aggregated_board_id.to_string(), "owner", &subject)
+            .grant_with_retry(KETO_NS, &aggregated_board_id.to_string(), "owner", &subject)
             .await
             .map_err(|e| internal("failed to write Keto owner tuple", e))?;
 
         // Also write a view tuple so ListAggregatedBoards sees it.
         self.keto
-            .grant(KETO_NS, &aggregated_board_id.to_string(), "view", &subject)
+            .grant_with_retry(KETO_NS, &aggregated_board_id.to_string(), "view", &subject)
             .await
             .map_err(|e| internal("failed to write Keto view tuple", e))?;
 
@@ -473,12 +499,13 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<GetAggregatedBoardRequest>,
     ) -> Result<Response<AggregatedBoardStream>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let subject = subject_from_request(&request)?;
+        let req = request.into_inner();
+        let aggregated_board_id = Uuid::parse_str(&req.aggregated_board_id)
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let row = sqlx::query(
-            "SELECT id, name, description, icon, created_at, updated_at \
+            "SELECT id, name, description, icon, visibility, created_at, updated_at \
              FROM aggregated_boards WHERE id = $1",
         )
         .bind(aggregated_board_id)
@@ -487,6 +514,25 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .map_err(|e| internal("failed to fetch aggregated board", e))?
         .ok_or_else(|| Status::not_found("aggregated board not found"))?;
 
+        let aggregate_visibility: String = row.get("visibility");
+        if !is_public_or_internal(&aggregate_visibility) {
+            let allowed = self
+                .keto
+                .check_permission_with_retry(
+                    KETO_NS,
+                    &aggregated_board_id.to_string(),
+                    "view",
+                    &subject,
+                )
+                .await
+                .map_err(|e| internal("failed to check aggregated board view permission", e))?;
+            if !allowed {
+                return Err(Status::permission_denied(
+                    "you do not have permission to view this aggregated board",
+                ));
+            }
+        }
+
         let metadata = aggregated_board_from_row(&row);
         let source_boards = fetch_source_boards(&self.pool, aggregated_board_id).await?;
         let board_ids: Vec<Uuid> = source_boards
@@ -494,8 +540,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .filter_map(|s| Uuid::parse_str(&s.board_id).ok())
             .collect();
 
-        let subject = subject_from_request(&request)?;
-        let visible_board_ids = expand_objects(
+        // Source boards are visible if public/internal or if private and the
+        // caller has an explicit Keto view relation.
+        let allowed_private_ids = expand_objects(
             &self.keto,
             ExpandQuery {
                 namespace: "KanbanBoard",
@@ -508,10 +555,17 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .await
         .map_err(|e| internal("keto expand failed", e))?;
 
-        let visible_board_uuids: Vec<Uuid> = visible_board_ids
+        let public_internal_ids = fetch_public_internal_board_ids(&self.pool, &board_ids).await?;
+
+        let allowed_source_ids: std::collections::HashSet<Uuid> = board_ids
             .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
+            .copied()
+            .filter(|id| {
+                public_internal_ids.contains(id) || allowed_private_ids.contains(&id.to_string())
+            })
             .collect();
+
+        let visible_board_uuids: Vec<Uuid> = allowed_source_ids.iter().copied().collect();
 
         let cards = fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_uuids).await?;
 
@@ -519,12 +573,20 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         chunks.push(AggregatedBoardChunk {
             payload: Some(ChunkPayload::Metadata(metadata)),
         });
-        for sb in &source_boards {
+        let filtered_source_boards: Vec<_> = source_boards
+            .into_iter()
+            .filter(|sb| {
+                Uuid::parse_str(&sb.board_id)
+                    .map(|id| allowed_source_ids.contains(&id))
+                    .unwrap_or(false)
+            })
+            .collect();
+        for sb in &filtered_source_boards {
             chunks.push(AggregatedBoardChunk {
                 payload: Some(ChunkPayload::SourceBoard(sb.clone())),
             });
         }
-        for (position, sb) in source_boards.iter().enumerate() {
+        for (position, sb) in filtered_source_boards.iter().enumerate() {
             chunks.push(AggregatedBoardChunk {
                 payload: Some(ChunkPayload::Column(AggregatedColumn {
                     id: format!("agg-col-{}", sb.board_id),
@@ -560,12 +622,40 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<UpdateAggregatedBoardRequest>,
     ) -> Result<Response<AggregatedBoard>, Status> {
+        let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = Uuid::parse_str(&object_id)
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let req = request.into_inner();
         let patch = req.aggregated_board.unwrap_or_default();
+
+        let update_paths: std::collections::HashSet<&str> = req
+            .update_mask
+            .as_ref()
+            .map(|m| m.paths.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        let visibility_change = update_paths.contains("visibility");
+
+        if visibility_change {
+            let allowed = self
+                .keto
+                .check_permission_with_retry(
+                    KETO_NS,
+                    &aggregated_board_id.to_string(),
+                    "manage",
+                    &subject,
+                )
+                .await
+                .map_err(|e| internal("failed to check aggregated board manage permission", e))?;
+            if !allowed {
+                return Err(Status::permission_denied(
+                    "you do not have permission to change aggregated board visibility",
+                ));
+            }
+        }
+
+        let new_visibility = proto_to_db(patch.visibility);
 
         let mut tx = self
             .pool
@@ -578,14 +668,17 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 name        = CASE WHEN $2 != '' THEN $2 ELSE name END, \
                 description = CASE WHEN $3 != '' THEN $3 ELSE description END, \
                 icon        = CASE WHEN $4 != '' THEN $4 ELSE icon END, \
+                visibility  = CASE WHEN $5::boolean THEN $6 ELSE visibility END, \
                 updated_at  = now() \
              WHERE id = $1 \
-             RETURNING id, name, description, icon, created_at, updated_at",
+             RETURNING id, name, description, icon, visibility, created_at, updated_at",
         )
         .bind(aggregated_board_id)
         .bind(&patch.name)
         .bind(&patch.description)
         .bind(&patch.icon)
+        .bind(visibility_change)
+        .bind(new_visibility)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update aggregated board", e))?
@@ -640,7 +733,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     ) -> Result<Response<ListAggregatedBoardsResponse>, Status> {
         let subject = subject_from_request(&request)?;
 
-        let visible_ids = expand_objects(
+        // Public/internal aggregates are visible to any authenticated user;
+        // private aggregates require an explicit Keto view relation.
+        let allowed_private_ids = expand_objects(
             &self.keto,
             ExpandQuery {
                 namespace: KETO_NS,
@@ -653,27 +748,23 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .await
         .map_err(|e| internal("keto expand failed", e))?;
 
-        if visible_ids.is_empty() {
-            return Ok(Response::new(ListAggregatedBoardsResponse {
-                aggregated_boards: vec![],
-            }));
-        }
-
-        let ids: Vec<Uuid> = visible_ids
-            .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
-            .collect();
-
         let rows = sqlx::query(
-            "SELECT id, name, description, icon, created_at, updated_at \
-             FROM aggregated_boards WHERE id = ANY($1)",
+            "SELECT id, name, description, icon, visibility, created_at, updated_at \
+             FROM aggregated_boards ORDER BY created_at ASC",
         )
-        .bind(&ids as &[Uuid])
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list aggregated boards", e))?;
 
-        let aggregated_boards = rows.iter().map(aggregated_board_from_row).collect();
+        let aggregated_boards: Vec<AggregatedBoard> = rows
+            .iter()
+            .filter(|row| {
+                let id: Uuid = row.get("id");
+                let visibility: String = row.get("visibility");
+                is_public_or_internal(&visibility) || allowed_private_ids.contains(&id.to_string())
+            })
+            .map(aggregated_board_from_row)
+            .collect();
 
         Ok(Response::new(ListAggregatedBoardsResponse {
             aggregated_boards,
@@ -856,14 +947,26 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<SubscribeAggregatedBoardRequest>,
     ) -> Result<Response<SubscribeAggregatedBoardStream>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = object_id.clone();
-
         let auth = request
             .extensions()
             .get::<AuthContext>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("missing auth context"))?;
+        let req = request.into_inner();
+        let aggregated_board_id = req.aggregated_board_id;
+
+        let visibility: String =
+            sqlx::query_scalar("SELECT visibility FROM aggregated_boards WHERE id = $1")
+                .bind(
+                    Uuid::parse_str(&aggregated_board_id)
+                        .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch aggregated board visibility", e))?
+                .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+
+        let is_private = !is_public_or_internal(&visibility);
 
         let source_board_ids = fetch_source_board_ids(
             &self.pool,
@@ -876,16 +979,17 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let keto = Arc::clone(&self.keto);
         let watermark = Arc::clone(&self.watermark);
 
-        let stream = build_subscribe_aggregated_board_stream(
+        let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
             registry,
             keto,
             watermark,
             auth,
             aggregated_board_id,
             source_board_ids,
-            Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
-        )
+            is_private,
+            heartbeat_interval: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+            keto_recheck_interval: Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
+        })
         .await?;
 
         Ok(Response::new(stream))
@@ -900,7 +1004,7 @@ impl AggregatedBoardServiceImpl {
         aggregated_board_id: Uuid,
     ) -> Result<Response<AggregatedBoard>, Status> {
         let row = sqlx::query(
-            "SELECT id, name, description, icon, created_at, updated_at \
+            "SELECT id, name, description, icon, visibility, created_at, updated_at \
              FROM aggregated_boards WHERE id = $1",
         )
         .bind(aggregated_board_id)
@@ -915,17 +1019,34 @@ impl AggregatedBoardServiceImpl {
 
 // ── Streaming implementation ──────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Arguments for `build_subscribe_aggregated_board_stream`.
+pub struct SubscribeAggregatedBoardArgs {
+    pub registry: Arc<BoardSubscriberRegistry>,
+    pub keto: Arc<KetoClient>,
+    pub watermark: Arc<LogoutWatermark>,
+    pub auth: AuthContext,
+    pub aggregated_board_id: String,
+    pub source_board_ids: Vec<Uuid>,
+    pub is_private: bool,
+    pub heartbeat_interval: Duration,
+    pub keto_recheck_interval: Duration,
+}
+
 pub async fn build_subscribe_aggregated_board_stream(
-    registry: Arc<BoardSubscriberRegistry>,
-    keto: Arc<KetoClient>,
-    watermark: Arc<LogoutWatermark>,
-    auth: AuthContext,
-    aggregated_board_id: String,
-    source_board_ids: Vec<Uuid>,
-    heartbeat_interval: Duration,
-    keto_recheck_interval: Duration,
+    args: SubscribeAggregatedBoardArgs,
 ) -> Result<SubscribeAggregatedBoardStream, Status> {
+    let SubscribeAggregatedBoardArgs {
+        registry,
+        keto,
+        watermark,
+        auth,
+        aggregated_board_id,
+        source_board_ids,
+        is_private,
+        heartbeat_interval,
+        keto_recheck_interval,
+    } = args;
+
     let s = stream! {
         // Emit cutover immediately (empty replay).
         yield Ok(cutover_envelope(0));
@@ -1002,7 +1123,7 @@ pub async fn build_subscribe_aggregated_board_stream(
                 }
             }
 
-            if last_keto_recheck.elapsed() >= keto_recheck_interval {
+            if is_private && last_keto_recheck.elapsed() >= keto_recheck_interval {
                 match revalidate_keto(&keto, &auth, &aggregated_board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1050,10 +1171,11 @@ mod tests {
 
     use crate::pb::board_service_server::BoardService;
     use crate::pb::card_service_server::CardService;
-    use crate::pb::{CreateBoardRequest, CreateCardRequest, GetBoardRequest};
+    use crate::pb::{BoardVisibility, CreateBoardRequest, CreateCardRequest, GetBoardRequest};
     use crate::services::boards::BoardServiceImpl;
     use crate::services::cards::CardServiceImpl;
     use crate::test_support::containers;
+    use prost_types::FieldMask;
 
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
@@ -1142,6 +1264,23 @@ mod tests {
         name: &str,
         subject: &str,
     ) -> Uuid {
+        create_source_board_with_visibility(
+            svc,
+            project_id,
+            name,
+            subject,
+            BoardVisibility::Private as i32,
+        )
+        .await
+    }
+
+    async fn create_source_board_with_visibility(
+        svc: &BoardServiceImpl,
+        project_id: Uuid,
+        name: &str,
+        subject: &str,
+        visibility: i32,
+    ) -> Uuid {
         let board = svc
             .create_board(authed_request_with_object(
                 CreateBoardRequest {
@@ -1150,6 +1289,7 @@ mod tests {
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
+                    visibility,
                 },
                 subject,
                 &project_id.to_string(),
@@ -1158,6 +1298,13 @@ mod tests {
             .expect("create_board failed")
             .into_inner();
         let board_id = Uuid::parse_str(&board.id).expect("board id is uuid");
+
+        // BoardService only writes the parent tuple; test Keto does not evaluate
+        // derived permissions, so grant the creator an explicit view tuple.
+        svc.keto
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
+            .await
+            .expect("grant board view failed");
 
         // BoardService does not create a default column; add one directly so
         // card creation tests have a target column.
@@ -1179,9 +1326,9 @@ mod tests {
     /// permissions (e.g. board `view` via project parent) are not evaluated.
     /// Tests that call `get_board` must write the view tuple themselves.
     async fn grant_board_view(keto: &KetoClient, board_id: Uuid, subject: &str) {
-        let _ = keto
-            .grant("KanbanBoard", &board_id.to_string(), "view", subject)
-            .await;
+        keto.grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
+            .await
+            .expect("grant board view failed");
     }
 
     /// Helper to collect a GetAggregatedBoard stream.
@@ -1200,8 +1347,8 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_aggregated_board() {
         let infra = containers::setup().await;
-        let agg_svc = make_service(infra).await;
-        let board_svc = make_board_service(infra).await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
         let project_id = create_test_project(&infra.pool, &subject).await;
@@ -1217,6 +1364,7 @@ mod tests {
                     icon: "layers".to_string(),
                     source_board_ids: vec![board_a.to_string(), board_b.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
             ))
@@ -1269,8 +1417,8 @@ mod tests {
     #[tokio::test]
     async fn list_aggregated_boards_returns_visible_boards() {
         let infra = containers::setup().await;
-        let agg_svc = make_service(infra).await;
-        let board_svc = make_board_service(infra).await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
         let project_id = create_test_project(&infra.pool, &subject).await;
@@ -1284,6 +1432,7 @@ mod tests {
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
             ))
@@ -1299,6 +1448,7 @@ mod tests {
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
             ))
@@ -1326,8 +1476,8 @@ mod tests {
     #[tokio::test]
     async fn add_remove_and_move_source_boards() {
         let infra = containers::setup().await;
-        let agg_svc = make_service(infra).await;
-        let board_svc = make_board_service(infra).await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
         let project_id = create_test_project(&infra.pool, &subject).await;
@@ -1343,6 +1493,7 @@ mod tests {
                     icon: String::new(),
                     source_board_ids: vec![board_a.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
             ))
@@ -1432,9 +1583,9 @@ mod tests {
     #[tokio::test]
     async fn get_aggregated_board_includes_cards() {
         let infra = containers::setup().await;
-        let agg_svc = make_service(infra).await;
-        let board_svc = make_board_service(infra).await;
-        let card_svc = make_card_service(infra);
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
+        let card_svc = make_card_service(&infra);
 
         let subject = format!("user:test-{}", Uuid::new_v4());
         let project_id = create_test_project(&infra.pool, &subject).await;
@@ -1483,6 +1634,7 @@ mod tests {
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &subject,
             ))
@@ -1525,8 +1677,8 @@ mod tests {
     #[tokio::test]
     async fn list_aggregated_boards_hides_boards_from_other_subject() {
         let infra = containers::setup().await;
-        let agg_svc = make_service(infra).await;
-        let board_svc = make_board_service(infra).await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
 
         let owner = format!("user:test-{}", Uuid::new_v4());
         let other = format!("user:test-{}", Uuid::new_v4());
@@ -1541,6 +1693,7 @@ mod tests {
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
+                    visibility: crate::pb::BoardVisibility::Private as i32,
                 },
                 &owner,
             ))
@@ -1564,6 +1717,692 @@ mod tests {
         );
 
         cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_project(&infra.pool, project_id).await;
+    }
+
+    // ── Visibility tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_aggregated_board_allows_non_member_for_public_aggregate() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Public Aggregate".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Public as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create aggregate failed")
+            .into_inner();
+        let agg_id = created.id;
+
+        let stream = agg_svc
+            .get_aggregated_board(authed_request_with_object(
+                GetAggregatedBoardRequest {
+                    aggregated_board_id: agg_id.clone(),
+                },
+                &stranger,
+                &agg_id,
+            ))
+            .await
+            .expect("non-member should view public aggregate")
+            .into_inner();
+
+        let chunks = collect_aggregate_stream(stream).await;
+        let metadata = chunks
+            .iter()
+            .find_map(|c| match &c.payload {
+                Some(ChunkPayload::Metadata(m)) => Some(m),
+                _ => None,
+            })
+            .expect("metadata chunk missing");
+        assert_eq!(metadata.id, agg_id);
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn get_aggregated_board_denies_non_member_for_private_aggregate() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Private Aggregate".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create aggregate failed")
+            .into_inner();
+        let agg_id = created.id;
+
+        let result = agg_svc
+            .get_aggregated_board(authed_request_with_object(
+                GetAggregatedBoardRequest {
+                    aggregated_board_id: agg_id.clone(),
+                },
+                &stranger,
+                &agg_id,
+            ))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "non-member must not view private aggregate"
+        );
+        assert_eq!(
+            result.err().unwrap().code(),
+            tonic::Code::PermissionDenied,
+            "private aggregate must return PermissionDenied"
+        );
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn list_aggregated_boards_returns_public_internal_for_any_authenticated_user() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let viewer = format!("user:test-{}", Uuid::new_v4());
+        let non_viewer = format!("user:test-{}", Uuid::new_v4());
+
+        let public_agg = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Public Agg".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Public as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create public aggregate failed")
+            .into_inner();
+
+        let internal_agg = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Internal Agg".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Internal as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create internal aggregate failed")
+            .into_inner();
+
+        let private_agg = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Private Agg".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create private aggregate failed")
+            .into_inner();
+
+        // Grant one stranger explicit view on the private aggregate.
+        infra
+            .keto
+            .grant_with_retry(KETO_NS, &private_agg.id, "view", &viewer)
+            .await
+            .expect("grant view failed");
+
+        let list = agg_svc
+            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &viewer))
+            .await
+            .expect("list failed")
+            .into_inner();
+
+        let names: Vec<&str> = list
+            .aggregated_boards
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Public Agg"),
+            "public aggregate must be listed"
+        );
+        assert!(
+            names.contains(&"Internal Agg"),
+            "internal aggregate must be listed"
+        );
+        assert!(
+            names.contains(&"Private Agg"),
+            "private aggregate with view tuple must be listed"
+        );
+
+        // A different stranger without a view tuple should see only public/internal.
+        let list_after = agg_svc
+            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &non_viewer))
+            .await
+            .expect("list failed")
+            .into_inner();
+
+        let names_after: Vec<&str> = list_after
+            .aggregated_boards
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            !names_after.contains(&"Private Agg"),
+            "private aggregate must be hidden without view tuple"
+        );
+        assert!(
+            names_after.contains(&"Public Agg"),
+            "public aggregate must still be listed"
+        );
+        assert!(
+            names_after.contains(&"Internal Agg"),
+            "internal aggregate must still be listed"
+        );
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&public_agg.id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&internal_agg.id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&private_agg.id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn update_aggregated_board_visibility_requires_manage_and_persists() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Visibility Patch".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create aggregate failed")
+            .into_inner();
+        let agg_id = created.id;
+
+        // Grant edit (middleware) and manage (handler-level visibility check).
+        infra
+            .keto
+            .grant_with_retry(KETO_NS, &agg_id, "edit", &owner)
+            .await
+            .expect("grant edit failed");
+        infra
+            .keto
+            .grant_with_retry(KETO_NS, &agg_id, "manage", &owner)
+            .await
+            .expect("grant manage failed");
+
+        let updated = agg_svc
+            .update_aggregated_board(authed_request_with_object(
+                UpdateAggregatedBoardRequest {
+                    aggregated_board_id: agg_id.clone(),
+                    aggregated_board: Some(AggregatedBoard {
+                        id: String::new(),
+                        name: String::new(),
+                        description: String::new(),
+                        icon: String::new(),
+                        visibility: BoardVisibility::Public as i32,
+                        created_at: None,
+                        updated_at: None,
+                    }),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["visibility".to_string()],
+                    }),
+                },
+                &owner,
+                &agg_id,
+            ))
+            .await
+            .expect("update visibility failed")
+            .into_inner();
+
+        assert_eq!(
+            updated.visibility,
+            BoardVisibility::Public as i32,
+            "visibility must be persisted as public"
+        );
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn get_aggregated_board_filters_source_boards_by_visibility() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
+        let card_svc = make_card_service(&infra);
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&infra.pool, &owner).await;
+
+        let public_board_id = create_source_board_with_visibility(
+            &board_svc,
+            project_id,
+            "Public Source",
+            &owner,
+            BoardVisibility::Public as i32,
+        )
+        .await;
+        let private_board_id = create_source_board_with_visibility(
+            &board_svc,
+            project_id,
+            "Private Source",
+            &owner,
+            BoardVisibility::Private as i32,
+        )
+        .await;
+
+        // Create one card in each source board.
+        let public_column_id = board_svc
+            .get_board(authed_request_with_object(
+                GetBoardRequest {
+                    board_id: public_board_id.to_string(),
+                },
+                &owner,
+                &public_board_id.to_string(),
+            ))
+            .await
+            .expect("get public board failed")
+            .into_inner()
+            .columns
+            .first()
+            .unwrap()
+            .id
+            .clone();
+        let private_column_id = board_svc
+            .get_board(authed_request_with_object(
+                GetBoardRequest {
+                    board_id: private_board_id.to_string(),
+                },
+                &owner,
+                &private_board_id.to_string(),
+            ))
+            .await
+            .expect("get private board failed")
+            .into_inner()
+            .columns
+            .first()
+            .unwrap()
+            .id
+            .clone();
+
+        card_svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: public_board_id.to_string(),
+                    column_id: public_column_id,
+                    title: "Public Card".to_string(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                },
+                &owner,
+                &public_board_id.to_string(),
+            ))
+            .await
+            .expect("create public card failed");
+
+        card_svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: private_board_id.to_string(),
+                    column_id: private_column_id,
+                    title: "Private Card".to_string(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                },
+                &owner,
+                &private_board_id.to_string(),
+            ))
+            .await
+            .expect("create private card failed");
+
+        // Make the aggregate public so the stranger can access it.
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Filtered Aggregate".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![
+                        public_board_id.to_string(),
+                        private_board_id.to_string(),
+                    ],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Public as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create aggregate failed")
+            .into_inner();
+        let agg_id = created.id;
+
+        let stream = agg_svc
+            .get_aggregated_board(authed_request_with_object(
+                GetAggregatedBoardRequest {
+                    aggregated_board_id: agg_id.clone(),
+                },
+                &stranger,
+                &agg_id,
+            ))
+            .await
+            .expect("stranger should view public aggregate")
+            .into_inner();
+        let chunks = collect_aggregate_stream(stream).await;
+
+        let source_ids: Vec<String> = chunks
+            .iter()
+            .filter_map(|c| match &c.payload {
+                Some(ChunkPayload::SourceBoard(sb)) => Some(sb.board_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(source_ids.len(), 1, "only public source board visible");
+        assert_eq!(source_ids[0], public_board_id.to_string());
+
+        let cards: Vec<&Card> = chunks
+            .iter()
+            .filter_map(|c| match &c.payload {
+                Some(ChunkPayload::CardBatch(batch)) => {
+                    Some(batch.cards.iter().collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(cards.len(), 1, "only card from public source board visible");
+        assert_eq!(cards[0].title, "Public Card");
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_project(&infra.pool, project_id).await;
+    }
+
+    // ── Delete + non-visibility update paths ───────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_aggregated_board_removes_row() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "To Delete".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private as i32,
+                },
+                &owner,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        agg_svc
+            .delete_aggregated_board(authed_request_with_object(
+                DeleteAggregatedBoardRequest {
+                    aggregated_board_id: created.id.clone(),
+                },
+                &owner,
+                &created.id,
+            ))
+            .await
+            .expect("delete failed");
+
+        let count: i64 = sqlx::query("SELECT COUNT(*) FROM aggregated_boards WHERE id = $1")
+            .bind(Uuid::parse_str(&created.id).unwrap())
+            .fetch_one(&infra.pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 0, "aggregated board must be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_aggregated_board_returns_not_found_for_missing() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let missing_id = Uuid::new_v4().to_string();
+        let result = agg_svc
+            .delete_aggregated_board(authed_request_with_object(
+                DeleteAggregatedBoardRequest {
+                    aggregated_board_id: missing_id.clone(),
+                },
+                &owner,
+                &missing_id,
+            ))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn update_aggregated_board_patches_name_and_description() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Original".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private as i32,
+                },
+                &owner,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Grant edit so the update request passes middleware.
+        infra
+            .keto
+            .grant_with_retry(KETO_NS, &created.id, "edit", &owner)
+            .await
+            .expect("grant edit failed");
+
+        let updated = agg_svc
+            .update_aggregated_board(authed_request_with_object(
+                UpdateAggregatedBoardRequest {
+                    aggregated_board_id: created.id.clone(),
+                    aggregated_board: Some(AggregatedBoard {
+                        id: String::new(),
+                        name: "Renamed".to_string(),
+                        description: "New desc".to_string(),
+                        icon: String::new(),
+                        visibility: BoardVisibility::Private as i32,
+                        created_at: None,
+                        updated_at: None,
+                    }),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["name".to_string(), "description".to_string()],
+                    }),
+                },
+                &owner,
+                &created.id,
+            ))
+            .await
+            .expect("update failed")
+            .into_inner();
+
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.description, "New desc");
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&created.id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_aggregated_board_emits_cutover() {
+        let infra = containers::setup().await;
+        let agg_svc = make_service(&infra).await;
+        let board_svc = make_board_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&infra.pool, &owner).await;
+        let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
+
+        let created = agg_svc
+            .create_aggregated_board(authed_request(
+                CreateAggregatedBoardRequest {
+                    name: "Agg".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    source_board_ids: vec![board_id.to_string()],
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Public as i32,
+                },
+                &owner,
+            ))
+            .await
+            .expect("create aggregated board")
+            .into_inner();
+
+        // Grant view so the subscribe request passes the middleware check.
+        infra
+            .keto
+            .grant_with_retry(KETO_NS, &created.id, "view", &owner)
+            .await
+            .expect("grant view failed");
+
+        let mut req = Request::new(SubscribeAggregatedBoardRequest {
+            aggregated_board_id: created.id.clone(),
+            since_seq: 0,
+        });
+        req.extensions_mut()
+            .insert(sunbeam_g2v::middleware::auth::AuthContext::authenticated(
+                &owner, None,
+            ));
+
+        let mut stream = agg_svc
+            .subscribe_aggregated_board(req)
+            .await
+            .expect("subscribe should succeed")
+            .into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream timed out before cutover")
+            .expect("stream ended before cutover")
+            .expect("cutover envelope errored");
+
+        assert!(
+            matches!(first.payload, Some(EventPayload::Cutover(_))),
+            "first payload should be a cutover"
+        );
+
+        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&created.id).unwrap()).await;
+        cleanup_project(&infra.pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn build_subscribe_stream_emits_heartbeat_with_short_interval() {
+        let infra = containers::setup().await;
+        let board_svc = make_board_service(&infra).await;
+
+        let owner = format!("user:test-{}", Uuid::new_v4());
+        let project_id = create_test_project(&infra.pool, &owner).await;
+        let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &infra.nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("ensure kanban stream");
+
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&infra.nats),
+            "pod-test-stream",
+        ));
+
+        let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
+            registry,
+            keto: Arc::clone(&infra.keto),
+            watermark: Arc::clone(&infra.watermark),
+            auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(&owner, None),
+            aggregated_board_id: Uuid::new_v4().to_string(),
+            source_board_ids: vec![board_id],
+            is_private: false,
+            heartbeat_interval: Duration::from_millis(10),
+            keto_recheck_interval: Duration::from_millis(100),
+        })
+        .await
+        .expect("build stream should succeed");
+
+        let mut stream = stream;
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for first item")
+            .expect("stream ended before first item")
+            .expect("first item errored");
+        assert!(
+            matches!(first.payload, Some(EventPayload::Cutover(_))),
+            "first item should be cutover"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for heartbeat")
+            .expect("stream ended before heartbeat")
+            .expect("heartbeat item errored");
+        assert!(
+            matches!(second.payload, Some(EventPayload::Heartbeat(_))),
+            "second item should be a heartbeat"
+        );
+
         cleanup_project(&infra.pool, project_id).await;
     }
 }
