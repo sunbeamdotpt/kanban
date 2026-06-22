@@ -42,13 +42,16 @@ use crate::pb::{
     attachment_service_server::AttachmentServiceServer, auth_service_server::AuthServiceServer,
     board_service_server::BoardServiceServer, card_service_server::CardServiceServer,
     github_link_service_server::GithubLinkServiceServer,
-    project_service_server::ProjectServiceServer, search_service_server::SearchServiceServer,
+    project_service_server::ProjectServiceServer,
+    public_board_service_server::PublicBoardServiceServer,
+    search_service_server::SearchServiceServer,
 };
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
     auth::AuthServiceImpl, boards::BoardServiceImpl, cards::CardServiceImpl,
-    github::GitHubServiceImpl, projects::ProjectServiceImpl, search::SearchServiceImpl,
+    github::GitHubServiceImpl, projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl,
+    search::SearchServiceImpl,
 };
 
 // ── JetStream stream name & config ──────────────────────────────────────────
@@ -188,7 +191,7 @@ async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// `/metrics` — render Prometheus text format.
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn metrics_handler(State(state): State<AppState>) -> (StatusCode, String) {
     let encoder = TextEncoder::new();
     let mf = state.metrics.registry.gather();
     match encoder.encode_to_string(&mf) {
@@ -202,39 +205,99 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
-pub async fn run() -> Result<()> {
-    // ── 1. Config from env ──────────────────────────────────────────────────
-    let port: u16 = std::env::var("KANBAN_PORT")
-        .unwrap_or_else(|_| "8080".into())
+// ── Configuration ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub addr: SocketAddr,
+    pub jwt_secret: String,
+    pub database_url: String,
+    pub nats_url: String,
+    pub valkey_url: String,
+    pub keto_read_addr: String,
+    pub keto_write_addr: String,
+    pub opensearch_url: String,
+    pub s3_endpoint: Option<String>,
+    pub pod_name: Option<String>,
+}
+
+pub fn load_config() -> Result<AppConfig> {
+    load_config_with(|key| std::env::var(key).ok())
+}
+
+pub fn load_config_with<F>(get_env: F) -> Result<AppConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let port: u16 = get_env("KANBAN_PORT")
+        .unwrap_or_else(|| "8080".into())
         .parse()
         .context("KANBAN_PORT must be a valid port number")?;
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
 
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "change-me".into());
+    let jwt_secret = get_env("JWT_SECRET").unwrap_or_else(|| "change-me".into());
 
-    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let database_url =
+        get_env("DATABASE_URL").context("DATABASE_URL is required")?;
 
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
+    let nats_url = get_env("NATS_URL").unwrap_or_else(|| "nats://localhost:4222".into());
 
     let valkey_url =
-        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        get_env("VALKEY_URL").unwrap_or_else(|| "redis://localhost:6379".into());
 
     let keto_read_addr =
-        std::env::var("KETO_READ_ADDR").unwrap_or_else(|_| "http://localhost:4466".into());
+        get_env("KETO_READ_ADDR").unwrap_or_else(|| "http://localhost:4466".into());
 
     let keto_write_addr =
-        std::env::var("KETO_WRITE_ADDR").unwrap_or_else(|_| "http://localhost:4467".into());
+        get_env("KETO_WRITE_ADDR").unwrap_or_else(|| "http://localhost:4467".into());
 
-    // ── 2. OTel tracing init ────────────────────────────────────────────────
+    let opensearch_url =
+        get_env("OPENSEARCH_URL").unwrap_or_else(|| "http://localhost:9200".into());
+
+    let s3_endpoint = get_env("S3_ENDPOINT");
+    let pod_name = get_env("POD_NAME");
+
+    Ok(AppConfig {
+        addr,
+        jwt_secret,
+        database_url,
+        nats_url,
+        valkey_url,
+        keto_read_addr,
+        keto_write_addr,
+        opensearch_url,
+        s3_endpoint,
+        pod_name,
+    })
+}
+
+// ── Main entry point ─────────────────────────────────────────────────────────
+
+pub async fn run() -> Result<()> {
+    let config = load_config()?;
+
+    // OTel tracing init.
     init_otel_tracing()?;
 
-    info!(addr = %addr, "kanban service starting");
+    info!(addr = %config.addr, "kanban service starting");
 
+    let listener = tokio::net::TcpListener::bind(config.addr)
+        .await
+        .with_context(|| format!("failed to bind to {}", config.addr))?;
+
+    run_with_config(config, listener, shutdown_signal()).await
+}
+
+pub async fn run_with_config(
+    config: AppConfig,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     // ── 3. Postgres + migrations ────────────────────────────────────────────
     let pg_pool = PgPoolOptions::new()
         .max_connections(20)
         .acquire_timeout(Duration::from_secs(10))
-        .connect(&database_url)
+        .connect(&config.database_url)
         .await
         .context("failed to connect to Postgres")?;
 
@@ -248,7 +311,7 @@ pub async fn run() -> Result<()> {
     // ── 4. NATS + JetStream bootstrap (fatal on failure) ───────────────────
     let nats = Arc::new(
         NatsClient::connect(&NatsConfig {
-            url: nats_url,
+            url: config.nats_url,
             jetstream: true,
             lease_duration: 30,
         })
@@ -278,22 +341,25 @@ pub async fn run() -> Result<()> {
     info!("outbox dispatcher spawned");
 
     // ── 4c. BoardSubscriberRegistry — per-pod NATS push consumer fanout ────
-    let pod_id =
-        std::env::var("POD_NAME").unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+    let pod_id = config
+        .pod_name
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let board_registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), pod_id));
 
     info!("BoardSubscriberRegistry constructed");
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
-    let watermark =
-        Arc::new(LogoutWatermark::new(&valkey_url).context("failed to construct LogoutWatermark")?);
+    let watermark = Arc::new(
+        LogoutWatermark::new(&config.valkey_url)
+            .context("failed to construct LogoutWatermark")?,
+    );
 
     info!("Valkey client initialised");
 
     // ── 6. Keto client + synthetic readiness tuple ──────────────────────────
     let keto = Arc::new(KetoClient::new(KetoConfig {
-        grpc_endpoint: keto_read_addr,
-        write_grpc_endpoint: keto_write_addr,
+        grpc_endpoint: config.keto_read_addr,
+        write_grpc_endpoint: config.keto_write_addr,
     }));
 
     ensure_keto_health_tuple(&keto).await?;
@@ -309,14 +375,16 @@ pub async fn run() -> Result<()> {
     let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
     info!(
         "S3 client initialised (endpoint={})",
-        std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "<default>".into())
+        config
+            .s3_endpoint
+            .unwrap_or_else(|| "<default>".into())
     );
 
     // ── 8b. OpenSearch client for SearchService ─────────────────────────────
     let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()));
     info!(
         "OpenSearch client initialised (url={})",
-        std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into())
+        config.opensearch_url
     );
 
     // ── Build tonic gRPC router ─────────────────────────────────────────────
@@ -353,10 +421,30 @@ pub async fn run() -> Result<()> {
         watermark: Arc::clone(&watermark),
     }))
     .add_service(SearchServiceServer::new(SearchServiceImpl {
+        pool: pg_pool.clone(),
         keto: Arc::clone(&keto),
         opensearch: Arc::clone(&opensearch_client),
+        index_name: None,
     }))
     .into_axum_router();
+
+    // Public, unauthenticated RPCs (no JWT / Keto middleware).
+    // We route each method directly to the tonic service so the resulting
+    // axum Router has no fallback; this lets us merge it with the main gRPC
+    // router (which does have a fallback) without a runtime panic.
+    let public_svc = PublicBoardServiceServer::new(PublicBoardServiceImpl {
+        pool: pg_pool.clone(),
+    });
+    let public_axum = Router::new()
+        .route_service(
+            "/sunbeam.kanban.v1.PublicBoardService/GetPublicBoard",
+            public_svc.clone(),
+        )
+        .route_service(
+            "/sunbeam.kanban.v1.PublicBoardService/ListPublicBoards",
+            public_svc,
+        )
+        .layer(TraceLayer::new_for_http());
 
     // ── 9. Middleware stack (outer → inner) + axum Router ───────────────────
     //
@@ -373,7 +461,7 @@ pub async fn run() -> Result<()> {
     });
 
     let jwt_validator = JwtValidator::new(AuthConfig {
-        jwt_secret: jwt_secret.clone(),
+        jwt_secret: config.jwt_secret.clone(),
         token_expiry: 3600,
     });
 
@@ -389,30 +477,26 @@ pub async fn run() -> Result<()> {
         .route("/metrics", get(metrics_handler))
         .with_state(app_state);
 
-    // Non-RPC routes serve health/metrics; unmatched paths fall through to
-    // the tonic gRPC axum router.
-    let app = aux_router
-        .merge(grpc_axum)
+    // Apply auth layers only to the gRPC router. Health/metrics routes live
+    // on their own unauthenticated router, and public RPCs are merged after the
+    // auth layers so they remain unauthenticated.
+    let grpc_auth = grpc_axum
         // keto_dispatch (innermost applied = innermost executed)
         .layer(middleware::from_fn_with_state(dispatch_state, dispatch))
         // JwtLayer — validates Bearer, inserts Extension<AuthContext>
         .layer(JwtLayer::new(jwt_validator))
-        // Prometheus metrics wrapper (records duration + status) — placeholder
-        // for Stage 3; the KanbanMetrics struct is declared and scrape-able now.
-        // Tower-level per-request instrumentation wired in Stage 3.
-        //
         // Tracing / OTel propagation (outermost)
         .layer(TraceLayer::new_for_http());
 
-    // ── 10. Bind and serve until SIGTERM ────────────────────────────────────
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind to {addr}"))?;
+    let app = Router::new()
+        .merge(aux_router.layer(TraceLayer::new_for_http()))
+        .merge(grpc_auth)
+        .merge(public_axum);
 
-    info!(addr = %addr, "kanban listening");
+    info!(addr = %listener.local_addr().unwrap_or(config.addr), "kanban listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
         .context("axum serve error")?;
 
@@ -500,4 +584,181 @@ async fn ensure_keto_health_tuple(keto: &KetoClient) -> Result<()> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("received shutdown signal");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::test_support::containers;
+
+    #[test]
+    fn kanban_metrics_new_succeeds() {
+        let metrics = KanbanMetrics::new();
+        assert!(metrics.is_ok(), "metrics registration should succeed");
+    }
+
+    #[tokio::test]
+    async fn healthz_ready_returns_ok_when_tuple_present() {
+        let infra = containers::setup().await;
+
+        // Ensure the synthetic health tuple exists.
+        ensure_keto_health_tuple(&infra.keto)
+            .await
+            .expect("health tuple should be writable");
+
+        let metrics = Arc::new(KanbanMetrics::new().unwrap());
+        let state = AppState {
+            keto: Arc::clone(&infra.keto),
+            metrics,
+        };
+
+        let resp = healthz_ready(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_renders_prometheus_text() {
+        let infra = containers::setup().await;
+        let metrics = Arc::new(KanbanMetrics::new().unwrap());
+        let state = AppState {
+            keto: Arc::clone(&infra.keto),
+            metrics,
+        };
+
+        let (status, body) = metrics_handler(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("kanban_logout_watermark_errors_total"),
+            "metrics body should contain kanban_logout_watermark_errors_total: {body}"
+        );
+    }
+
+    #[test]
+    fn init_otel_tracing_without_endpoint_succeeds() {
+        // If a subscriber is already set (e.g. from another test), the function
+        // returns Ok because it ignores the duplicate-init error.
+        let result = init_otel_tracing();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn healthz_live_returns_ok() {
+        let resp = healthz_live().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn load_config_with_parses_all_fields() {
+        let cfg = load_config_with(|key| match key {
+            "KANBAN_PORT" => Some("1234".into()),
+            "JWT_SECRET" => Some("secret".into()),
+            "DATABASE_URL" => Some("postgres://db".into()),
+            "NATS_URL" => Some("nats://nats".into()),
+            "VALKEY_URL" => Some("redis://valkey".into()),
+            "KETO_READ_ADDR" => Some("http://keto-read".into()),
+            "KETO_WRITE_ADDR" => Some("http://keto-write".into()),
+            "OPENSEARCH_URL" => Some("http://opensearch".into()),
+            "S3_ENDPOINT" => Some("http://s3".into()),
+            "POD_NAME" => Some("pod-1".into()),
+            _ => None,
+        })
+        .expect("config should parse");
+
+        assert_eq!(cfg.addr.port(), 1234);
+        assert_eq!(cfg.jwt_secret, "secret");
+        assert_eq!(cfg.database_url, "postgres://db");
+        assert_eq!(cfg.nats_url, "nats://nats");
+        assert_eq!(cfg.valkey_url, "redis://valkey");
+        assert_eq!(cfg.keto_read_addr, "http://keto-read");
+        assert_eq!(cfg.keto_write_addr, "http://keto-write");
+        assert_eq!(cfg.opensearch_url, "http://opensearch");
+        assert_eq!(cfg.s3_endpoint, Some("http://s3".into()));
+        assert_eq!(cfg.pod_name, Some("pod-1".into()));
+    }
+
+    #[test]
+    fn load_config_with_uses_defaults() {
+        let cfg = load_config_with(|key| match key {
+            "DATABASE_URL" => Some("postgres://db".into()),
+            _ => None,
+        })
+        .expect("config should parse with defaults");
+
+        assert_eq!(cfg.addr.port(), 8080);
+        assert_eq!(cfg.jwt_secret, "change-me");
+        assert_eq!(cfg.nats_url, "nats://localhost:4222");
+        assert_eq!(cfg.valkey_url, "redis://localhost:6379");
+        assert_eq!(cfg.keto_read_addr, "http://localhost:4466");
+        assert_eq!(cfg.keto_write_addr, "http://localhost:4467");
+        assert_eq!(cfg.opensearch_url, "http://localhost:9200");
+        assert!(cfg.pod_name.is_none());
+    }
+
+    #[test]
+    fn load_config_with_requires_database_url() {
+        let err = load_config_with(|_| None).unwrap_err();
+        assert!(
+            err.to_string().contains("DATABASE_URL is required"),
+            "error should mention DATABASE_URL: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_with_rejects_invalid_port() {
+        let err = load_config_with(|key| match key {
+            "DATABASE_URL" => Some("postgres://db".into()),
+            "KANBAN_PORT" => Some("not-a-port".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("KANBAN_PORT"),
+            "error should mention KANBAN_PORT: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_config_starts_and_serves_health() {
+        let _infra = containers::setup().await;
+
+        let config = AppConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            jwt_secret: "test-secret".into(),
+            database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL"),
+            nats_url: std::env::var("NATS_URL").expect("NATS_URL"),
+            valkey_url: std::env::var("VALKEY_URL").expect("VALKEY_URL"),
+            keto_read_addr: std::env::var("KETO_READ_ADDR").expect("KETO_READ_ADDR"),
+            keto_write_addr: std::env::var("KETO_WRITE_ADDR").expect("KETO_WRITE_ADDR"),
+            opensearch_url: std::env::var("OPENSEARCH_URL")
+                .unwrap_or_else(|_| "http://localhost:9200".into()),
+            s3_endpoint: std::env::var("S3_ENDPOINT").ok(),
+            pod_name: Some("test-pod".into()),
+        };
+
+        let listener = tokio::net::TcpListener::bind(config.addr)
+            .await
+            .expect("test listener should bind");
+        let local_addr = listener.local_addr().expect("local addr");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async { rx.await.ok(); };
+
+        let handle = tokio::spawn(async move {
+            run_with_config(config, listener, shutdown).await
+        });
+
+        // Wait for migrations + service startup.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let resp = reqwest::get(format!("http://{local_addr}/healthz/live"))
+            .await
+            .expect("should reach health endpoint");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        tx.send(()).ok();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .ok();
+    }
 }
