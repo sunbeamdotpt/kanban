@@ -1,0 +1,152 @@
+// proto/sunbeam/kanban/v1/templates.proto
+//
+// Reusable board templates. Global templates are available to every user;
+// project-scoped templates are only visible within their project.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// A column preset stored inside a template.
+message TemplateColumn {
+  string title = 1;
+  // 0-based display order.
+  int32 position = 2;
+  // CSS color token, e.g. "blue" | "amber" | "green".
+  string accent = 3;
+}
+
+// BoardTemplate is a reusable column layout.
+message BoardTemplate {
+  string id = 1;
+  // Empty when the template is global.
+  string project_id = 2;
+  string name = 3;
+  string description = 4;
+  repeated TemplateColumn columns = 5;
+  bool is_global = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message ListTemplatesRequest {
+  // If set, include project-scoped templates for this project in addition to
+  // global templates. Omit to return only global templates.
+  string project_id = 1;
+}
+
+message ListTemplatesResponse {
+  repeated BoardTemplate templates = 1;
+}
+
+message GetTemplateRequest {
+  string template_id = 1;
+}
+
+message CreateTemplateRequest {
+  string project_id = 1;
+  string name = 2;
+  string description = 3;
+  repeated TemplateColumn columns = 4;
+}
+
+message UpdateTemplateRequest {
+  string template_id = 1;
+  // Fields to update. Supports "name", "description", and "columns".
+  google.protobuf.FieldMask update_mask = 2;
+  string name = 3;
+  string description = 4;
+  repeated TemplateColumn columns = 5;
+}
+
+message DeleteTemplateRequest {
+  string template_id = 1;
+}
+
+// A default checklist item stored inside a card template.
+message TemplateChecklistItem {
+  string title = 1;
+}
+
+// CardTemplate is a reusable card preset.
+message CardTemplate {
+  string id = 1;
+  // Empty when the template is global.
+  string project_id = 2;
+  string name = 3;
+  string description = 4;
+  // Default card title when instantiated.
+  string title = 5;
+  // Default card description when instantiated.
+  string default_description = 6;
+  repeated string label_names = 7;
+  repeated TemplateChecklistItem checklist_items = 8;
+  bool is_global = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message ListCardTemplatesRequest {
+  // If set, include project-scoped templates for this project in addition to
+  // global templates. Omit to return only global templates.
+  string project_id = 1;
+}
+
+message ListCardTemplatesResponse {
+  repeated CardTemplate templates = 1;
+}
+
+message GetCardTemplateRequest {
+  string template_id = 1;
+}
+
+message CreateCardTemplateRequest {
+  string project_id = 1;
+  string name = 2;
+  string description = 3;
+  string title = 4;
+  string default_description = 5;
+  repeated string label_names = 6;
+  repeated TemplateChecklistItem checklist_items = 7;
+}
+
+message UpdateCardTemplateRequest {
+  string template_id = 1;
+  // Fields to update. Supports "name", "description", "title",
+  // "default_description", "label_names", and "checklist_items".
+  google.protobuf.FieldMask update_mask = 2;
+  string name = 3;
+  string description = 4;
+  string title = 5;
+  string default_description = 6;
+  repeated string label_names = 7;
+  repeated TemplateChecklistItem checklist_items = 8;
+}
+
+message DeleteCardTemplateRequest {
+  string template_id = 1;
+}
+
+service TemplatesService {
+  // Board templates.
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  rpc GetTemplate(GetTemplateRequest) returns (BoardTemplate);
+  rpc CreateTemplate(CreateTemplateRequest) returns (BoardTemplate);
+  rpc UpdateTemplate(UpdateTemplateRequest) returns (BoardTemplate);
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (google.protobuf.Empty);
+
+  // Card templates.
+  rpc ListCardTemplates(ListCardTemplatesRequest) returns (ListCardTemplatesResponse);
+  rpc GetCardTemplate(GetCardTemplateRequest) returns (CardTemplate);
+  rpc CreateCardTemplate(CreateCardTemplateRequest) returns (CardTemplate);
+  rpc UpdateCardTemplate(UpdateCardTemplateRequest) returns (CardTemplate);
+  rpc DeleteCardTemplate(DeleteCardTemplateRequest) returns (google.protobuf.Empty);
+}
