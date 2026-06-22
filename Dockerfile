@@ -12,7 +12,7 @@ ARG VERSION=0.1.0
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.94-bookworm AS builder
 
 # Bring in xx cross-compilation helpers.
 COPY --from=xx / /
