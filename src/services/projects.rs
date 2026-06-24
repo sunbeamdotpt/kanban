@@ -580,42 +580,15 @@ impl ProjectService for ProjectServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
-
-    // ── Test env config ──────────────────────────────────────────────────────
-
-    fn database_url() -> String {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
-    }
-
-    fn keto_read_url() -> String {
-        std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string())
-    }
-
-    fn keto_write_url() -> String {
-        std::env::var("KETO_WRITE_GRPC_URL").unwrap_or_else(|_| "http://localhost:4467".to_string())
-    }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
 
     async fn setup_pool() -> PgPool {
-        PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&database_url())
-            .await
-            .expect("failed to connect to Postgres")
+        crate::test_support::setup_pool().await
     }
 
-    fn setup_keto() -> Arc<KetoClient> {
-        Arc::new(KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_read_url(),
-                write_grpc_endpoint: keto_write_url(),
-            },
-        ))
+    async fn setup_keto() -> Arc<KetoClient> {
+        crate::test_support::setup_keto().await
     }
 
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
@@ -684,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_returns_same_project() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -739,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn list_projects_returns_only_visible_via_keto_expand() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject_a = format!("user:test-a-{}", Uuid::new_v4());
@@ -838,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn update_project_applies_patch_fields_only() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -902,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn delete_project_cascades_and_clears_keto_tuples() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -961,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn add_member_writes_keto_then_sql_row() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
@@ -1026,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn remove_member_clears_both_keto_and_sql() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
@@ -1107,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn list_members_returns_inserted_rows() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let owner = format!("user:test-owner-{}", Uuid::new_v4());
@@ -1188,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn create_with_idempotency_key_returns_cached_response_on_replay() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -1243,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_project_returns_unimplemented_pending_stage_4c5() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
         let subject = format!("user:test-{}", Uuid::new_v4());

@@ -172,20 +172,28 @@ pub(crate) fn nats_url() -> String {
     std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
 }
 
+/// Start the shared testcontainers stack (if not already started) and return a
+/// Postgres pool. Tests can call this directly instead of relying on the
+/// removed ctor/dtor harness.
+#[cfg(test)]
+pub async fn setup_pool() -> PgPool {
+    containers::setup().await.pool.clone()
+}
+
+/// Start the shared testcontainers stack (if not already started) and return a
+/// Keto client.
+#[cfg(test)]
+pub async fn setup_keto() -> std::sync::Arc<sunbeam_g2v::middleware::auth::keto::KetoClient> {
+    containers::setup().await.keto.clone()
+}
+
 // ── Testcontainers-backed dependency harness ───────────────────────────────
 //
-// This module starts Postgres, NATS (JetStream), Valkey, and Ory Keto in
-// throwaway containers when `containers::setup()` is first called. The
-// implementation uses testcontainers' GenericImage directly instead of
-// module-specific wrappers because Apple Container's Docker-compatible API
-// (accessed via socktainer) does not reliably stream container logs, so
-// log-based readiness strategies hang. Instead we start containers with no
-// wait strategy and poll readiness manually.
-//
-// Because socktainer does not publish container ports to the host, we connect
-// to each container via its bridge IP address and the original internal port.
-// `sunbeam_test::container_bridge_ip` resolves that IP by inspecting
-// `NetworkSettings.Networks`, which works with this runtime.
+// This module starts Postgres, NATS (JetStream), Valkey, Ory Keto, MinIO, and
+// OpenSearch in throwaway containers when `containers::setup()` is first called.
+// Containers are started through the Docker-compatible API pointed at by
+// `DOCKER_HOST`; testcontainers' host-port mapping is used, so the harness
+// works natively with lima-docker and other remote Docker contexts.
 
 #[cfg(test)]
 pub(crate) mod containers {
@@ -196,7 +204,6 @@ pub(crate) mod containers {
     use sunbeam_g2v::config::NatsConfig;
     use sunbeam_g2v::middleware::auth::keto::KetoClient;
     use sunbeam_g2v::mq::NatsClient;
-    use sunbeam_test::container_bridge_ip;
     use testcontainers::core::{ContainerPort, IntoContainerPort};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -238,8 +245,8 @@ pub(crate) mod containers {
     ///
     /// A fresh `TestInfra` is returned on every call so that each test owns
     /// its own Postgres pool and clients. The heavy container handles are kept
-    /// alive in the static `SHARED` singleton and stopped when the test process
-    /// exits.
+    /// alive in the static `SHARED` singleton; testcontainers removes the
+    /// containers when the test process exits.
     pub struct TestInfra {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
@@ -284,7 +291,6 @@ pub(crate) mod containers {
     }
 
     static SHARED: Mutex<Option<SharedInfra>> = Mutex::const_new(None);
-    static CONTAINER_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     /// Set up the shared test infrastructure and return a fresh `TestInfra`
     /// for the calling test.
@@ -311,73 +317,6 @@ pub(crate) mod containers {
             &urls.keto_write_url,
         )
         .await
-    }
-
-    /// Stop and remove every container started by this harness.
-    ///
-    /// This is synchronous so it can be called from `#[ctor::dtor]` at process
-    /// exit. Containers are removed with `container rm -f` (falling back to
-    /// `docker rm -f`) so the runtime's async context does not matter.
-    pub fn teardown() {
-        let ids: Vec<String> = match CONTAINER_IDS.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-
-        for id in ids {
-            remove_container(&id);
-        }
-    }
-
-    fn remove_container(id: &str) {
-        // Prefer the Docker-compatible API over the local CLI. The Apple
-        // Container `container` binary uses UUIDs in its UI that do not match
-        // the ids returned by testcontainers, but the unix socket still speaks
-        // the Docker Engine API and accepts the id we have.
-        if let Ok(docker_host) = std::env::var("DOCKER_HOST") {
-            if docker_host.starts_with("unix://") {
-                let path = &docker_host["unix://".len()..];
-                if api_remove(path, id) {
-                    eprintln!("[testcontainers] removed container {id}");
-                    return;
-                }
-            }
-        }
-
-        // Fall back to whichever container CLI is available.
-        for binary in ["container", "docker"] {
-            let output = std::process::Command::new(binary)
-                .args(["rm", "-f", id])
-                .output();
-            if let Ok(output) = output {
-                if output.status.success() {
-                    eprintln!("[testcontainers] removed container {id}");
-                    return;
-                }
-            }
-        }
-        eprintln!("[testcontainers] failed to remove container {id}");
-    }
-
-    fn api_remove(socket_path: &str, id: &str) -> bool {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
-        let request = format!(
-            "DELETE /containers/{id}?force=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        );
-        let mut stream = match UnixStream::connect(socket_path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        if stream.write_all(request.as_bytes()).is_err() {
-            return false;
-        }
-        let mut response = String::new();
-        if stream.read_to_string(&mut response).is_err() {
-            return false;
-        }
-        response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.1 404")
     }
 
     /// Use externally-provided services when the standard env vars are set.
@@ -419,39 +358,30 @@ pub(crate) mod containers {
         let startup_timeout = Duration::from_secs(600);
 
         let pg = start_postgres(startup_timeout).await;
-        let pg_ip = bridge_ip(&pg).await;
-        let database_url = format!("postgres://sunbeam:sunbeam@{pg_ip}:5432/kanban");
+        let (pg_host, pg_port) = host_port(&pg, 5432).await;
+        let database_url = format!("postgres://sunbeam:sunbeam@{pg_host}:{pg_port}/kanban");
 
         let nats = start_nats(startup_timeout).await;
-        let nats_ip = bridge_ip(&nats).await;
-        let nats_url = format!("nats://{nats_ip}:4222");
+        let (nats_host, nats_port) = host_port(&nats, 4222).await;
+        let nats_url = format!("nats://{nats_host}:{nats_port}");
 
         let valkey = start_valkey(startup_timeout).await;
-        let valkey_ip = bridge_ip(&valkey).await;
-        let valkey_url = format!("redis://{valkey_ip}:6379");
+        let (valkey_host, valkey_port) = host_port(&valkey, 6379).await;
+        let valkey_url = format!("redis://{valkey_host}:{valkey_port}");
 
         let keto = start_keto(startup_timeout).await;
-        let keto_ip = bridge_ip(&keto).await;
-        let keto_read_url = format!("http://{keto_ip}:4466");
-        let keto_write_url = format!("http://{keto_ip}:4467");
+        let (keto_host, keto_read_port) = host_port(&keto, 4466).await;
+        let (_, keto_write_port) = host_port(&keto, 4467).await;
+        let keto_read_url = format!("http://{keto_host}:{keto_read_port}");
+        let keto_write_url = format!("http://{keto_host}:{keto_write_port}");
 
         let minio = start_minio(startup_timeout).await;
-        let minio_ip = bridge_ip(&minio).await;
-        let s3_endpoint = format!("http://{minio_ip}:9000");
+        let (minio_host, minio_port) = host_port(&minio, 9000).await;
+        let s3_endpoint = format!("http://{minio_host}:{minio_port}");
 
         let opensearch = start_opensearch(startup_timeout).await;
-        let opensearch_ip = bridge_ip(&opensearch).await;
-        let opensearch_url = format!("http://{opensearch_ip}:9200");
-
-        {
-            let mut ids = CONTAINER_IDS.lock().unwrap();
-            ids.push(pg.id().to_string());
-            ids.push(nats.id().to_string());
-            ids.push(valkey.id().to_string());
-            ids.push(keto.id().to_string());
-            ids.push(minio.id().to_string());
-            ids.push(opensearch.id().to_string());
-        }
+        let (opensearch_host, opensearch_port) = host_port(&opensearch, 9200).await;
+        let opensearch_url = format!("http://{opensearch_host}:{opensearch_port}");
 
         // Export the service URLs as environment variables so that tests that
         // spin up their own clients (e.g. auth::keto_dispatch integration tests)
@@ -506,15 +436,18 @@ pub(crate) mod containers {
         }
     }
 
-    /// Return the bridge IP address of a running container.
+    /// Return the host and published port for a running container.
     ///
-    /// Uses `sunbeam_test::container_bridge_ip`, which inspects
-    /// `NetworkSettings.Networks` directly and therefore works with runtimes
-    /// such as socktainer that do not expose host port mappings.
-    async fn bridge_ip(container: &ContainerAsync<GenericImage>) -> String {
-        container_bridge_ip(container.id())
+    /// With native Docker (including lima-docker) ports are published to the
+    /// host, so tests can connect via `localhost:<mapped-port>` instead of the
+    /// container bridge IP.
+    async fn host_port(container: &ContainerAsync<GenericImage>, port: u16) -> (String, u16) {
+        let host = container.get_host().await.expect("failed to resolve container host");
+        let mapped = container
+            .get_host_port_ipv4(ContainerPort::Tcp(port))
             .await
-            .expect("failed to resolve container bridge IP")
+            .expect("failed to resolve container host port");
+        (host.to_string(), mapped)
     }
 
     async fn start_postgres(timeout: Duration) -> ContainerAsync<GenericImage> {
@@ -534,14 +467,13 @@ pub(crate) mod containers {
             .await
             .expect("failed to start Postgres container");
 
-        let host = bridge_ip(&container).await;
+        let (host, port) = host_port(&container, 5432).await;
 
         // Poll until Postgres accepts connections.
         for _ in 0..120 {
-            match tokio::net::TcpStream::connect((&*host, 5432)).await {
+            match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(_) => {
-                    // Also verify we can run a simple query.
-                    let url = format!("postgres://sunbeam:sunbeam@{host}:5432/kanban");
+                    let url = format!("postgres://sunbeam:sunbeam@{host}:{port}/kanban");
                     if let Ok(pool) = PgPoolOptions::new()
                         .max_connections(1)
                         .acquire_timeout(Duration::from_secs(2))
@@ -576,10 +508,10 @@ pub(crate) mod containers {
             .await
             .expect("failed to start NATS container");
 
-        let host = bridge_ip(&container).await;
+        let (host, port) = host_port(&container, 4222).await;
 
         for _ in 0..120 {
-            if tokio::net::TcpStream::connect((&*host, 4222)).await.is_ok() {
+            if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
                 return container;
             }
             sleep(Duration::from_millis(250)).await;
@@ -602,10 +534,10 @@ pub(crate) mod containers {
             .await
             .expect("failed to start Valkey container");
 
-        let host = bridge_ip(&container).await;
+        let (host, port) = host_port(&container, 6379).await;
 
         for _ in 0..120 {
-            let url = format!("redis://{host}:6379");
+            let url = format!("redis://{host}:{port}");
             if let Ok(client) = redis::Client::open(url.as_str()) {
                 if client.get_multiplexed_async_connection().await.is_ok() {
                     return container;
@@ -618,13 +550,7 @@ pub(crate) mod containers {
     }
 
     async fn start_keto(timeout: Duration) -> ContainerAsync<GenericImage> {
-        // Write the Keto config to a host path and bind-mount it into the
-        // container. testcontainers' `with_copy_to` copies files before the
-        // container starts, which socktainer does not support ("Rootfs not
-        // found"); a bind mount works because the runtime resolves it at start.
-        let config_path =
-            std::env::temp_dir().join(format!("kanban-keto-config-{}.yml", std::process::id()));
-        std::fs::write(&config_path, keto_config()).expect("write keto config");
+        let config = keto_config();
 
         let parts: Vec<&str> = KETO_IMAGE.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
@@ -636,21 +562,19 @@ pub(crate) mod containers {
             .with_exposed_port(ContainerPort::Tcp(4466))
             .with_exposed_port(ContainerPort::Tcp(4467))
             .with_exposed_port(ContainerPort::Tcp(4468))
-            .with_host_config_modifier(move |host_config| {
-                let bind = format!("{}:/home/ory/keto.yml", config_path.display());
-                host_config.binds = Some(vec![bind]);
-            })
+            .with_copy_to("/home/ory/keto.yml", config.into_bytes())
             .with_cmd(vec!["serve", "-c", "/home/ory/keto.yml"])
             .with_startup_timeout(timeout)
             .start()
             .await
             .expect("failed to start Keto container");
 
-        let host = bridge_ip(&container).await;
+        let (host, read_port) = host_port(&container, 4466).await;
+        let (_, write_port) = host_port(&container, 4467).await;
 
         let client = KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
-            grpc_endpoint: format!("http://{host}:4466"),
-            write_grpc_endpoint: format!("http://{host}:4467"),
+            grpc_endpoint: format!("http://{host}:{read_port}"),
+            write_grpc_endpoint: format!("http://{host}:{write_port}"),
         });
 
         for _ in 0..120 {
@@ -684,10 +608,10 @@ pub(crate) mod containers {
             .await
             .expect("failed to start MinIO container");
 
-        let host = bridge_ip(&container).await;
+        let (host, port) = host_port(&container, 9000).await;
 
         for _ in 0..120 {
-            let url = format!("http://{host}:9000/minio/health/live");
+            let url = format!("http://{host}:{port}/minio/health/live");
             if let Ok(resp) = reqwest::get(&url).await {
                 if resp.status().is_success() {
                     return container;
@@ -721,10 +645,10 @@ pub(crate) mod containers {
             .await
             .expect("failed to start OpenSearch container");
 
-        let host = bridge_ip(&container).await;
+        let (host, port) = host_port(&container, 9200).await;
 
         for _ in 0..240 {
-            let url = format!("http://{host}:9200/_cluster/health");
+            let url = format!("http://{host}:{port}/_cluster/health");
             if let Ok(resp) = reqwest::get(&url).await {
                 if resp.status().is_success() {
                     if let Ok(body) = resp.text().await {
@@ -786,8 +710,8 @@ serve:
         }
 
         let minio = start_minio(Duration::from_secs(600)).await;
-        let host = bridge_ip(&minio).await;
-        let endpoint = format!("http://{host}:9000");
+        let (host, port) = host_port(&minio, 9000).await;
+        let endpoint = format!("http://{host}:{port}");
 
         unsafe {
             std::env::set_var("S3_ENDPOINT", &endpoint);
