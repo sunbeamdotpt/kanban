@@ -104,7 +104,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 68] = [
+static MATRIX: [DispatchEntry; 70] = [
     // ── AuthService (2) ─────────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AuthService/WhoAmI",
@@ -236,7 +236,7 @@ static MATRIX: [DispatchEntry; 68] = [
         relation: "",
         object_id_source: ObjectIdSource::None,
     },
-    // ── CardService (17) ────────────────────────────────────────────────────
+    // ── CardService (19) ────────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/GetCard",
         namespace: "KanbanCard",
@@ -278,6 +278,18 @@ static MATRIX: [DispatchEntry; 68] = [
         namespace: "KanbanCard",
         relation: "manage",
         object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.CardService/AddCardDependency",
+        namespace: "KanbanBoard",
+        relation: "edit",
+        object_id_source: ObjectIdSource::Header, // board id; handler verifies both cards
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.CardService/RemoveCardDependency",
+        namespace: "KanbanBoard",
+        relation: "edit",
+        object_id_source: ObjectIdSource::Header, // board id; handler verifies both cards
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/BulkUpdateCardLabels",
@@ -942,8 +954,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_68() {
-        assert_eq!(MATRIX.len(), 68, "matrix must contain exactly 68 entries");
+    fn matrix_size_is_70() {
+        assert_eq!(MATRIX.len(), 70, "matrix must contain exactly 70 entries");
     }
 
     #[test]

@@ -41,7 +41,7 @@ use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::cards::{
     card_from_row, fetch_assignees, fetch_attachments_count, fetch_checklist, fetch_comments_count,
-    fetch_labels, to_proto_ts,
+    fetch_dependencies, fetch_dependents, fetch_labels, to_proto_ts,
 };
 use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
@@ -262,7 +262,7 @@ async fn fetch_cards_for_boards(
 
     let rows = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                position, priority, due_date, completed_at, blocked, cover, \
+                position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                 milestone_id, revision, created_at, updated_at \
          FROM cards \
          WHERE board_id = ANY($1) \
@@ -286,6 +286,8 @@ async fn fetch_cards_for_boards(
         let checklist = fetch_checklist(pool, card_id).await;
         let comments_count = fetch_comments_count(pool, card_id).await;
         let attachments_count = fetch_attachments_count(pool, card_id).await;
+        let depends_on = fetch_dependencies(pool, card_id).await;
+        let dependents = fetch_dependents(pool, card_id).await;
 
         cards.push(card_from_row(
             row,
@@ -294,6 +296,8 @@ async fn fetch_cards_for_boards(
             checklist,
             comments_count,
             attachments_count,
+            depends_on,
+            dependents,
         ));
     }
 

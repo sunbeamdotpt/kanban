@@ -33,6 +33,15 @@ enum CardPriority {
   CARD_PRIORITY_URGENT = 4;
 }
 
+// Urgency is a parallel fixed enum used for time-sensitivity triage.
+enum CardUrgency {
+  CARD_URGENCY_UNSPECIFIED = 0;
+  CARD_URGENCY_LOW = 1;
+  CARD_URGENCY_MEDIUM = 2;
+  CARD_URGENCY_HIGH = 3;
+  CARD_URGENCY_CRITICAL = 4;
+}
+
 // Label catalog entry, scoped to a project. Stored in `labels` table.
 message Label {
   string id = 1;            // ULID.
@@ -111,6 +120,12 @@ message Card {
   uint64 revision = 21;
   google.protobuf.Timestamp created_at = 22;
   google.protobuf.Timestamp updated_at = 23;
+  // Time-sensitivity triage, parallel to priority.
+  CardUrgency urgency = 24;
+  // Cards this card depends on (must be done first).
+  repeated string depends_on_card_ids = 25;
+  // Cards that depend on this card.
+  repeated string dependent_card_ids = 26;
 }
 
 // Column lives in boards.proto (Stage 1c) — see file header.
@@ -169,6 +184,8 @@ message CreateCardRequest {
   int32 position = 8;
   // ULID — required. Server stores for 24h idempotency.
   string idempotency_key = 9;
+  // Time-sensitivity triage. Defaults to MEDIUM when unspecified.
+  CardUrgency urgency = 10;
 }
 
 message UpdateCardRequest {
@@ -195,6 +212,14 @@ message MoveCardRequest {
 
 message DeleteCardRequest {
   string card_id = 1;
+}
+
+// CardDependencyRequest links two cards: `card_id` depends on `depends_on_card_id`.
+// Both cards must belong to the same board. idempotency_key is required.
+message CardDependencyRequest {
+  string card_id = 1;
+  string depends_on_card_id = 2;
+  string idempotency_key = 3;
 }
 
 // BulkUpdateCardLabelsRequest replaces the full label set on each named card.
@@ -276,7 +301,7 @@ message ListCommentsResponse {
 // Service — CardService (Stage 1c)
 // ============================================================================
 
-// CardService manages cards, checklists, assignments, and comments.
+// CardService manages cards, checklists, assignments, comments, and dependencies.
 //
 // Auth: every RPC requires a valid bearer token. Keto checks are performed
 // by the kanban-local `keto_dispatch` middleware defined in
@@ -307,12 +332,20 @@ service CardService {
 
   // MoveCard repositions a card within or between columns on the same board.
   // Cross-project moves return Unimplemented (MF-3). idempotency_key is
-  // strongly recommended; echoed in the CardMoved stream event for
-  // optimistic-UI deduplication (Tension 7 / Pre-mortem 3).
+  // strongly recommended; echoed in the CardMoved stream event for optimistic-UI
+  // deduplication (Tension 7 / Pre-mortem 3).
   rpc MoveCard(MoveCardRequest) returns (Card);
 
   // DeleteCard requires "edit" on the board. Emits CardDeleted stream event.
   rpc DeleteCard(DeleteCardRequest) returns (google.protobuf.Empty);
+
+  // AddCardDependency creates a directed edge: card_id depends on depends_on_card_id.
+  // Both cards must belong to the same board. Requires "edit" on the board.
+  rpc AddCardDependency(CardDependencyRequest) returns (Card);
+
+  // RemoveCardDependency removes a directed dependency edge.
+  // Both cards must belong to the same board. Requires "edit" on the board.
+  rpc RemoveCardDependency(CardDependencyRequest) returns (Card);
 
   // BulkUpdateCardLabels replaces the label set on multiple cards.
   // Requires "edit" on the board for each card.

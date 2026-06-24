@@ -26,10 +26,11 @@ use crate::pb::card_service_server::CardService;
 use crate::pb::{
     AddChecklistItemRequest, AddCommentRequest, AssignCardRequest, Assignee, BatchGetCardsRequest,
     BatchGetCardsResponse, BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card,
-    ChecklistItem, Comment, CreateCardRequest, DeleteCardRequest, DeleteCommentRequest,
-    EditCommentRequest, GetCardRequest, Label, ListCardsByBoardRequest, ListCardsByBoardResponse,
-    ListCommentsRequest, ListCommentsResponse, MoveCardRequest, RemoveChecklistItemRequest,
-    UnassignCardRequest, UpdateCardRequest, UpdateChecklistItemRequest,
+    CardDependencyRequest, ChecklistItem, Comment, CreateCardRequest,
+    DeleteCardRequest, DeleteCommentRequest, EditCommentRequest, GetCardRequest, Label,
+    ListCardsByBoardRequest, ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse,
+    MoveCardRequest, RemoveChecklistItemRequest, UnassignCardRequest, UpdateCardRequest,
+    UpdateChecklistItemRequest,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -102,6 +103,28 @@ fn priority_from_i32(v: i32) -> &'static str {
     }
 }
 
+// ── Urgency mapping ───────────────────────────────────────────────────────────
+
+pub(crate) fn urgency_to_i32(s: &str) -> i32 {
+    match s {
+        "low" => 1,
+        "medium" => 2,
+        "high" => 3,
+        "critical" => 4,
+        _ => 0,
+    }
+}
+
+fn urgency_from_i32(v: i32) -> &'static str {
+    match v {
+        1 => "low",
+        2 => "medium",
+        3 => "high",
+        4 => "critical",
+        _ => "medium",
+    }
+}
+
 // ── Row → proto helpers ───────────────────────────────────────────────────────
 
 pub(crate) fn card_from_row(
@@ -111,6 +134,8 @@ pub(crate) fn card_from_row(
     checklist: Vec<ChecklistItem>,
     comments_count: i32,
     attachments_count: i32,
+    depends_on_card_ids: Vec<String>,
+    dependent_card_ids: Vec<String>,
 ) -> Card {
     let id: Uuid = row.get("id");
     let project_id: Uuid = row.get("project_id");
@@ -121,6 +146,7 @@ pub(crate) fn card_from_row(
     let description: Option<String> = row.get("description");
     let position: i32 = row.get("position");
     let priority: Option<String> = row.get("priority");
+    let urgency: Option<String> = row.get("urgency");
     let due_date: Option<DateTime<Utc>> = row.get("due_date");
     let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
     let blocked: bool = row.get("blocked");
@@ -154,6 +180,9 @@ pub(crate) fn card_from_row(
         revision: revision as u64,
         created_at: Some(to_proto_ts(created_at)),
         updated_at: Some(to_proto_ts(updated_at)),
+        urgency: urgency_to_i32(urgency.as_deref().unwrap_or("medium")),
+        depends_on_card_ids,
+        dependent_card_ids,
     }
 }
 
@@ -269,11 +298,39 @@ pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32
         .unwrap_or(0)
 }
 
+pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Uuid) -> Vec<String> {
+    sqlx::query("SELECT depends_on_card_id FROM card_dependencies WHERE card_id = $1 ORDER BY created_at")
+        .bind(card_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("depends_on_card_id");
+            id.to_string()
+        })
+        .collect()
+}
+
+pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Uuid) -> Vec<String> {
+    sqlx::query("SELECT card_id FROM card_dependencies WHERE depends_on_card_id = $1 ORDER BY created_at")
+        .bind(card_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("card_id");
+            id.to_string()
+        })
+        .collect()
+}
+
 /// Load a complete card, including its relationships, by id.
 async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                position, priority, due_date, completed_at, blocked, cover, \
+                position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                 milestone_id, revision, created_at, updated_at \
          FROM cards WHERE id = $1",
     )
@@ -288,6 +345,8 @@ async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
     let checklist = fetch_checklist(pool, card_id).await;
     let comments_count = fetch_comments_count(pool, card_id).await;
     let attachments_count = fetch_attachments_count(pool, card_id).await;
+    let depends_on = fetch_dependencies(pool, card_id).await;
+    let dependents = fetch_dependents(pool, card_id).await;
 
     Ok(card_from_row(
         &row,
@@ -296,6 +355,8 @@ async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
         checklist,
         comments_count,
         attachments_count,
+        depends_on,
+        dependents,
     ))
 }
 
@@ -460,7 +521,7 @@ impl CardService for CardServiceImpl {
         // Fetch rows that are actually on this board.
         let rows = sqlx::query(
             "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                    position, priority, due_date, completed_at, blocked, cover, \
+                    position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                     milestone_id, revision, created_at, updated_at \
              FROM cards \
              WHERE board_id = $1 AND id = ANY($2) \
@@ -480,6 +541,8 @@ impl CardService for CardServiceImpl {
             let checklist = fetch_checklist(&self.pool, cid).await;
             let comments_count = fetch_comments_count(&self.pool, cid).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid).await;
+            let depends_on = fetch_dependencies(&self.pool, cid).await;
+            let dependents = fetch_dependents(&self.pool, cid).await;
             cards.push(card_from_row(
                 row,
                 labels,
@@ -487,6 +550,8 @@ impl CardService for CardServiceImpl {
                 checklist,
                 comments_count,
                 attachments_count,
+                depends_on,
+                dependents,
             ));
         }
 
@@ -537,7 +602,7 @@ impl CardService for CardServiceImpl {
             if let Some(after) = cursor_id {
                 sqlx::query(
                     "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                            position, priority, due_date, completed_at, blocked, cover, \
+                            position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
                      FROM cards \
                      WHERE board_id = $1 AND column_id = $2 AND id > $3 \
@@ -553,7 +618,7 @@ impl CardService for CardServiceImpl {
             } else {
                 sqlx::query(
                     "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                            position, priority, due_date, completed_at, blocked, cover, \
+                            position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
                      FROM cards WHERE board_id = $1 AND column_id = $2 \
                      ORDER BY column_id, position LIMIT $3",
@@ -567,7 +632,7 @@ impl CardService for CardServiceImpl {
         } else if let Some(after) = cursor_id {
             sqlx::query(
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                        position, priority, due_date, completed_at, blocked, cover, \
+                        position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
                  FROM cards WHERE board_id = $1 AND id > $2 \
                  ORDER BY column_id, position LIMIT $3",
@@ -580,7 +645,7 @@ impl CardService for CardServiceImpl {
         } else {
             sqlx::query(
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
-                        position, priority, due_date, completed_at, blocked, cover, \
+                        position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
                  FROM cards WHERE board_id = $1 \
                  ORDER BY column_id, position LIMIT $2",
@@ -618,6 +683,8 @@ impl CardService for CardServiceImpl {
             let checklist = fetch_checklist(&self.pool, cid).await;
             let comments_count = fetch_comments_count(&self.pool, cid).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid).await;
+            let depends_on = fetch_dependencies(&self.pool, cid).await;
+            let dependents = fetch_dependents(&self.pool, cid).await;
             cards.push(card_from_row(
                 row,
                 labels,
@@ -625,6 +692,8 @@ impl CardService for CardServiceImpl {
                 checklist,
                 comments_count,
                 attachments_count,
+                depends_on,
+                dependents,
             ));
         }
 
@@ -723,6 +792,7 @@ impl CardService for CardServiceImpl {
 
         // Parse optional fields.
         let priority_str = priority_from_i32(req.priority);
+        let urgency_str = urgency_from_i32(req.urgency);
         let due_date: Option<DateTime<Utc>> = req
             .due
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
@@ -734,8 +804,8 @@ impl CardService for CardServiceImpl {
 
         sqlx::query(
             "INSERT INTO cards (id, project_id, board_id, column_id, ref, title, description, \
-                                position, priority, due_date, milestone_id, created_by, revision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0)",
+                                position, priority, urgency, due_date, milestone_id, created_by, revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::card_priority, $10::card_urgency, $11, $12, $13, 0)",
         )
         .bind(card_id)
         .bind(project_id)
@@ -750,6 +820,7 @@ impl CardService for CardServiceImpl {
         })
         .bind(position)
         .bind(priority_str)
+        .bind(urgency_str)
         .bind(due_date)
         .bind(milestone_id)
         .bind(&subject)
@@ -765,6 +836,8 @@ impl CardService for CardServiceImpl {
             "title": req.title,
             "ref": card_ref,
             "position": position,
+            "priority": priority_str,
+            "urgency": urgency_str,
             "idempotency_key": req.idempotency_key,
         });
         insert_event_log(&mut tx, board_id, "CardCreated", payload, 0).await?;
@@ -820,6 +893,12 @@ impl CardService for CardServiceImpl {
             None
         };
 
+        let urgency_str: Option<&str> = if patch.urgency != 0 {
+            Some(urgency_from_i32(patch.urgency))
+        } else {
+            None
+        };
+
         let due_date: Option<DateTime<Utc>> = patch
             .due
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
@@ -834,11 +913,12 @@ impl CardService for CardServiceImpl {
             "UPDATE cards SET
                 title       = CASE WHEN $2 != '' THEN $2 ELSE title END,
                 description = CASE WHEN $3 != '' THEN $3 ELSE description END,
-                priority    = CASE WHEN $4 IS NOT NULL THEN $4 ELSE priority END,
-                due_date    = CASE WHEN $5 IS NOT NULL THEN $5 ELSE due_date END,
-                blocked     = CASE WHEN $6 THEN $6 ELSE blocked END,
-                cover       = CASE WHEN $7 != '' THEN $7 ELSE cover END,
-                milestone_id = CASE WHEN $8 IS NOT NULL THEN $8 ELSE milestone_id END,
+                priority    = CASE WHEN $4 IS NOT NULL THEN $4::card_priority ELSE priority END,
+                urgency     = CASE WHEN $5 IS NOT NULL THEN $5::card_urgency ELSE urgency END,
+                due_date    = CASE WHEN $6 IS NOT NULL THEN $6 ELSE due_date END,
+                blocked     = CASE WHEN $7 THEN $7 ELSE blocked END,
+                cover       = CASE WHEN $8 != '' THEN $8 ELSE cover END,
+                milestone_id = CASE WHEN $9 IS NOT NULL THEN $9 ELSE milestone_id END,
                 revision    = revision + 1,
                 updated_at  = now()
              WHERE id = $1
@@ -848,6 +928,7 @@ impl CardService for CardServiceImpl {
         .bind(&patch.title)
         .bind(&patch.description)
         .bind(priority_str)
+        .bind(urgency_str)
         .bind(due_date)
         .bind(patch.blocked)
         .bind(&patch.cover)
@@ -869,6 +950,7 @@ impl CardService for CardServiceImpl {
                 "title": patch.title,
                 "description": patch.description,
                 "priority": patch.priority,
+                "urgency": patch.urgency,
                 "blocked": patch.blocked,
                 "cover": patch.cover,
             }
@@ -1111,6 +1193,224 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(()))
+    }
+
+    // ── AddCardDependency ─────────────────────────────────────────────────────
+    //
+    // CheckedObjectId = board_id (KanbanBoard + edit, per matrix).
+    // Creates a directed edge: card_id depends on depends_on_card_id.
+    // Both cards must belong to the authorized board. Bumps card_id revision.
+    // event_log: CardUpdated.
+
+    async fn add_card_dependency(
+        &self,
+        request: Request<CardDependencyRequest>,
+    ) -> Result<Response<Card>, Status> {
+        let object_id = checked_object_id(&request)?;
+        let board_id = Uuid::parse_str(&object_id)
+            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+
+        let req = request.into_inner();
+
+        if req.idempotency_key.is_empty() {
+            return Err(Status::invalid_argument("idempotency_key is required"));
+        }
+
+        let card_id = Uuid::parse_str(&req.card_id)
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let depends_on_id = Uuid::parse_str(&req.depends_on_card_id)
+            .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
+
+        if card_id == depends_on_id {
+            return Err(Status::invalid_argument("a card cannot depend on itself"));
+        }
+
+        if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
+            return fetch_full_card(&self.pool, existing_id)
+                .await
+                .map(Response::new);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
+        // Verify both cards belong to the authorized board.
+        let rows = sqlx::query(
+            "SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2",
+        )
+        .bind(&[card_id, depends_on_id][..])
+        .bind(board_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to verify cards", e))?;
+
+        if rows.len() != 2 {
+            return Err(Status::invalid_argument(
+                "both cards must belong to the authorized board",
+            ));
+        }
+
+        let mut prev_revision = 0i64;
+        for row in &rows {
+            let id: Uuid = row.get("id");
+            if id == card_id {
+                prev_revision = row.get("revision");
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO card_dependencies (card_id, depends_on_card_id) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(card_id)
+        .bind(depends_on_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to add card dependency", e))?;
+
+        let updated = sqlx::query(
+            "UPDATE cards SET revision = revision + 1, updated_at = now() \
+             WHERE id = $1 RETURNING revision",
+        )
+        .bind(card_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to bump card revision", e))?;
+        let new_revision: i64 = updated.get("revision");
+
+        let payload = json!({
+            "card_id": card_id.to_string(),
+            "board_id": board_id.to_string(),
+            "depends_on_card_id": depends_on_id.to_string(),
+            "prev_revision": prev_revision,
+            "new_revision": new_revision,
+            "idempotency_key": req.idempotency_key,
+        });
+        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
+        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+
+        let card = fetch_full_card(&self.pool, card_id).await?;
+        Ok(Response::new(card))
+    }
+
+    // ── RemoveCardDependency ──────────────────────────────────────────────────
+    //
+    // CheckedObjectId = board_id (KanbanBoard + edit, per matrix).
+    // Removes a directed dependency edge. Both cards must belong to the board.
+    // Bumps card_id revision. event_log: CardUpdated.
+
+    async fn remove_card_dependency(
+        &self,
+        request: Request<CardDependencyRequest>,
+    ) -> Result<Response<Card>, Status> {
+        let object_id = checked_object_id(&request)?;
+        let board_id = Uuid::parse_str(&object_id)
+            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+
+        let req = request.into_inner();
+
+        if req.idempotency_key.is_empty() {
+            return Err(Status::invalid_argument("idempotency_key is required"));
+        }
+
+        let card_id = Uuid::parse_str(&req.card_id)
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let depends_on_id = Uuid::parse_str(&req.depends_on_card_id)
+            .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
+
+        if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
+            return fetch_full_card(&self.pool, existing_id)
+                .await
+                .map(Response::new);
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
+        // Verify both cards belong to the authorized board and fetch the card revision.
+        let card_row = sqlx::query(
+            "SELECT revision FROM cards WHERE id = $1 AND board_id = $2",
+        )
+        .bind(card_id)
+        .bind(board_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to verify card", e))?;
+
+        let prev_revision = match card_row {
+            Some(row) => row.get::<i64, _>("revision"),
+            None => {
+                return Err(Status::invalid_argument(
+                    "card does not belong to the authorized board",
+                ));
+            }
+        };
+
+        let depends_row = sqlx::query("SELECT 1 FROM cards WHERE id = $1 AND board_id = $2")
+            .bind(depends_on_id)
+            .bind(board_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to verify dependency card", e))?;
+
+        if depends_row.is_none() {
+            return Err(Status::invalid_argument(
+                "dependency card does not belong to the authorized board",
+            ));
+        }
+
+        let result = sqlx::query(
+            "DELETE FROM card_dependencies WHERE card_id = $1 AND depends_on_card_id = $2",
+        )
+        .bind(card_id)
+        .bind(depends_on_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to remove card dependency", e))?;
+
+        let new_revision = if result.rows_affected() > 0 {
+            let updated = sqlx::query(
+                "UPDATE cards SET revision = revision + 1, updated_at = now() \
+                 WHERE id = $1 RETURNING revision",
+            )
+            .bind(card_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to bump card revision", e))?;
+            updated.get::<i64, _>("revision")
+        } else {
+            prev_revision
+        };
+
+        let payload = json!({
+            "card_id": card_id.to_string(),
+            "board_id": board_id.to_string(),
+            "depends_on_card_id": depends_on_id.to_string(),
+            "prev_revision": prev_revision,
+            "new_revision": new_revision,
+            "idempotency_key": req.idempotency_key,
+        });
+        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
+        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+
+        let card = fetch_full_card(&self.pool, card_id).await?;
+        Ok(Response::new(card))
     }
 
     // ── BulkUpdateCardLabels ──────────────────────────────────────────────────
@@ -2030,43 +2330,16 @@ impl CardService for CardServiceImpl {
 mod tests {
     use super::*;
     use prost_types::FieldMask;
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
     use sunbeam_g2v::middleware::auth::AuthContext;
-
-    // ── Test env config ──────────────────────────────────────────────────────
-
-    fn database_url() -> String {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
-    }
-
-    fn keto_read_url() -> String {
-        std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string())
-    }
-
-    fn keto_write_url() -> String {
-        std::env::var("KETO_WRITE_GRPC_URL").unwrap_or_else(|_| "http://localhost:4467".to_string())
-    }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
 
     async fn setup_pool() -> PgPool {
-        PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&database_url())
-            .await
-            .expect("failed to connect to Postgres")
+        crate::test_support::setup_pool().await
     }
 
-    fn setup_keto() -> Arc<KetoClient> {
-        Arc::new(KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_read_url(),
-                write_grpc_endpoint: keto_write_url(),
-            },
-        ))
+    async fn setup_keto() -> Arc<KetoClient> {
+        crate::test_support::setup_keto().await
     }
 
     fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> CardServiceImpl {
@@ -2168,7 +2441,7 @@ mod tests {
     #[tokio::test]
     async fn create_card_allocates_ref() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2236,7 +2509,7 @@ mod tests {
     #[tokio::test]
     async fn create_card_in_different_projects_have_independent_seqs() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2292,7 +2565,7 @@ mod tests {
     #[tokio::test]
     async fn move_card_within_same_board_succeeds() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2353,7 +2626,7 @@ mod tests {
     #[tokio::test]
     async fn move_card_to_column_on_different_project_returns_invalid_argument() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2407,7 +2680,7 @@ mod tests {
     #[tokio::test]
     async fn move_card_with_idempotency_key_replays_returns_same_state() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2482,7 +2755,7 @@ mod tests {
     #[tokio::test]
     async fn update_card_bumps_revision_and_writes_event_log_row() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2547,7 +2820,7 @@ mod tests {
     #[tokio::test]
     async fn delete_card_cascades_assignees_labels_checklist_comments() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2652,7 +2925,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_update_card_labels_writes_event_log_per_card() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2732,7 +3005,7 @@ mod tests {
     #[tokio::test]
     async fn assign_card_idempotent_on_repeat() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2790,7 +3063,7 @@ mod tests {
     #[tokio::test]
     async fn add_checklist_item_appends_to_position_max_plus_one() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2849,7 +3122,7 @@ mod tests {
     #[tokio::test]
     async fn add_then_edit_comment_updates_body_and_writes_event_log() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -2926,7 +3199,7 @@ mod tests {
     #[tokio::test]
     async fn delete_comment_rejects_when_caller_is_not_author_or_admin() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let author = format!("user:author-{}", Uuid::new_v4());
@@ -3012,7 +3285,7 @@ mod tests {
     #[tokio::test]
     async fn get_card_returns_created_card() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3057,7 +3330,7 @@ mod tests {
     #[tokio::test]
     async fn batch_get_cards_filters_by_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3103,7 +3376,7 @@ mod tests {
     #[tokio::test]
     async fn list_cards_by_board_paginates() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3151,7 +3424,7 @@ mod tests {
     #[tokio::test]
     async fn unassign_card_removes_assignee() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3210,7 +3483,7 @@ mod tests {
     #[tokio::test]
     async fn update_checklist_item_persists_changes() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3285,7 +3558,7 @@ mod tests {
     #[tokio::test]
     async fn remove_checklist_item_deletes_item() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3359,7 +3632,7 @@ mod tests {
     #[tokio::test]
     async fn list_comments_returns_comments() {
         let pool = setup_pool().await;
-        let keto = setup_keto();
+        let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
         let subject = format!("user:test-{}", Uuid::new_v4());
@@ -3411,6 +3684,586 @@ mod tests {
 
         assert_eq!(resp.comments.len(), 1);
         assert_eq!(resp.comments[0].body, "first");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn create_card_persists_urgency() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "URG").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Urgent".to_string(),
+                    urgency: 4, // critical
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
+
+        assert_eq!(card.urgency, 4, "created urgency should be critical");
+
+        let fetched = svc
+            .get_card(authed_request_with_object(
+                GetCardRequest {
+                    card_id: card.id.clone(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("get failed")
+            .into_inner();
+        assert_eq!(fetched.urgency, 4, "fetched urgency should be critical");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn create_card_defaults_urgency_to_medium() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "DEF").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Default urgency".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
+
+        assert_eq!(card.urgency, 2, "default urgency should be medium");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn update_card_persists_urgency() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "UUP").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Update urgency".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
+
+        let updated = svc
+            .update_card(authed_request_with_object(
+                UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card {
+                        urgency: 3, // high
+                        ..Default::default()
+                    }),
+                    update_mask: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &card.id,
+            ))
+            .await
+            .expect("update failed")
+            .into_inner();
+
+        assert_eq!(updated.urgency, 3, "updated urgency should be high");
+        assert!(updated.revision > card.revision, "revision should bump");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn priority_enum_still_round_trips() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "PRI").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Priority enum".to_string(),
+                    priority: 3, // high
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
+
+        assert_eq!(card.priority, 3, "priority should round-trip");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn add_card_dependency_links_cards() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "DEP").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card_a = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create a failed")
+            .into_inner();
+
+        let card_b = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create b failed")
+            .into_inner();
+
+        let dep = svc
+            .add_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("add dependency failed")
+            .into_inner();
+
+        assert_eq!(dep.depends_on_card_ids, vec![card_b.id.clone()]);
+
+        let b = svc
+            .get_card(authed_request_with_object(
+                GetCardRequest {
+                    card_id: card_b.id.clone(),
+                },
+                &subject,
+                &card_b.id,
+            ))
+            .await
+            .expect("get b failed")
+            .into_inner();
+        assert_eq!(b.dependent_card_ids, vec![card_a.id.clone()]);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn remove_card_dependency_unlinks_cards() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "REM").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card_a = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create a failed")
+            .into_inner();
+
+        let card_b = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create b failed")
+            .into_inner();
+
+        svc.add_card_dependency(authed_request_with_object(
+            CardDependencyRequest {
+                card_id: card_a.id.clone(),
+                depends_on_card_id: card_b.id.clone(),
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+            &subject,
+            &bid.to_string(),
+        ))
+        .await
+        .expect("add dependency failed");
+
+        let removed = svc
+            .remove_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("remove dependency failed")
+            .into_inner();
+
+        assert!(removed.depends_on_card_ids.is_empty());
+
+        let b = svc
+            .get_card(authed_request_with_object(
+                GetCardRequest {
+                    card_id: card_b.id.clone(),
+                },
+                &subject,
+                &card_b.id,
+            ))
+            .await
+            .expect("get b failed")
+            .into_inner();
+        assert!(b.dependent_card_ids.is_empty());
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn add_card_dependency_rejects_self_dependency() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "SDP").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Self".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create failed")
+            .into_inner();
+
+        let err = svc
+            .add_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card.id.clone(),
+                    depends_on_card_id: card.id.clone(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect_err("self dependency should fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn add_card_dependency_rejects_cross_board() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "CRB").await;
+        let bid_a = seed_board(&pool, pid).await;
+        let cid_a = seed_column(&pool, bid_a).await;
+        let bid_b = seed_board(&pool, pid).await;
+        let cid_b = seed_column(&pool, bid_b).await;
+
+        let card_a = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid_a.to_string(),
+                    column_id: cid_a.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid_a.to_string(),
+            ))
+            .await
+            .expect("create a failed")
+            .into_inner();
+
+        let card_b = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid_b.to_string(),
+                    column_id: cid_b.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid_b.to_string(),
+            ))
+            .await
+            .expect("create b failed")
+            .into_inner();
+
+        let err = svc
+            .add_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid_a.to_string(),
+            ))
+            .await
+            .expect_err("cross-board dependency should fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn add_card_dependency_idempotent() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "DID").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card_a = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create a failed")
+            .into_inner();
+
+        let card_b = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create b failed")
+            .into_inner();
+
+        let key = Uuid::new_v4().to_string();
+        svc.add_card_dependency(authed_request_with_object(
+            CardDependencyRequest {
+                card_id: card_a.id.clone(),
+                depends_on_card_id: card_b.id.clone(),
+                idempotency_key: key.clone(),
+            },
+            &subject,
+            &bid.to_string(),
+        ))
+        .await
+        .expect("add 1 failed");
+
+        let replay = svc
+            .add_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: key.clone(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("add replay failed")
+            .into_inner();
+
+        assert_eq!(replay.depends_on_card_ids, vec![card_b.id.clone()]);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn dependency_mutation_bumps_revision_and_event_log() {
+        let pool = setup_pool().await;
+        let keto = setup_keto().await;
+        let svc = make_service(pool.clone(), Arc::clone(&keto));
+
+        let subject = format!("user:test-{}", Uuid::new_v4());
+        let pid = seed_project(&pool, &subject, "DEV").await;
+        let bid = seed_board(&pool, pid).await;
+        let cid = seed_column(&pool, bid).await;
+
+        let card_a = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create a failed")
+            .into_inner();
+
+        let card_b = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("create b failed")
+            .into_inner();
+
+        let add_rev = svc
+            .add_card_dependency(authed_request_with_object(
+                CardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .expect("add failed")
+            .into_inner()
+            .revision;
+
+        assert!(add_rev > card_a.revision, "add should bump revision");
+
+        let event_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardUpdated'",
+        )
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+        assert_eq!(event_count, 1, "CardUpdated should be written");
 
         cleanup_project(&pool, pid).await;
     }

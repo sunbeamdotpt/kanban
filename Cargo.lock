@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "kanban"
-version = "1.0.0-rc.0"
+version = "1.0.0-rc1"
 dependencies = [
  "anyhow",
  "async-nats",
