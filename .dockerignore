@@ -1,0 +1,43 @@
+# Build artifacts
+target/
+
+# Git metadata
+.git/
+.gitignore
+
+# GitHub metadata
+.github/
+
+# Documentation (not needed for the build)
+docs/
+README.md
+CHANGELOG.md
+LICENSE
+AGENTS.md
+
+# CI / local testing scripts and integration tooling
+test.sh
+.integration/
+
+# Coverage / profiling artifacts
+coverage*.lcov
+build_rs_cov.profraw
+sunbeam.yaml
+
+# Docker files themselves
+Dockerfile
+.dockerignore
+
+# Editor / OS files
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Local environment / secrets
+.env
+.env.*
+*.local
