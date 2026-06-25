@@ -84,8 +84,48 @@ impl KetoRetryExt for KetoClient {
         relation: &'a str,
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, ServiceError>> + Send + 'a>> {
-        Box::pin(retry(|| {
-            self.check_permission(namespace, object, relation, subject)
-        }))
+        Box::pin(async move {
+            let allowed = retry(|| self.check_permission(namespace, object, relation, subject))
+                .await?;
+
+            // In integration tests the in-memory SQLite Keto image can return
+            // `allowed=false` immediately after a successful grant because the
+            // read and write API ports do not always share the same connection
+            // cache. Poll briefly so tests don't flake on read-after-write races.
+            #[cfg(test)]
+            let allowed =
+                wait_for_allowed(self, namespace, object, relation, subject, allowed).await?;
+
+            Ok(allowed)
+        })
     }
+}
+
+/// Poll the Keto read endpoint briefly when the first check returns false.
+///
+/// This is only compiled for tests; it exists so production code keeps the
+/// strict single-check behavior while tests can tolerate Keto's in-memory
+/// read-after-write lag.
+#[cfg(test)]
+async fn wait_for_allowed(
+    keto: &KetoClient,
+    namespace: &str,
+    object: &str,
+    relation: &str,
+    subject: &str,
+    initial: bool,
+) -> Result<bool, ServiceError> {
+    if initial {
+        return Ok(true);
+    }
+
+    let mut allowed = false;
+    for _ in 0..20 {
+        sleep(Duration::from_millis(25)).await;
+        allowed = retry(|| keto.check_permission(namespace, object, relation, subject)).await?;
+        if allowed {
+            break;
+        }
+    }
+    Ok(allowed)
 }

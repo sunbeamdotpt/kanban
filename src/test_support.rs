@@ -159,19 +159,6 @@ pub(crate) async fn seed_event_log_dispatched(
     row.get("id")
 }
 
-/// Return the `DATABASE_URL` for integration tests, falling back to a sensible
-/// dev-compose default.
-pub(crate) fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://sunbeam:sunbeam@localhost:5432/kanban".to_string())
-}
-
-/// Return the `NATS_URL` for integration tests, falling back to a sensible
-/// dev-compose default.
-pub(crate) fn nats_url() -> String {
-    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
-}
-
 /// Start the shared testcontainers stack (if not already started) and return a
 /// Postgres pool. Tests can call this directly instead of relying on the
 /// removed ctor/dtor harness.

@@ -198,6 +198,8 @@ pub async fn ensure_kanban_stream(nats: &NatsClient, cfg: &StreamConfig) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     /// Calling `ensure_kanban_stream` twice against a live NATS server must be
@@ -208,17 +210,7 @@ mod tests {
     /// is shared / idempotent).
     #[tokio::test]
     async fn ensure_kanban_stream_is_idempotent() {
-        let nats_url =
-            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-
-        let nats = NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
-            url: nats_url,
-            jetstream: true,
-            lease_duration: 30,
-            auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-        })
-        .await
-        .expect("NATS connect failed — is NATS_URL set and the server running?");
+        let nats = Arc::clone(&crate::test_support::containers::setup().await.nats);
 
         let cfg = default_config();
 

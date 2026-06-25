@@ -458,36 +458,16 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
 mod tests {
     use super::*;
 
-    use sqlx::postgres::PgPoolOptions;
     use sunbeam_g2v::config::NatsConfig;
 
     use crate::test_support::{
-        database_url, nats_url, seed_card_chain, seed_event_log, seed_event_log_dispatched,
+        containers, seed_card_chain, seed_event_log, seed_event_log_dispatched, setup_pool,
     };
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
-    async fn setup_pool() -> PgPool {
-        let url = database_url();
-        PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(&url)
-            .await
-            .expect("failed to connect to Postgres — is DATABASE_URL set and the DB running?")
-    }
-
     async fn setup_nats() -> Arc<NatsClient> {
-        let url = nats_url();
-        let nats = NatsClient::connect(&NatsConfig {
-            url,
-            jetstream: true,
-            lease_duration: 30,
-            auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-        })
-        .await
-        .expect("failed to connect to NATS — is NATS_URL set and the server running?");
-        Arc::new(nats)
+        Arc::clone(&containers::setup().await.nats)
     }
 
     fn make_dispatcher(pool: PgPool, nats: Arc<NatsClient>, board_id: Uuid) -> OutboxDispatcher {

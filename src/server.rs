@@ -953,6 +953,48 @@ mod tests {
         Cli::try_parse_from(full_args).map(|cli| cli.into_config().expect("into_config"))
     }
 
+    /// Parse CLI arguments with environment variables temporarily cleared.
+    ///
+    /// Integration tests set service endpoints in the environment, which would
+    /// otherwise leak into these unit tests and change defaults / required-arg
+    /// behaviour.
+    fn parse_config_args_isolated(args: &[&str]) -> Result<AppConfig, clap::Error> {
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prefixes: &[&str] = &[
+            "DATABASE_URL",
+            "JWT_SECRET",
+            "JWT_TOKEN_EXPIRY_SECS",
+            "NATS_",
+            "VALKEY_URL",
+            "KETO_",
+            "OPENSEARCH_URL",
+            "KANBAN_",
+            "S3_",
+            "POD_NAME",
+        ];
+
+        let snapshot: Vec<(String, Option<String>)> = std::env::vars()
+            .filter(|(k, _)| prefixes.iter().any(|p| k == *p || k.starts_with(p)))
+            .map(|(k, v)| (k, Some(v)))
+            .collect();
+
+        for (k, _) in &snapshot {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        let result = parse_config_args(args);
+
+        for (k, v) in snapshot {
+            if let Some(val) = v {
+                unsafe { std::env::set_var(k, val) };
+            }
+        }
+
+        result
+    }
+
     #[test]
     fn cli_parses_all_fields() {
         let cfg = parse_config_args(&[
@@ -1039,7 +1081,7 @@ mod tests {
 
     #[test]
     fn cli_uses_defaults() {
-        let cfg = parse_config_args(&["--database-url=postgres://db"])
+        let cfg = parse_config_args_isolated(&["--database-url=postgres://db"])
             .expect("config should parse with defaults");
 
         assert_eq!(cfg.addr.port(), 8080);
@@ -1084,7 +1126,7 @@ mod tests {
 
     #[test]
     fn cli_requires_database_url() {
-        let err = parse_config_args(&[]).unwrap_err();
+        let err = parse_config_args_isolated(&[]).unwrap_err();
         assert!(
             err.to_string().contains("database-url") || err.to_string().contains("DATABASE_URL"),
             "error should mention database-url/DATABASE_URL: {err}"
