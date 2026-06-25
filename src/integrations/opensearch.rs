@@ -602,4 +602,25 @@ mod tests {
             .await
             .expect("404 delete is ignored");
     }
+
+    #[test]
+    fn opensearch_config_from_env_defaults() {
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe { std::env::remove_var("OPENSEARCH_URL") };
+        let cfg = OpenSearchConfig::from_env();
+        assert_eq!(cfg.url, "http://localhost:9200");
+    }
+
+    #[test]
+    fn opensearch_config_from_env_reads_url() {
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe { std::env::set_var("OPENSEARCH_URL", "http://opensearch:9200") };
+        let cfg = OpenSearchConfig::from_env();
+        assert_eq!(cfg.url, "http://opensearch:9200");
+        unsafe { std::env::remove_var("OPENSEARCH_URL") };
+    }
 }

@@ -38,23 +38,47 @@ const WATERMARK_VALKEY_TTL_SECS: u64 = 86_400;
 
 type CacheEntry = (u64, Instant);
 
+/// Tunables for [`LogoutWatermark`].
+#[derive(Clone, Debug)]
+pub struct WatermarkConfig {
+    pub cache_ttl: Duration,
+    pub valkey_ttl_secs: u64,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl: CACHE_TTL,
+            valkey_ttl_secs: WATERMARK_VALKEY_TTL_SECS,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LogoutWatermark {
     client: redis::Client,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    config: WatermarkConfig,
 }
 
 impl LogoutWatermark {
-    /// Construct a `LogoutWatermark` connected to the given Valkey/Redis URL.
+    /// Construct a `LogoutWatermark` connected to the given Valkey/Redis URL
+    /// with default tunables.
     ///
     /// `redis_url` should be of the form `redis://host:port` or
     /// `redis://:password@host:port`. The connection is established lazily on
     /// the first command; construction never blocks.
     pub fn new(redis_url: &str) -> Result<Self> {
+        Self::new_with_config(redis_url, WatermarkConfig::default())
+    }
+
+    /// Construct a `LogoutWatermark` with explicit tunables.
+    pub fn new_with_config(redis_url: &str, config: WatermarkConfig) -> Result<Self> {
         let client = redis::Client::open(redis_url)?;
         Ok(Self {
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            config,
         })
     }
 
@@ -66,12 +90,14 @@ impl LogoutWatermark {
     pub async fn signal_logout(&self, subject: &str) -> Result<u64> {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         let key = Self::key(subject);
         let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let _: () = conn.set_ex(&key, now_ms, WATERMARK_VALKEY_TTL_SECS).await?;
+        let _: () = conn
+            .set_ex(&key, now_ms, self.config.valkey_ttl_secs)
+            .await?;
 
         // Update local cache so in-process reads are immediately consistent.
         {
@@ -93,7 +119,7 @@ impl LogoutWatermark {
         {
             let guard = self.cache.read();
             if let Some(&(wm, cached_at)) = guard.get(subject)
-                && cached_at.elapsed() < CACHE_TTL
+                && cached_at.elapsed() < self.config.cache_ttl
             {
                 return Ok(wm);
             }
@@ -251,6 +277,23 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "two cached reads took {elapsed:?}, expected <100ms"
         );
+    }
+
+    #[test]
+    fn watermark_config_can_be_constructed_with_overrides() {
+        let cfg = WatermarkConfig {
+            cache_ttl: Duration::from_secs(10),
+            valkey_ttl_secs: 3600,
+        };
+        assert_eq!(cfg.cache_ttl, Duration::from_secs(10));
+        assert_eq!(cfg.valkey_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn watermark_config_default_matches_constants() {
+        let cfg = WatermarkConfig::default();
+        assert_eq!(cfg.cache_ttl, CACHE_TTL);
+        assert_eq!(cfg.valkey_ttl_secs, WATERMARK_VALKEY_TTL_SECS);
     }
 
     #[tokio::test]

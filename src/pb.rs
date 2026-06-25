@@ -6,6 +6,7 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 #![allow(clippy::large_enum_variant)]
+#![allow(clippy::question_mark_used)]
 
 pub use tonic::include_proto;
 

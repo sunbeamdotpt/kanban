@@ -1021,7 +1021,7 @@ mod tests {
         }
 
         // Build a request with iat=0 (0 * 1000 = 0ms < 1000ms watermark).
-        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::JwtClaims;
         let claims = JwtClaims {
             sub: subject.to_string(),
             iat: 0,
@@ -1054,7 +1054,7 @@ mod tests {
             .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
-        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
         let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
@@ -1122,7 +1122,7 @@ mod tests {
             .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
-        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
         let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
@@ -1155,7 +1155,7 @@ mod tests {
         let _infra = crate::test_support::containers::setup().await;
         let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
 
-        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
         let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());

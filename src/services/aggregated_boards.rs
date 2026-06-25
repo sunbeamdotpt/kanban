@@ -40,8 +40,8 @@ use crate::pb::{
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::cards::{
-    card_from_row, fetch_assignees, fetch_attachments_count, fetch_checklist, fetch_comments_count,
-    fetch_dependencies, fetch_dependents, fetch_labels, to_proto_ts,
+    CardAggregates, card_from_row, fetch_assignees, fetch_attachments_count, fetch_checklist,
+    fetch_comments_count, fetch_dependencies, fetch_dependents, fetch_labels, to_proto_ts,
 };
 use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
@@ -51,11 +51,6 @@ const KETO_NS: &str = "KanbanAggregatedBoard";
 const MAX_AGGREGATES: usize = 10_000;
 const CARD_BATCH_SIZE: usize = 100;
 
-/// Heartbeat interval for live streams (15 seconds).
-const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
-/// How often to recheck Keto permissions for live streams (30 seconds).
-const KETO_RECHECK_INTERVAL_MS: u64 = 30_000;
-
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct AggregatedBoardServiceImpl {
@@ -63,6 +58,9 @@ pub struct AggregatedBoardServiceImpl {
     pub keto: Arc<KetoClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub watermark: Arc<LogoutWatermark>,
+    pub heartbeat_interval: Duration,
+    pub keto_recheck_interval: Duration,
+    pub cutover_seen_capacity: usize,
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -294,10 +292,12 @@ async fn fetch_cards_for_boards(
             labels,
             assignees,
             checklist,
-            comments_count,
-            attachments_count,
-            depends_on,
-            dependents,
+            CardAggregates {
+                comments_count,
+                attachments_count,
+                depends_on_card_ids: depends_on,
+                dependent_card_ids: dependents,
+            },
         ));
     }
 
@@ -992,8 +992,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             aggregated_board_id,
             source_board_ids,
             is_private,
-            heartbeat_interval: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            keto_recheck_interval: Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
+            heartbeat_interval: self.heartbeat_interval,
+            keto_recheck_interval: self.keto_recheck_interval,
+            cutover_seen_capacity: self.cutover_seen_capacity,
         })
         .await?;
 
@@ -1035,6 +1036,7 @@ pub struct SubscribeAggregatedBoardArgs {
     pub is_private: bool,
     pub heartbeat_interval: Duration,
     pub keto_recheck_interval: Duration,
+    pub cutover_seen_capacity: usize,
 }
 
 pub async fn build_subscribe_aggregated_board_stream(
@@ -1050,6 +1052,7 @@ pub async fn build_subscribe_aggregated_board_stream(
         is_private,
         heartbeat_interval,
         keto_recheck_interval,
+        cutover_seen_capacity,
     } = args;
 
     let s = stream! {
@@ -1079,7 +1082,7 @@ pub async fn build_subscribe_aggregated_board_stream(
             }
         }
 
-        let mut tracker = CutoverTracker::new();
+        let mut tracker = CutoverTracker::with_capacity(cutover_seen_capacity);
         tracker.cutover_to_live(0);
 
         // Forward all source board events (and aggregate events) into a single
@@ -1208,6 +1211,9 @@ mod tests {
             keto: Arc::clone(&infra.keto),
             registry,
             watermark: Arc::clone(&infra.watermark),
+            heartbeat_interval: Duration::from_millis(15_000),
+            keto_recheck_interval: Duration::from_millis(30_000),
+            cutover_seen_capacity: 1024,
         }
     }
 
@@ -1221,6 +1227,9 @@ mod tests {
             keto: Arc::clone(&infra.keto),
             registry,
             watermark: Arc::clone(&infra.watermark),
+            heartbeat_interval: Duration::from_millis(15_000),
+            keto_recheck_interval: Duration::from_millis(30_000),
+            cutover_seen_capacity: 1024,
         }
     }
 
@@ -2382,6 +2391,7 @@ mod tests {
             is_private: false,
             heartbeat_interval: Duration::from_millis(10),
             keto_recheck_interval: Duration::from_millis(100),
+            cutover_seen_capacity: 16,
         })
         .await
         .expect("build stream should succeed");

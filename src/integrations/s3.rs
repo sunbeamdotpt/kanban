@@ -401,7 +401,10 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    let mut mac = match HmacSha256::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => panic!("HMAC accepts any key size"),
+    };
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -427,10 +430,10 @@ fn format_iso8601(secs: u64) -> String {
     // Days from epoch to compute date fields.
     // Using chrono from workspace is fine here; it's already a dep.
     use chrono::{TimeZone, Utc};
-    let dt = Utc
-        .timestamp_opt(s as i64, 0)
-        .single()
-        .expect("valid timestamp");
+    let dt = match Utc.timestamp_opt(s as i64, 0).single() {
+        Some(dt) => dt,
+        None => panic!("valid timestamp"),
+    };
     dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
@@ -559,5 +562,60 @@ mod tests {
             url.contains("X-Amz-Signature="),
             "presigned GET URL must contain X-Amz-Signature"
         );
+    }
+
+    #[test]
+    fn s3_config_from_env_uses_defaults_when_unset() {
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        for key in [
+            "S3_ENDPOINT",
+            "S3_REGION",
+            "S3_ACCESS_KEY",
+            "S3_SECRET_KEY",
+            "S3_BUCKET",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let cfg = S3Config::from_env();
+        assert_eq!(
+            cfg.endpoint,
+            "http://seaweedfs-filer.storage.svc.cluster.local:8333"
+        );
+        assert_eq!(cfg.region, "us-east-1");
+        assert!(cfg.access_key.is_empty());
+        assert!(cfg.secret_key.is_empty());
+        assert_eq!(cfg.bucket, "sunbeam-kanban");
+    }
+
+    #[test]
+    fn s3_config_from_env_reads_overrides() {
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        unsafe { std::env::set_var("S3_ENDPOINT", "http://minio:9000") };
+        unsafe { std::env::set_var("S3_REGION", "eu-west-1") };
+        unsafe { std::env::set_var("S3_ACCESS_KEY", "access") };
+        unsafe { std::env::set_var("S3_SECRET_KEY", "secret") };
+        unsafe { std::env::set_var("S3_BUCKET", "bucket") };
+
+        let cfg = S3Config::from_env();
+        assert_eq!(cfg.endpoint, "http://minio:9000");
+        assert_eq!(cfg.region, "eu-west-1");
+        assert_eq!(cfg.access_key, "access");
+        assert_eq!(cfg.secret_key, "secret");
+        assert_eq!(cfg.bucket, "bucket");
+
+        for key in [
+            "S3_ENDPOINT",
+            "S3_REGION",
+            "S3_ACCESS_KEY",
+            "S3_SECRET_KEY",
+            "S3_BUCKET",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 }

@@ -26,11 +26,10 @@ use crate::pb::card_service_server::CardService;
 use crate::pb::{
     AddChecklistItemRequest, AddCommentRequest, AssignCardRequest, Assignee, BatchGetCardsRequest,
     BatchGetCardsResponse, BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card,
-    CardDependencyRequest, ChecklistItem, Comment, CreateCardRequest,
-    DeleteCardRequest, DeleteCommentRequest, EditCommentRequest, GetCardRequest, Label,
-    ListCardsByBoardRequest, ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse,
-    MoveCardRequest, RemoveChecklistItemRequest, UnassignCardRequest, UpdateCardRequest,
-    UpdateChecklistItemRequest,
+    CardDependencyRequest, ChecklistItem, Comment, CreateCardRequest, DeleteCardRequest,
+    DeleteCommentRequest, EditCommentRequest, GetCardRequest, Label, ListCardsByBoardRequest,
+    ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse, MoveCardRequest,
+    RemoveChecklistItemRequest, UnassignCardRequest, UpdateCardRequest, UpdateChecklistItemRequest,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -127,15 +126,20 @@ fn urgency_from_i32(v: i32) -> &'static str {
 
 // ── Row → proto helpers ───────────────────────────────────────────────────────
 
+/// Derived card metadata that is not stored on the `cards` row itself.
+pub(crate) struct CardAggregates {
+    pub comments_count: i32,
+    pub attachments_count: i32,
+    pub depends_on_card_ids: Vec<String>,
+    pub dependent_card_ids: Vec<String>,
+}
+
 pub(crate) fn card_from_row(
     row: &sqlx::postgres::PgRow,
     labels: Vec<Label>,
     assignees: Vec<Assignee>,
     checklist: Vec<ChecklistItem>,
-    comments_count: i32,
-    attachments_count: i32,
-    depends_on_card_ids: Vec<String>,
-    dependent_card_ids: Vec<String>,
+    aggregates: CardAggregates,
 ) -> Card {
     let id: Uuid = row.get("id");
     let project_id: Uuid = row.get("project_id");
@@ -175,14 +179,14 @@ pub(crate) fn card_from_row(
         assignees,
         checklist,
         github_links: vec![],
-        comments_count,
-        attachments_count,
+        comments_count: aggregates.comments_count,
+        attachments_count: aggregates.attachments_count,
         revision: revision as u64,
         created_at: Some(to_proto_ts(created_at)),
         updated_at: Some(to_proto_ts(updated_at)),
         urgency: urgency_to_i32(urgency.as_deref().unwrap_or("medium")),
-        depends_on_card_ids,
-        dependent_card_ids,
+        depends_on_card_ids: aggregates.depends_on_card_ids,
+        dependent_card_ids: aggregates.dependent_card_ids,
     }
 }
 
@@ -299,31 +303,35 @@ pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32
 }
 
 pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Uuid) -> Vec<String> {
-    sqlx::query("SELECT depends_on_card_id FROM card_dependencies WHERE card_id = $1 ORDER BY created_at")
-        .bind(card_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| {
-            let id: Uuid = r.get("depends_on_card_id");
-            id.to_string()
-        })
-        .collect()
+    sqlx::query(
+        "SELECT depends_on_card_id FROM card_dependencies WHERE card_id = $1 ORDER BY created_at",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        let id: Uuid = r.get("depends_on_card_id");
+        id.to_string()
+    })
+    .collect()
 }
 
 pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Uuid) -> Vec<String> {
-    sqlx::query("SELECT card_id FROM card_dependencies WHERE depends_on_card_id = $1 ORDER BY created_at")
-        .bind(card_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| {
-            let id: Uuid = r.get("card_id");
-            id.to_string()
-        })
-        .collect()
+    sqlx::query(
+        "SELECT card_id FROM card_dependencies WHERE depends_on_card_id = $1 ORDER BY created_at",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        let id: Uuid = r.get("card_id");
+        id.to_string()
+    })
+    .collect()
 }
 
 /// Load a complete card, including its relationships, by id.
@@ -353,10 +361,12 @@ async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
         labels,
         assignees,
         checklist,
-        comments_count,
-        attachments_count,
-        depends_on,
-        dependents,
+        CardAggregates {
+            comments_count,
+            attachments_count,
+            depends_on_card_ids: depends_on,
+            dependent_card_ids: dependents,
+        },
     ))
 }
 
@@ -548,10 +558,12 @@ impl CardService for CardServiceImpl {
                 labels,
                 assignees,
                 checklist,
-                comments_count,
-                attachments_count,
-                depends_on,
-                dependents,
+                CardAggregates {
+                    comments_count,
+                    attachments_count,
+                    depends_on_card_ids: depends_on,
+                    dependent_card_ids: dependents,
+                },
             ));
         }
 
@@ -690,10 +702,12 @@ impl CardService for CardServiceImpl {
                 labels,
                 assignees,
                 checklist,
-                comments_count,
-                attachments_count,
-                depends_on,
-                dependents,
+                CardAggregates {
+                    comments_count,
+                    attachments_count,
+                    depends_on_card_ids: depends_on,
+                    dependent_card_ids: dependents,
+                },
             ));
         }
 
@@ -1238,14 +1252,13 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("begin tx failed", e))?;
 
         // Verify both cards belong to the authorized board.
-        let rows = sqlx::query(
-            "SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2",
-        )
-        .bind(&[card_id, depends_on_id][..])
-        .bind(board_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| internal("failed to verify cards", e))?;
+        let rows =
+            sqlx::query("SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2")
+                .bind(&[card_id, depends_on_id][..])
+                .bind(board_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| internal("failed to verify cards", e))?;
 
         if rows.len() != 2 {
             return Err(Status::invalid_argument(
@@ -1339,14 +1352,12 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("begin tx failed", e))?;
 
         // Verify both cards belong to the authorized board and fetch the card revision.
-        let card_row = sqlx::query(
-            "SELECT revision FROM cards WHERE id = $1 AND board_id = $2",
-        )
-        .bind(card_id)
-        .bind(board_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| internal("failed to verify card", e))?;
+        let card_row = sqlx::query("SELECT revision FROM cards WHERE id = $1 AND board_id = $2")
+            .bind(card_id)
+            .bind(board_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to verify card", e))?;
 
         let prev_revision = match card_row {
             Some(row) => row.get::<i64, _>("revision"),

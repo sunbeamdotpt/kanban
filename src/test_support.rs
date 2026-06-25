@@ -442,7 +442,10 @@ pub(crate) mod containers {
     /// host, so tests can connect via `localhost:<mapped-port>` instead of the
     /// container bridge IP.
     async fn host_port(container: &ContainerAsync<GenericImage>, port: u16) -> (String, u16) {
-        let host = container.get_host().await.expect("failed to resolve container host");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to resolve container host");
         let mapped = container
             .get_host_port_ipv4(ContainerPort::Tcp(port))
             .await
@@ -511,7 +514,10 @@ pub(crate) mod containers {
         let (host, port) = host_port(&container, 4222).await;
 
         for _ in 0..120 {
-            if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            if tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .is_ok()
+            {
                 return container;
             }
             sleep(Duration::from_millis(250)).await;
@@ -772,6 +778,7 @@ serve:
                 url: nats_url.to_string(),
                 jetstream: true,
                 lease_duration: 30,
+                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             })
             .await
             .expect("NATS connect failed"),

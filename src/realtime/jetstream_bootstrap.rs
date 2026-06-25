@@ -106,24 +106,39 @@ pub enum Storage {
 /// - Limits retention so replay consumers can seek to any offset within the window.
 /// - 1 replica; set `KANBAN_NATS_REPLICAS=3` in production.
 /// - File storage; override to Memory in tests via `StreamConfig { storage: Storage::Memory, .. }`.
+impl std::str::FromStr for Retention {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "limits" => Ok(Retention::Limits),
+            "interest" => Ok(Retention::Interest),
+            "work_queue" | "workqueue" | "work-queue" => Ok(Retention::WorkQueue),
+            _ => Err(format!("unknown retention policy: {s}")),
+        }
+    }
+}
+
+impl std::str::FromStr for Storage {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "file" => Ok(Storage::File),
+            "memory" => Ok(Storage::Memory),
+            _ => Err(format!("unknown storage type: {s}")),
+        }
+    }
+}
+
 pub fn default_config() -> StreamConfig {
-    let replicas: i32 = std::env::var("KANBAN_NATS_REPLICAS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-
-    let max_age_secs: u64 = std::env::var("KANBAN_STREAM_MAX_AGE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(86_400); // 24 h
-
     StreamConfig {
         name: STREAM_NAME,
         subjects: &[STREAM_WILDCARD_SUBJECT],
         retention: Retention::Limits,
-        max_age_secs,
+        max_age_secs: 86_400,
         max_msgs_per_subject: 10_000,
-        replicas,
+        replicas: 1,
         storage: Storage::File,
     }
 }
@@ -200,6 +215,7 @@ mod tests {
             url: nats_url,
             jetstream: true,
             lease_duration: 30,
+            auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
         })
         .await
         .expect("NATS connect failed — is NATS_URL set and the server running?");
@@ -218,5 +234,55 @@ mod tests {
 
         // TODO(g2v): when NatsClient exposes stream_info(), assert returned
         // config matches default_config() fields (retention, max_age, etc.).
+    }
+
+    #[test]
+    fn retention_from_str_parses_variants() {
+        assert_eq!("limits".parse::<Retention>().unwrap(), Retention::Limits);
+        assert_eq!(
+            "Interest".parse::<Retention>().unwrap(),
+            Retention::Interest
+        );
+        assert_eq!(
+            "work_queue".parse::<Retention>().unwrap(),
+            Retention::WorkQueue
+        );
+        assert!("unknown".parse::<Retention>().is_err());
+    }
+
+    #[test]
+    fn storage_from_str_parses_variants() {
+        assert_eq!("file".parse::<Storage>().unwrap(), Storage::File);
+        assert_eq!("Memory".parse::<Storage>().unwrap(), Storage::Memory);
+        assert!("tape".parse::<Storage>().is_err());
+    }
+
+    #[test]
+    fn default_config_matches_documented_defaults() {
+        let cfg = default_config();
+        assert_eq!(cfg.name, STREAM_NAME);
+        assert_eq!(cfg.retention, Retention::Limits);
+        assert_eq!(cfg.max_age_secs, 86_400);
+        assert_eq!(cfg.max_msgs_per_subject, 10_000);
+        assert_eq!(cfg.replicas, 1);
+        assert_eq!(cfg.storage, Storage::File);
+    }
+
+    #[test]
+    fn stream_config_can_be_overridden() {
+        let cfg = StreamConfig {
+            name: STREAM_NAME,
+            subjects: &[STREAM_WILDCARD_SUBJECT],
+            retention: Retention::Interest,
+            max_age_secs: 600,
+            max_msgs_per_subject: 500,
+            replicas: 3,
+            storage: Storage::Memory,
+        };
+        assert_eq!(cfg.retention, Retention::Interest);
+        assert_eq!(cfg.max_age_secs, 600);
+        assert_eq!(cfg.max_msgs_per_subject, 500);
+        assert_eq!(cfg.replicas, 3);
+        assert_eq!(cfg.storage, Storage::Memory);
     }
 }

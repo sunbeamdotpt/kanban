@@ -8,13 +8,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-// for @siennathesane's sanity and to make it clear the scope of error handling. and because it's
-// super fucking subtle and i'll miss it in code reviews sorry not sorry
-#![deny(clippy::question_mark_used)]
 // just keeps syntax consistent
 #![deny(clippy::needless_borrow)]
 
 pub mod auth;
+pub mod config;
 pub mod integrations;
 pub mod keto_proto;
 pub mod pb;

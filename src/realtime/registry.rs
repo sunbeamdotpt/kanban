@@ -39,7 +39,25 @@ use crate::pb::BoardEventEnvelope;
 
 /// Per-board ring-buffer capacity. 256 covers typical burst windows;
 /// slow receivers get `RecvError::Lagged` and must reconnect.
-const BROADCAST_CAPACITY: usize = 256;
+const DEFAULT_BROADCAST_CAPACITY: usize = 256;
+/// Default NATS ephemeral consumer GC threshold in seconds.
+const DEFAULT_INACTIVE_THRESHOLD_SECS: u64 = 30;
+
+/// Tunables for [`BoardSubscriberRegistry`].
+#[derive(Clone, Debug)]
+pub struct RegistryConfig {
+    pub broadcast_capacity: usize,
+    pub inactive_threshold_secs: u64,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
+            inactive_threshold_secs: DEFAULT_INACTIVE_THRESHOLD_SECS,
+        }
+    }
+}
 
 // ── BoardChannel ─────────────────────────────────────────────────────────────
 
@@ -59,19 +77,30 @@ pub struct BoardSubscriberRegistry {
     nats: Arc<NatsClient>,
     pod_id: String,
     boards: Arc<RwLock<HashMap<String, BoardChannel>>>,
+    config: RegistryConfig,
 }
 
 impl BoardSubscriberRegistry {
-    /// Construct a new registry.
+    /// Construct a new registry with default tunables.
     ///
     /// `pod_id` is embedded in every ephemeral consumer name (MF-6).
     /// A stable, unique-per-pod string (e.g. `$POD_NAME` env var or a
     /// random UUID at process start) is recommended.
     pub fn new(nats: Arc<NatsClient>, pod_id: impl Into<String>) -> Self {
+        Self::new_with_config(nats, pod_id, RegistryConfig::default())
+    }
+
+    /// Construct a new registry with explicit tunables.
+    pub fn new_with_config(
+        nats: Arc<NatsClient>,
+        pod_id: impl Into<String>,
+        config: RegistryConfig,
+    ) -> Self {
         Self {
             nats,
             pod_id: pod_id.into(),
             boards: Arc::new(RwLock::new(HashMap::new())),
+            config,
         }
     }
 
@@ -155,13 +184,13 @@ impl BoardSubscriberRegistry {
                 name: Some(consumer_name.clone()),
                 deliver_subject: deliver_inbox.clone(),
                 filter_subject: subject.clone(),
-                inactive_threshold: Duration::from_secs(30),
+                inactive_threshold: Duration::from_secs(self.config.inactive_threshold_secs),
                 ..Default::default()
             })
             .await
             .map_err(|e| anyhow!("failed to create push consumer {consumer_name}: {e}"))?;
 
-        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (sender, _) = broadcast::channel(self.config.broadcast_capacity);
         let pump_sender = sender.clone();
 
         // Spawn the pump task. It runs until aborted (on last-subscriber drop).
@@ -298,6 +327,7 @@ mod tests {
                 url,
                 jetstream: true,
                 lease_duration: 30,
+                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             })
             .await
             .expect("NATS connect failed — set NATS_URL"),
@@ -459,6 +489,23 @@ mod tests {
             let ch = guard.get(&board_id).unwrap();
             assert_eq!(ch.refcount, 1, "fresh channel must have refcount 1");
         }
+    }
+
+    #[test]
+    fn registry_config_can_be_constructed_with_overrides() {
+        let cfg = RegistryConfig {
+            broadcast_capacity: 512,
+            inactive_threshold_secs: 60,
+        };
+        assert_eq!(cfg.broadcast_capacity, 512);
+        assert_eq!(cfg.inactive_threshold_secs, 60);
+    }
+
+    #[test]
+    fn registry_config_default_matches_constants() {
+        let cfg = RegistryConfig::default();
+        assert_eq!(cfg.broadcast_capacity, DEFAULT_BROADCAST_CAPACITY);
+        assert_eq!(cfg.inactive_threshold_secs, DEFAULT_INACTIVE_THRESHOLD_SECS);
     }
 
     /// Events on board A do not appear on board B's subscriber.

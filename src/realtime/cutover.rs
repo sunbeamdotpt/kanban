@@ -121,14 +121,19 @@ pub struct CutoverTracker {
 }
 
 impl CutoverTracker {
-    /// Capacity of the event-id ring buffer.
-    const SEEN_CAPACITY: usize = 1_024;
+    /// Default capacity of the event-id ring buffer.
+    const DEFAULT_SEEN_CAPACITY: usize = 1_024;
 
     /// Construct a new tracker in the [`Phase::Replay`] state.
     pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_SEEN_CAPACITY)
+    }
+
+    /// Construct a new tracker with an explicit deduplication capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             phase: Phase::Replay,
-            seen_ids: BoundedSet::new(Self::SEEN_CAPACITY),
+            seen_ids: BoundedSet::new(capacity),
             last_live_seq: None,
         }
     }
@@ -357,5 +362,16 @@ mod tests {
         // Second call with a different seq — must not change anything.
         t.cutover_to_live(999);
         assert_eq!(*t.phase(), Phase::Live { resume_seq: 11 });
+    }
+
+    /// Trackers can be constructed with a custom deduplication capacity.
+    #[test]
+    fn cutover_tracker_with_capacity() {
+        let mut t = CutoverTracker::with_capacity(2);
+        assert_eq!(t.observe_replay("a"), Outcome::Emit);
+        assert_eq!(t.observe_replay("b"), Outcome::Emit);
+        assert_eq!(t.observe_replay("a"), Outcome::Drop);
+        // "c" evicts the oldest unseen id, which is "b".
+        assert_eq!(t.observe_replay("c"), Outcome::Emit);
     }
 }

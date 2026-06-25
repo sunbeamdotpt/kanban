@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use axum::{
     Router, extract::State, http::StatusCode, middleware, response::IntoResponse, routing::get,
 };
+use clap::Parser;
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
 use tonic::service::Routes as TonicRoutes;
@@ -29,7 +30,7 @@ use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
 use sunbeam_g2v::mq::NatsClient;
 
 use crate::auth::keto_dispatch::{DispatchState, dispatch};
-use crate::auth::logout_watermark::LogoutWatermark;
+use crate::auth::logout_watermark::{LogoutWatermark, WatermarkConfig};
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
@@ -77,6 +78,12 @@ pub struct KanbanMetrics {
 
 impl KanbanMetrics {
     pub fn new() -> Result<Self> {
+        Self::with_buckets(vec![
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        ])
+    }
+
+    pub fn with_buckets(buckets: Vec<f64>) -> Result<Self> {
         let registry = Arc::new(Registry::new());
 
         let keto_check_total = CounterVec::new(
@@ -117,9 +124,7 @@ impl KanbanMetrics {
                 "kanban_rpc_duration_seconds",
                 "gRPC handler duration in seconds",
             )
-            .buckets(vec![
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-            ]),
+            .buckets(buckets),
             &["service", "method"],
         )?;
         registry.register(Box::new(rpc_duration_seconds.clone()))?;
@@ -200,68 +205,316 @@ async fn metrics_handler(State(state): State<AppState>) -> (StatusCode, String) 
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
-// ── Configuration ────────────────────────────────────────────────────────────
+// ── CLI / Configuration ───────────────────────────────────────────────────────
+
+/// Kanban service configuration.
+///
+/// All fields can be set via environment variables (the `env` attribute on each
+/// arg) or command-line flags. Command-line flags take precedence over env vars.
+#[derive(Clone, Debug, Parser)]
+#[command(name = "kanban", about = "Sunbeam Kanban backend")]
+pub struct Cli {
+    /// Host address to bind to.
+    #[arg(long, env = "KANBAN_HOST", default_value = "0.0.0.0")]
+    host: String,
+
+    /// Port to listen on.
+    #[arg(long, env = "KANBAN_PORT", default_value = "8080")]
+    port: u16,
+
+    /// PostgreSQL connection string.
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: String,
+
+    /// Maximum Postgres pool size.
+    #[arg(long, env = "KANBAN_DATABASE_MAX_CONNECTIONS", default_value = "20")]
+    database_max_connections: u32,
+
+    /// Postgres connection acquire timeout in seconds.
+    #[arg(
+        long,
+        env = "KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS",
+        default_value = "10"
+    )]
+    database_acquire_timeout_secs: u64,
+
+    /// Secret used to validate Bearer JWTs.
+    #[arg(long, env = "JWT_SECRET", default_value = "change-me")]
+    jwt_secret: String,
+
+    /// JWT token expiry in seconds.
+    #[arg(long, env = "JWT_TOKEN_EXPIRY_SECS", default_value = "3600")]
+    jwt_token_expiry_secs: u64,
+
+    /// NATS server URL.
+    #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
+    nats_url: String,
+
+    /// Optional NATS authentication token (supports NATS auth callout).
+    #[arg(long, env = "NATS_AUTH_TOKEN")]
+    nats_auth_token: Option<String>,
+
+    /// Valkey / Redis URL for logout watermarks.
+    #[arg(long, env = "VALKEY_URL", default_value = "redis://localhost:6379")]
+    valkey_url: String,
+
+    /// Keto read API endpoint.
+    #[arg(long, env = "KETO_READ_ADDR", default_value = "http://localhost:4466")]
+    keto_read_addr: String,
+
+    /// Keto write API endpoint.
+    #[arg(long, env = "KETO_WRITE_ADDR", default_value = "http://localhost:4467")]
+    keto_write_addr: String,
+
+    /// OpenSearch base URL.
+    #[arg(long, env = "OPENSEARCH_URL", default_value = "http://localhost:9200")]
+    opensearch_url: String,
+
+    /// OpenSearch index name for card search.
+    #[arg(
+        long,
+        env = "KANBAN_OPENSEARCH_INDEX",
+        default_value = "sunbeam-kanban-cards-v1"
+    )]
+    opensearch_index_name: String,
+
+    /// Optional S3-compatible endpoint for attachments.
+    #[arg(long, env = "S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+
+    /// S3 region.
+    #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+
+    /// S3 access key.
+    #[arg(long, env = "S3_ACCESS_KEY", default_value = "")]
+    s3_access_key: String,
+
+    /// S3 secret key.
+    #[arg(long, env = "S3_SECRET_KEY", default_value = "")]
+    s3_secret_key: String,
+
+    /// S3 bucket name.
+    #[arg(long, env = "S3_BUCKET", default_value = "sunbeam-kanban")]
+    s3_bucket: String,
+
+    /// Stable pod identity used when naming NATS consumers.
+    #[arg(long, env = "POD_NAME")]
+    pod_name: Option<String>,
+
+    /// Prometheus RPC duration histogram buckets in seconds (comma-separated).
+    #[arg(
+        long,
+        env = "KANBAN_RPC_DURATION_BUCKETS_SECS",
+        value_delimiter = ',',
+        default_value = "0.005,0.01,0.025,0.05,0.1,0.25,0.5,1.0,2.5,5.0"
+    )]
+    rpc_duration_buckets_secs: Vec<f64>,
+
+    // ── NATS / JetStream tunables ─────────────────────────────────────────────
+    /// NATS consumer lease duration in seconds.
+    #[arg(long, env = "KANBAN_NATS_LEASE_DURATION_SECS", default_value = "30")]
+    nats_lease_duration_secs: u64,
+
+    /// JetStream stream replica count.
+    #[arg(long, env = "KANBAN_NATS_REPLICAS", default_value = "1")]
+    stream_replicas: i32,
+
+    /// JetStream stream max age in seconds.
+    #[arg(long, env = "KANBAN_STREAM_MAX_AGE_SECS", default_value = "86400")]
+    stream_max_age_secs: u64,
+
+    /// Max messages retained per subject.
+    #[arg(
+        long,
+        env = "KANBAN_STREAM_MAX_MSGS_PER_SUBJECT",
+        default_value = "10000"
+    )]
+    stream_max_msgs_per_subject: i64,
+
+    /// JetStream retention policy: limits, interest, or work_queue.
+    #[arg(long, env = "KANBAN_STREAM_RETENTION", default_value = "limits")]
+    stream_retention: String,
+
+    /// JetStream storage backend: file or memory.
+    #[arg(long, env = "KANBAN_STREAM_STORAGE", default_value = "file")]
+    stream_storage: String,
+
+    // ── Outbox dispatcher ─────────────────────────────────────────────────────
+    /// Outbox poll interval in milliseconds.
+    #[arg(long, env = "KANBAN_OUTBOX_POLL_INTERVAL_MS", default_value = "250")]
+    outbox_poll_interval_ms: u64,
+
+    /// Outbox drain batch size.
+    #[arg(long, env = "KANBAN_OUTBOX_BATCH_SIZE", default_value = "256")]
+    outbox_batch_size: i64,
+
+    // ── Board subscriber registry ─────────────────────────────────────────────
+    /// Per-board broadcast channel capacity.
+    #[arg(
+        long,
+        env = "KANBAN_REGISTRY_BROADCAST_CAPACITY",
+        default_value = "256"
+    )]
+    registry_broadcast_capacity: usize,
+
+    /// NATS ephemeral consumer inactive threshold in seconds.
+    #[arg(
+        long,
+        env = "KANBAN_REGISTRY_INACTIVE_THRESHOLD_SECS",
+        default_value = "30"
+    )]
+    registry_inactive_threshold_secs: u64,
+
+    // ── Live subscription streams ─────────────────────────────────────────────
+    /// Heartbeat interval for live streams in milliseconds.
+    #[arg(long, env = "KANBAN_HEARTBEAT_INTERVAL_MS", default_value = "15000")]
+    heartbeat_interval_ms: u64,
+
+    /// Keto permission recheck interval for live streams in milliseconds.
+    #[arg(long, env = "KANBAN_KETO_RECHECK_INTERVAL_MS", default_value = "30000")]
+    keto_recheck_interval_ms: u64,
+
+    /// Cutover tracker deduplication capacity.
+    #[arg(long, env = "KANBAN_CUTOVER_SEEN_CAPACITY", default_value = "1024")]
+    cutover_seen_capacity: usize,
+
+    // ── Logout watermark ──────────────────────────────────────────────────────
+    /// Local watermark cache TTL in seconds.
+    #[arg(
+        long,
+        env = "KANBAN_LOGOUT_WATERMARK_CACHE_TTL_SECS",
+        default_value = "5"
+    )]
+    watermark_cache_ttl_secs: u64,
+
+    /// Valkey watermark key TTL in seconds.
+    #[arg(
+        long,
+        env = "KANBAN_LOGOUT_WATERMARK_VALKEY_TTL_SECS",
+        default_value = "86400"
+    )]
+    watermark_valkey_ttl_secs: u64,
+
+    // ── Attachment presigned URLs ─────────────────────────────────────────────
+    /// Presigned PUT URL lifetime in seconds.
+    #[arg(long, env = "KANBAN_UPLOAD_EXPIRES_SECS", default_value = "900")]
+    upload_expires_secs: u64,
+
+    /// Presigned GET URL lifetime in seconds.
+    #[arg(long, env = "KANBAN_DOWNLOAD_EXPIRES_SECS", default_value = "300")]
+    download_expires_secs: u64,
+}
+
+impl Cli {
+    /// Convert parsed CLI / env configuration into the internal `AppConfig`.
+    pub fn into_config(self) -> Result<AppConfig> {
+        let addr: SocketAddr = format!("{}:{}", self.host, self.port)
+            .parse()
+            .context("failed to parse KANBAN_HOST:KANBAN_PORT as a socket address")?;
+
+        let stream_retention = self
+            .stream_retention
+            .parse::<crate::realtime::jetstream_bootstrap::Retention>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "KANBAN_STREAM_RETENTION must be one of: limits, interest, work_queue: {e}"
+                )
+            })?;
+        let stream_storage = self
+            .stream_storage
+            .parse::<crate::realtime::jetstream_bootstrap::Storage>()
+            .map_err(|e| {
+                anyhow::anyhow!("KANBAN_STREAM_STORAGE must be one of: file, memory: {e}")
+            })?;
+
+        Ok(AppConfig {
+            addr,
+            host: self.host,
+            jwt_secret: self.jwt_secret,
+            jwt_token_expiry_secs: self.jwt_token_expiry_secs,
+            database_url: self.database_url,
+            database_max_connections: self.database_max_connections,
+            database_acquire_timeout_secs: self.database_acquire_timeout_secs,
+            nats_url: self.nats_url,
+            nats_auth_token: self.nats_auth_token,
+            nats_lease_duration_secs: self.nats_lease_duration_secs,
+            valkey_url: self.valkey_url,
+            keto_read_addr: self.keto_read_addr,
+            keto_write_addr: self.keto_write_addr,
+            opensearch_url: self.opensearch_url,
+            opensearch_index_name: self.opensearch_index_name,
+            s3_endpoint: self.s3_endpoint,
+            s3_region: self.s3_region,
+            s3_access_key: self.s3_access_key,
+            s3_secret_key: self.s3_secret_key,
+            s3_bucket: self.s3_bucket,
+            pod_name: self.pod_name,
+            rpc_duration_buckets_secs: self.rpc_duration_buckets_secs,
+            stream_replicas: self.stream_replicas,
+            stream_max_age_secs: self.stream_max_age_secs,
+            stream_max_msgs_per_subject: self.stream_max_msgs_per_subject,
+            stream_retention,
+            stream_storage,
+            outbox_poll_interval_ms: self.outbox_poll_interval_ms,
+            outbox_batch_size: self.outbox_batch_size,
+            registry_broadcast_capacity: self.registry_broadcast_capacity,
+            registry_inactive_threshold_secs: self.registry_inactive_threshold_secs,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
+            keto_recheck_interval_ms: self.keto_recheck_interval_ms,
+            cutover_seen_capacity: self.cutover_seen_capacity,
+            watermark_cache_ttl_secs: self.watermark_cache_ttl_secs,
+            watermark_valkey_ttl_secs: self.watermark_valkey_ttl_secs,
+            upload_expires_secs: self.upload_expires_secs,
+            download_expires_secs: self.download_expires_secs,
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub addr: SocketAddr,
+    pub host: String,
     pub jwt_secret: String,
+    pub jwt_token_expiry_secs: u64,
     pub database_url: String,
+    pub database_max_connections: u32,
+    pub database_acquire_timeout_secs: u64,
     pub nats_url: String,
+    pub nats_auth_token: Option<String>,
+    pub nats_lease_duration_secs: u64,
     pub valkey_url: String,
     pub keto_read_addr: String,
     pub keto_write_addr: String,
     pub opensearch_url: String,
+    pub opensearch_index_name: String,
     pub s3_endpoint: Option<String>,
+    pub s3_region: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub s3_bucket: String,
     pub pod_name: Option<String>,
+    pub rpc_duration_buckets_secs: Vec<f64>,
+    pub stream_replicas: i32,
+    pub stream_max_age_secs: u64,
+    pub stream_max_msgs_per_subject: i64,
+    pub stream_retention: crate::realtime::jetstream_bootstrap::Retention,
+    pub stream_storage: crate::realtime::jetstream_bootstrap::Storage,
+    pub outbox_poll_interval_ms: u64,
+    pub outbox_batch_size: i64,
+    pub registry_broadcast_capacity: usize,
+    pub registry_inactive_threshold_secs: u64,
+    pub heartbeat_interval_ms: u64,
+    pub keto_recheck_interval_ms: u64,
+    pub cutover_seen_capacity: usize,
+    pub watermark_cache_ttl_secs: u64,
+    pub watermark_valkey_ttl_secs: u64,
+    pub upload_expires_secs: u64,
+    pub download_expires_secs: u64,
 }
 
 pub fn load_config() -> Result<AppConfig> {
-    load_config_with(|key| std::env::var(key).ok())
-}
-
-pub fn load_config_with<F>(get_env: F) -> Result<AppConfig>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let port: u16 = get_env("KANBAN_PORT")
-        .unwrap_or_else(|| "8080".into())
-        .parse()
-        .context("KANBAN_PORT must be a valid port number")?;
-    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-
-    let jwt_secret = get_env("JWT_SECRET").unwrap_or_else(|| "change-me".into());
-
-    let database_url = get_env("DATABASE_URL").context("DATABASE_URL is required")?;
-
-    let nats_url = get_env("NATS_URL").unwrap_or_else(|| "nats://localhost:4222".into());
-
-    let valkey_url = get_env("VALKEY_URL").unwrap_or_else(|| "redis://localhost:6379".into());
-
-    let keto_read_addr =
-        get_env("KETO_READ_ADDR").unwrap_or_else(|| "http://localhost:4466".into());
-
-    let keto_write_addr =
-        get_env("KETO_WRITE_ADDR").unwrap_or_else(|| "http://localhost:4467".into());
-
-    let opensearch_url =
-        get_env("OPENSEARCH_URL").unwrap_or_else(|| "http://localhost:9200".into());
-
-    let s3_endpoint = get_env("S3_ENDPOINT");
-    let pod_name = get_env("POD_NAME");
-
-    Ok(AppConfig {
-        addr,
-        jwt_secret,
-        database_url,
-        nats_url,
-        valkey_url,
-        keto_read_addr,
-        keto_write_addr,
-        opensearch_url,
-        s3_endpoint,
-        pod_name,
-    })
+    Cli::parse().into_config()
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -288,8 +541,8 @@ pub async fn run_with_config(
 ) -> Result<()> {
     // ── 3. Postgres + migrations ────────────────────────────────────────────
     let pg_pool = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(10))
+        .max_connections(config.database_max_connections)
+        .acquire_timeout(Duration::from_secs(config.database_acquire_timeout_secs))
         .connect(&config.database_url)
         .await
         .context("failed to connect to Postgres")?;
@@ -306,44 +559,75 @@ pub async fn run_with_config(
         NatsClient::connect(&NatsConfig {
             url: config.nats_url,
             jetstream: true,
-            lease_duration: 30,
+            lease_duration: config.nats_lease_duration_secs,
+            auth_token: config.nats_auth_token.clone(),
         })
         .await
         .context("failed to connect to NATS")?,
     );
 
-    crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
-        &nats,
-        &crate::realtime::jetstream_bootstrap::default_config(),
-    )
-    .await
-    .context("fatal: failed to bootstrap KANBAN_BOARD_EVENTS JetStream stream")?;
+    let stream_config = crate::realtime::jetstream_bootstrap::StreamConfig {
+        name: crate::realtime::jetstream_bootstrap::STREAM_NAME,
+        subjects: &[crate::realtime::jetstream_bootstrap::STREAM_WILDCARD_SUBJECT],
+        retention: config.stream_retention,
+        max_age_secs: config.stream_max_age_secs,
+        max_msgs_per_subject: config.stream_max_msgs_per_subject,
+        replicas: config.stream_replicas,
+        storage: config.stream_storage,
+    };
+    crate::realtime::jetstream_bootstrap::ensure_kanban_stream(&nats, &stream_config)
+        .await
+        .context("fatal: failed to bootstrap KANBAN_BOARD_EVENTS JetStream stream")?;
 
     info!(
         stream = crate::realtime::jetstream_bootstrap::STREAM_NAME,
         "JetStream stream bootstrapped"
     );
 
+    // Stable pod identity used by the outbox dispatcher and NATS consumers.
+    let pod_id = config
+        .pod_name
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
     // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
     // Drains undispatched event_log rows to NATS JetStream at 250ms poll
     // cadence. Hold the handle so the task is not immediately dropped.
     // TODO: graceful shutdown — plumb a CancellationToken and abort on SIGTERM.
-    let _outbox_handle =
-        crate::realtime::outbox::OutboxDispatcher::new(pg_pool.clone(), Arc::clone(&nats)).spawn();
+    let _outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
+        pg_pool.clone(),
+        Arc::clone(&nats),
+        crate::realtime::outbox::OutboxConfig {
+            poll_interval: Duration::from_millis(config.outbox_poll_interval_ms),
+            batch_size: config.outbox_batch_size,
+            pod_name: pod_id.clone(),
+        },
+    )
+    .spawn();
 
     info!("outbox dispatcher spawned");
 
     // ── 4c. BoardSubscriberRegistry — per-pod NATS push consumer fanout ────
-    let pod_id = config
-        .pod_name
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    let board_registry = Arc::new(BoardSubscriberRegistry::new(Arc::clone(&nats), pod_id));
+    let board_registry = Arc::new(BoardSubscriberRegistry::new_with_config(
+        Arc::clone(&nats),
+        pod_id,
+        crate::realtime::registry::RegistryConfig {
+            broadcast_capacity: config.registry_broadcast_capacity,
+            inactive_threshold_secs: config.registry_inactive_threshold_secs,
+        },
+    ));
 
     info!("BoardSubscriberRegistry constructed");
 
     // ── 5. Valkey / logout watermark ────────────────────────────────────────
     let watermark = Arc::new(
-        LogoutWatermark::new(&config.valkey_url).context("failed to construct LogoutWatermark")?,
+        LogoutWatermark::new_with_config(
+            &config.valkey_url,
+            WatermarkConfig {
+                cache_ttl: Duration::from_secs(config.watermark_cache_ttl_secs),
+                valkey_ttl_secs: config.watermark_valkey_ttl_secs,
+            },
+        )
+        .context("failed to construct LogoutWatermark")?,
     );
 
     info!("Valkey client initialised");
@@ -359,19 +643,31 @@ pub async fn run_with_config(
     info!("Keto client initialised and health tuple present");
 
     // ── 7. Prometheus metrics ───────────────────────────────────────────────
-    let metrics = Arc::new(KanbanMetrics::new().context("failed to register metrics")?);
+    let metrics = Arc::new(
+        KanbanMetrics::with_buckets(config.rpc_duration_buckets_secs.clone())
+            .context("failed to register metrics")?,
+    );
 
     info!("Prometheus metrics declared");
 
     // ── 8. S3 client for AttachmentService ─────────────────────────────────
-    let s3_client = Arc::new(S3Client::new(S3Config::from_env()));
-    info!(
-        "S3 client initialised (endpoint={})",
-        config.s3_endpoint.unwrap_or_else(|| "<default>".into())
-    );
+    let s3_endpoint = config
+        .s3_endpoint
+        .clone()
+        .unwrap_or_else(|| "http://seaweedfs-filer.storage.svc.cluster.local:8333".to_string());
+    let s3_client = Arc::new(S3Client::new(S3Config {
+        endpoint: s3_endpoint.clone(),
+        region: config.s3_region.clone(),
+        access_key: config.s3_access_key.clone(),
+        secret_key: config.s3_secret_key.clone(),
+        bucket: config.s3_bucket.clone(),
+    }));
+    info!("S3 client initialised (endpoint={})", s3_endpoint);
 
     // ── 8b. OpenSearch client for SearchService ─────────────────────────────
-    let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()));
+    let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+        url: config.opensearch_url.clone(),
+    }));
     info!(
         "OpenSearch client initialised (url={})",
         config.opensearch_url
@@ -384,12 +680,17 @@ pub async fn run_with_config(
     .add_service(AttachmentServiceServer::new(AttachmentServiceImpl {
         pool: pg_pool.clone(),
         s3: Arc::clone(&s3_client),
+        upload_expires_secs: config.upload_expires_secs,
+        download_expires_secs: config.download_expires_secs,
     }))
     .add_service(BoardServiceServer::new(BoardServiceImpl {
         pool: pg_pool.clone(),
         keto: Arc::clone(&keto),
         registry: Arc::clone(&board_registry),
         watermark: Arc::clone(&watermark),
+        heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+        keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
+        cutover_seen_capacity: config.cutover_seen_capacity,
     }))
     .add_service(CardServiceServer::new(CardServiceImpl {
         pool: pg_pool.clone(),
@@ -402,6 +703,9 @@ pub async fn run_with_config(
             keto: Arc::clone(&keto),
             registry: Arc::clone(&board_registry),
             watermark: Arc::clone(&watermark),
+            heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+            keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
+            cutover_seen_capacity: config.cutover_seen_capacity,
         },
     ))
     .add_service(ProjectServiceServer::new(ProjectServiceImpl {
@@ -414,7 +718,7 @@ pub async fn run_with_config(
         pool: pg_pool.clone(),
         keto: Arc::clone(&keto),
         opensearch: Arc::clone(&opensearch_client),
-        index_name: None,
+        index_name: Some(config.opensearch_index_name.clone()),
     }))
     .add_service(TemplatesServiceServer::new(TemplatesServiceImpl {
         pool: pg_pool.clone(),
@@ -456,7 +760,7 @@ pub async fn run_with_config(
 
     let jwt_validator = JwtValidator::new(AuthConfig {
         jwt_secret: config.jwt_secret.clone(),
-        token_expiry: 3600,
+        token_expiry: config.jwt_token_expiry_secs,
     });
 
     let app_state = AppState {
@@ -584,6 +888,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    use crate::realtime::jetstream_bootstrap::{Retention, Storage};
     use crate::test_support::containers;
 
     #[test]
@@ -642,73 +947,157 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    fn parse_config_args(args: &[&str]) -> Result<AppConfig, clap::Error> {
+        let mut full_args = vec!["kanban"];
+        full_args.extend(args);
+        Cli::try_parse_from(full_args).map(|cli| cli.into_config().expect("into_config"))
+    }
+
     #[test]
-    fn load_config_with_parses_all_fields() {
-        let cfg = load_config_with(|key| match key {
-            "KANBAN_PORT" => Some("1234".into()),
-            "JWT_SECRET" => Some("secret".into()),
-            "DATABASE_URL" => Some("postgres://db".into()),
-            "NATS_URL" => Some("nats://nats".into()),
-            "VALKEY_URL" => Some("redis://valkey".into()),
-            "KETO_READ_ADDR" => Some("http://keto-read".into()),
-            "KETO_WRITE_ADDR" => Some("http://keto-write".into()),
-            "OPENSEARCH_URL" => Some("http://opensearch".into()),
-            "S3_ENDPOINT" => Some("http://s3".into()),
-            "POD_NAME" => Some("pod-1".into()),
-            _ => None,
-        })
+    fn cli_parses_all_fields() {
+        let cfg = parse_config_args(&[
+            "--port=1234",
+            "--host=127.0.0.1",
+            "--jwt-secret=secret",
+            "--database-url=postgres://db",
+            "--database-max-connections=50",
+            "--database-acquire-timeout-secs=5",
+            "--jwt-token-expiry-secs=7200",
+            "--nats-url=nats://nats",
+            "--nats-auth-token=callout-token",
+            "--nats-lease-duration-secs=60",
+            "--valkey-url=redis://valkey",
+            "--keto-read-addr=http://keto-read",
+            "--keto-write-addr=http://keto-write",
+            "--opensearch-url=http://opensearch",
+            "--opensearch-index-name=custom-index",
+            "--s3-endpoint=http://s3",
+            "--s3-region=us-west-2",
+            "--s3-access-key=access",
+            "--s3-secret-key=secret",
+            "--s3-bucket=my-bucket",
+            "--pod-name=pod-1",
+            "--rpc-duration-buckets-secs=0.1,0.2",
+            "--stream-replicas=3",
+            "--stream-max-age-secs=3600",
+            "--stream-max-msgs-per-subject=5000",
+            "--stream-retention=interest",
+            "--stream-storage=memory",
+            "--outbox-poll-interval-ms=100",
+            "--outbox-batch-size=128",
+            "--registry-broadcast-capacity=512",
+            "--registry-inactive-threshold-secs=60",
+            "--heartbeat-interval-ms=7000",
+            "--keto-recheck-interval-ms=15000",
+            "--cutover-seen-capacity=2048",
+            "--watermark-cache-ttl-secs=10",
+            "--watermark-valkey-ttl-secs=43200",
+            "--upload-expires-secs=600",
+            "--download-expires-secs=120",
+        ])
         .expect("config should parse");
 
-        assert_eq!(cfg.addr.port(), 1234);
+        assert_eq!(cfg.addr, "127.0.0.1:1234".parse().unwrap());
+        assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.jwt_secret, "secret");
         assert_eq!(cfg.database_url, "postgres://db");
+        assert_eq!(cfg.database_max_connections, 50);
+        assert_eq!(cfg.database_acquire_timeout_secs, 5);
+        assert_eq!(cfg.jwt_token_expiry_secs, 7200);
         assert_eq!(cfg.nats_url, "nats://nats");
+        assert_eq!(cfg.nats_auth_token, Some("callout-token".into()));
+        assert_eq!(cfg.nats_lease_duration_secs, 60);
         assert_eq!(cfg.valkey_url, "redis://valkey");
         assert_eq!(cfg.keto_read_addr, "http://keto-read");
         assert_eq!(cfg.keto_write_addr, "http://keto-write");
         assert_eq!(cfg.opensearch_url, "http://opensearch");
+        assert_eq!(cfg.opensearch_index_name, "custom-index");
         assert_eq!(cfg.s3_endpoint, Some("http://s3".into()));
+        assert_eq!(cfg.s3_region, "us-west-2");
+        assert_eq!(cfg.s3_access_key, "access");
+        assert_eq!(cfg.s3_secret_key, "secret");
+        assert_eq!(cfg.s3_bucket, "my-bucket");
         assert_eq!(cfg.pod_name, Some("pod-1".into()));
+        assert_eq!(cfg.rpc_duration_buckets_secs, vec![0.1, 0.2]);
+        assert_eq!(cfg.stream_replicas, 3);
+        assert_eq!(cfg.stream_max_age_secs, 3600);
+        assert_eq!(cfg.stream_max_msgs_per_subject, 5000);
+        assert_eq!(cfg.stream_retention, Retention::Interest);
+        assert_eq!(cfg.stream_storage, Storage::Memory);
+        assert_eq!(cfg.outbox_poll_interval_ms, 100);
+        assert_eq!(cfg.outbox_batch_size, 128);
+        assert_eq!(cfg.registry_broadcast_capacity, 512);
+        assert_eq!(cfg.registry_inactive_threshold_secs, 60);
+        assert_eq!(cfg.heartbeat_interval_ms, 7000);
+        assert_eq!(cfg.keto_recheck_interval_ms, 15000);
+        assert_eq!(cfg.cutover_seen_capacity, 2048);
+        assert_eq!(cfg.watermark_cache_ttl_secs, 10);
+        assert_eq!(cfg.watermark_valkey_ttl_secs, 43200);
+        assert_eq!(cfg.upload_expires_secs, 600);
+        assert_eq!(cfg.download_expires_secs, 120);
     }
 
     #[test]
-    fn load_config_with_uses_defaults() {
-        let cfg = load_config_with(|key| match key {
-            "DATABASE_URL" => Some("postgres://db".into()),
-            _ => None,
-        })
-        .expect("config should parse with defaults");
+    fn cli_uses_defaults() {
+        let cfg = parse_config_args(&["--database-url=postgres://db"])
+            .expect("config should parse with defaults");
 
         assert_eq!(cfg.addr.port(), 8080);
+        assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.jwt_secret, "change-me");
+        assert_eq!(cfg.jwt_token_expiry_secs, 3600);
+        assert_eq!(cfg.database_max_connections, 20);
+        assert_eq!(cfg.database_acquire_timeout_secs, 10);
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
+        assert!(cfg.nats_auth_token.is_none());
+        assert_eq!(cfg.nats_lease_duration_secs, 30);
         assert_eq!(cfg.valkey_url, "redis://localhost:6379");
         assert_eq!(cfg.keto_read_addr, "http://localhost:4466");
         assert_eq!(cfg.keto_write_addr, "http://localhost:4467");
         assert_eq!(cfg.opensearch_url, "http://localhost:9200");
+        assert_eq!(cfg.opensearch_index_name, "sunbeam-kanban-cards-v1");
+        assert!(cfg.s3_endpoint.is_none());
+        assert_eq!(cfg.s3_region, "us-east-1");
+        assert_eq!(cfg.s3_bucket, "sunbeam-kanban");
         assert!(cfg.pod_name.is_none());
+        assert_eq!(
+            cfg.rpc_duration_buckets_secs,
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        );
+        assert_eq!(cfg.stream_replicas, 1);
+        assert_eq!(cfg.stream_max_age_secs, 86_400);
+        assert_eq!(cfg.stream_max_msgs_per_subject, 10_000);
+        assert_eq!(cfg.stream_retention, Retention::Limits);
+        assert_eq!(cfg.stream_storage, Storage::File);
+        assert_eq!(cfg.outbox_poll_interval_ms, 250);
+        assert_eq!(cfg.outbox_batch_size, 256);
+        assert_eq!(cfg.registry_broadcast_capacity, 256);
+        assert_eq!(cfg.registry_inactive_threshold_secs, 30);
+        assert_eq!(cfg.heartbeat_interval_ms, 15_000);
+        assert_eq!(cfg.keto_recheck_interval_ms, 30_000);
+        assert_eq!(cfg.cutover_seen_capacity, 1024);
+        assert_eq!(cfg.watermark_cache_ttl_secs, 5);
+        assert_eq!(cfg.watermark_valkey_ttl_secs, 86_400);
+        assert_eq!(cfg.upload_expires_secs, 900);
+        assert_eq!(cfg.download_expires_secs, 300);
     }
 
     #[test]
-    fn load_config_with_requires_database_url() {
-        let err = load_config_with(|_| None).unwrap_err();
+    fn cli_requires_database_url() {
+        let err = parse_config_args(&[]).unwrap_err();
         assert!(
-            err.to_string().contains("DATABASE_URL is required"),
-            "error should mention DATABASE_URL: {err}"
+            err.to_string().contains("database-url") || err.to_string().contains("DATABASE_URL"),
+            "error should mention database-url/DATABASE_URL: {err}"
         );
     }
 
     #[test]
-    fn load_config_with_rejects_invalid_port() {
-        let err = load_config_with(|key| match key {
-            "DATABASE_URL" => Some("postgres://db".into()),
-            "KANBAN_PORT" => Some("not-a-port".into()),
-            _ => None,
-        })
-        .unwrap_err();
+    fn cli_rejects_invalid_port() {
+        let err =
+            parse_config_args(&["--database-url=postgres://db", "--port=not-a-port"]).unwrap_err();
         assert!(
-            err.to_string().contains("KANBAN_PORT"),
-            "error should mention KANBAN_PORT: {err}"
+            err.to_string().contains("port") || err.to_string().contains("KANBAN_PORT"),
+            "error should mention port/KANBAN_PORT: {err}"
         );
     }
 
@@ -718,16 +1107,46 @@ mod tests {
 
         let config = AppConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
+            host: "127.0.0.1".into(),
             jwt_secret: "test-secret".into(),
+            jwt_token_expiry_secs: 3600,
             database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL"),
+            database_max_connections: 20,
+            database_acquire_timeout_secs: 10,
             nats_url: std::env::var("NATS_URL").expect("NATS_URL"),
+            nats_auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
+            nats_lease_duration_secs: 30,
             valkey_url: std::env::var("VALKEY_URL").expect("VALKEY_URL"),
             keto_read_addr: std::env::var("KETO_READ_ADDR").expect("KETO_READ_ADDR"),
             keto_write_addr: std::env::var("KETO_WRITE_ADDR").expect("KETO_WRITE_ADDR"),
             opensearch_url: std::env::var("OPENSEARCH_URL")
                 .unwrap_or_else(|_| "http://localhost:9200".into()),
+            opensearch_index_name: "sunbeam-kanban-cards-v1".into(),
             s3_endpoint: std::env::var("S3_ENDPOINT").ok(),
+            s3_region: "us-east-1".into(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            s3_bucket: "sunbeam-kanban".into(),
             pod_name: Some("test-pod".into()),
+            rpc_duration_buckets_secs: vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            ],
+            stream_replicas: 1,
+            stream_max_age_secs: 86_400,
+            stream_max_msgs_per_subject: 10_000,
+            stream_retention: Retention::Limits,
+            stream_storage: Storage::File,
+            outbox_poll_interval_ms: 250,
+            outbox_batch_size: 256,
+            registry_broadcast_capacity: 256,
+            registry_inactive_threshold_secs: 30,
+            heartbeat_interval_ms: 15_000,
+            keto_recheck_interval_ms: 30_000,
+            cutover_seen_capacity: 1024,
+            watermark_cache_ttl_secs: 5,
+            watermark_valkey_ttl_secs: 86_400,
+            upload_expires_secs: 900,
+            download_expires_secs: 300,
         };
 
         let listener = tokio::net::TcpListener::bind(config.addr)

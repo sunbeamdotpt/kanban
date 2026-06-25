@@ -601,6 +601,7 @@ mod tests {
                 url: nats_url,
                 jetstream: true,
                 lease_duration: 30,
+                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             })
             .await
             .expect("NATS connect failed"),

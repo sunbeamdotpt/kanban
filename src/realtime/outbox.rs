@@ -74,6 +74,27 @@ use crate::pb::{
     board_event_envelope::Payload,
 };
 
+// ── OutboxConfig ─────────────────────────────────────────────────────────────
+
+/// Tunables for the outbox dispatcher.
+#[derive(Clone, Debug)]
+pub struct OutboxConfig {
+    pub poll_interval: Duration,
+    pub batch_size: i64,
+    /// Pod identity embedded in every emitted envelope.
+    pub pod_name: String,
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(250),
+            batch_size: 256,
+            pod_name: String::new(),
+        }
+    }
+}
+
 // ── OutboxDispatcher ──────────────────────────────────────────────────────────
 
 /// Long-running task that drains `event_log` rows to JetStream.
@@ -87,6 +108,8 @@ pub struct OutboxDispatcher {
     /// Per-loop batch size. Bounds the SELECT cursor so a backlog after
     /// downtime doesn't OOM the pod. 256 covers most steady-state load.
     batch_size: i64,
+    /// Pod identity embedded in every emitted envelope.
+    pod_name: String,
     /// Test-only board scope. `None` in production drains every undispatched
     /// row; `Some(board_id)` restricts to one board so concurrent integration
     /// tests don't eat each other's rows.
@@ -95,14 +118,14 @@ pub struct OutboxDispatcher {
 }
 
 impl OutboxDispatcher {
-    /// Construct a dispatcher with default poll interval (250ms) and batch
-    /// size (256).
-    pub fn new(pool: PgPool, nats: Arc<NatsClient>) -> Self {
+    /// Construct a dispatcher with the provided configuration.
+    pub fn new(pool: PgPool, nats: Arc<NatsClient>, config: OutboxConfig) -> Self {
         Self {
             pool,
             nats,
-            poll_interval: Duration::from_millis(250),
-            batch_size: 256,
+            poll_interval: config.poll_interval,
+            batch_size: config.batch_size,
+            pod_name: config.pod_name,
             #[cfg(test)]
             board_filter: None,
         }
@@ -193,17 +216,26 @@ impl OutboxDispatcher {
 
         for row in &rows {
             let row_id: Uuid = row.get("id");
-            let object_id: Uuid = row
+            let object_id: Uuid = match row
                 .get::<Option<Uuid>, _>("aggregated_board_id")
                 .or_else(|| row.get::<Option<Uuid>, _>("board_id"))
-                .expect("event_log row has neither board_id nor aggregated_board_id");
+            {
+                Some(id) => id,
+                None => panic!("event_log row has neither board_id nor aggregated_board_id"),
+            };
             let event_type: String = row.get("event_type");
             let payload_json: JsonValue = row.get("payload");
             let created_at: DateTime<Utc> = row.get("created_at");
 
             // Step 2: build BoardEventEnvelope.
-            let envelope =
-                build_envelope(row_id, object_id, &event_type, &payload_json, created_at);
+            let envelope = build_envelope(
+                row_id,
+                object_id,
+                &event_type,
+                &payload_json,
+                created_at,
+                &self.pod_name,
+            );
 
             // Step 3: encode to bytes.
             let encoded = Bytes::from(envelope.encode_to_vec());
@@ -286,6 +318,7 @@ fn build_envelope(
     event_type: &str,
     payload_json: &JsonValue,
     created_at: DateTime<Utc>,
+    emitter_pod_id: &str,
 ) -> BoardEventEnvelope {
     let emitted_at = Some(Timestamp {
         seconds: created_at.timestamp(),
@@ -310,7 +343,7 @@ fn build_envelope(
         nats_seq: 0,
         board_revision: 0, // TODO: carry board_revision in event_log payload
         emitted_at,
-        emitter_pod_id: std::env::var("POD_NAME").unwrap_or_default(),
+        emitter_pod_id: emitter_pod_id.to_string(),
         actor_subject: payload_json
             .get("actor_subject")
             .and_then(|v| v.as_str())
@@ -450,6 +483,7 @@ mod tests {
             url,
             jetstream: true,
             lease_duration: 30,
+            auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
         })
         .await
         .expect("failed to connect to NATS — is NATS_URL set and the server running?");
@@ -457,7 +491,7 @@ mod tests {
     }
 
     fn make_dispatcher(pool: PgPool, nats: Arc<NatsClient>, board_id: Uuid) -> OutboxDispatcher {
-        OutboxDispatcher::new(pool, nats).with_board_filter(board_id)
+        OutboxDispatcher::new(pool, nats, OutboxConfig::default()).with_board_filter(board_id)
     }
 
     /// Count event_log rows for a board where nats_seq IS NOT NULL.
@@ -652,9 +686,10 @@ mod tests {
         }
 
         // Use batch_size=3.
-        let dispatcher = OutboxDispatcher::new(pool.clone(), Arc::clone(&nats))
-            .with_batch_size(3)
-            .with_board_filter(board_id);
+        let dispatcher =
+            OutboxDispatcher::new(pool.clone(), Arc::clone(&nats), OutboxConfig::default())
+                .with_batch_size(3)
+                .with_board_filter(board_id);
 
         let mut total = 0usize;
         loop {
@@ -694,6 +729,7 @@ mod tests {
             url: "nats://localhost:19999".to_string(),
             jetstream: true,
             lease_duration: 30,
+            auth_token: None,
         })
         .await;
 
@@ -740,7 +776,14 @@ mod tests {
             "actor_subject": "user:alice"
         });
 
-        let env = build_envelope(row_id, board_id, "CardCreated", &payload, created_at);
+        let env = build_envelope(
+            row_id,
+            board_id,
+            "CardCreated",
+            &payload,
+            created_at,
+            "pod-test",
+        );
 
         assert_eq!(env.board_id, board_id.to_string());
         assert_eq!(env.event_id, row_id.to_string());
@@ -833,5 +876,39 @@ mod tests {
         let json = serde_json::json!({ "card_id": "card-1" });
         assert!(build_payload("BoardRenamed", &json).is_none());
         assert!(build_payload("", &json).is_none());
+    }
+
+    #[test]
+    fn outbox_config_default_values() {
+        let cfg = OutboxConfig::default();
+        assert_eq!(cfg.poll_interval, Duration::from_millis(250));
+        assert_eq!(cfg.batch_size, 256);
+        assert_eq!(cfg.pod_name, "");
+    }
+
+    #[test]
+    fn outbox_config_can_override_pod_name() {
+        let cfg = OutboxConfig {
+            poll_interval: Duration::from_millis(100),
+            batch_size: 64,
+            pod_name: "pod-42".into(),
+        };
+        assert_eq!(cfg.pod_name, "pod-42");
+    }
+
+    #[test]
+    fn build_envelope_uses_emitter_pod_id() {
+        let row_id = Uuid::new_v4();
+        let board_id = Uuid::new_v4();
+        let payload = serde_json::json!({ "card_id": "card-1" });
+        let env = build_envelope(
+            row_id,
+            board_id,
+            "CardCreated",
+            &payload,
+            Utc::now(),
+            "pod-7",
+        );
+        assert_eq!(env.emitter_pod_id, "pod-7");
     }
 }

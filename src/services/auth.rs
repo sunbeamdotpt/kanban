@@ -133,7 +133,7 @@ mod tests {
     use std::collections::HashMap;
 
     use serde_json::Value as JsonValue;
-    use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+    use sunbeam_g2v::middleware::auth::JwtClaims;
 
     fn valkey_url() -> Option<String> {
         std::env::var("VALKEY_URL").ok()

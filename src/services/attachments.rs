@@ -38,18 +38,13 @@ use crate::pb::{
     RequestPresignedUploadResponse,
 };
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
-/// Lifetime of a presigned PUT URL (15 minutes).
-const UPLOAD_EXPIRES_SECS: u64 = 900;
-/// Lifetime of a presigned GET URL (5 minutes).
-const DOWNLOAD_EXPIRES_SECS: u64 = 300;
-
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct AttachmentServiceImpl {
     pub pool: PgPool,
     pub s3: Arc<S3Client>,
+    pub upload_expires_secs: u64,
+    pub download_expires_secs: u64,
 }
 
 // ── Timestamp helpers ────────────────────────────────────────────────────────
@@ -188,8 +183,8 @@ impl AttachmentService for AttachmentServiceImpl {
 
         let presigned_url = self
             .s3
-            .presign_put(&s3_key, &req.mime_type, UPLOAD_EXPIRES_SECS);
-        let expires_at = now_plus_secs(UPLOAD_EXPIRES_SECS);
+            .presign_put(&s3_key, &req.mime_type, self.upload_expires_secs);
+        let expires_at = now_plus_secs(self.upload_expires_secs);
 
         Ok(Response::new(RequestPresignedUploadResponse {
             presigned_url,
@@ -294,8 +289,8 @@ impl AttachmentService for AttachmentServiceImpl {
         }
 
         let s3_key: String = row.get("s3_key");
-        let presigned_url = self.s3.presign_get(&s3_key, DOWNLOAD_EXPIRES_SECS);
-        let expires_at = now_plus_secs(DOWNLOAD_EXPIRES_SECS);
+        let presigned_url = self.s3.presign_get(&s3_key, self.download_expires_secs);
+        let expires_at = now_plus_secs(self.download_expires_secs);
 
         Ok(Response::new(RequestPresignedDownloadResponse {
             presigned_url,
@@ -411,6 +406,8 @@ mod tests {
         let svc = AttachmentServiceImpl {
             pool: infra.pool.clone(),
             s3: Arc::new(S3Client::new(cfg)),
+            upload_expires_secs: 900,
+            download_expires_secs: 300,
         };
         (infra, svc)
     }

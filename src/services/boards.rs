@@ -56,6 +56,9 @@ pub struct BoardServiceImpl {
     pub keto: Arc<KetoClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub watermark: Arc<LogoutWatermark>,
+    pub heartbeat_interval: Duration,
+    pub keto_recheck_interval: Duration,
+    pub cutover_seen_capacity: usize,
 }
 
 // ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
@@ -194,13 +197,6 @@ fn slug_from_name(name: &str) -> String {
 
 type SubscribeBoardStream =
     Pin<Box<dyn Stream<Item = Result<BoardEventEnvelope, Status>> + Send + 'static>>;
-
-// ── Streaming intervals (overridable in tests via build_subscribe_board_stream) ─
-
-/// Default heartbeat interval used in production.
-pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
-/// Default Keto permission recheck interval used in production.
-pub const KETO_RECHECK_INTERVAL_MS: u64 = 30_000;
 
 // ── Stream helpers ────────────────────────────────────────────────────────────
 
@@ -1121,8 +1117,8 @@ impl BoardService for BoardServiceImpl {
             auth,
             board_id,
             is_private,
-            heartbeat_interval: Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            keto_recheck_interval: Duration::from_millis(KETO_RECHECK_INTERVAL_MS),
+            heartbeat_interval: self.heartbeat_interval,
+            keto_recheck_interval: self.keto_recheck_interval,
         })
         .await?;
 
@@ -1159,6 +1155,7 @@ mod tests {
                 url: nats_url(),
                 jetstream: true,
                 lease_duration: 30,
+                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             })
             .await
             .expect("NATS connect failed — set NATS_URL"),
@@ -1173,7 +1170,7 @@ mod tests {
     }
 
     fn make_auth_with_future_exp(subject: &str) -> AuthContext {
-        use sunbeam_g2v::middleware::auth::jwt::JwtClaims;
+        use sunbeam_g2v::middleware::auth::JwtClaims;
         let claims = JwtClaims {
             sub: subject.to_string(),
             iat: 0,
@@ -1635,6 +1632,9 @@ mod tests {
             keto,
             registry,
             watermark,
+            heartbeat_interval: Duration::from_millis(15_000),
+            keto_recheck_interval: Duration::from_millis(30_000),
+            cutover_seen_capacity: 1024,
         }
     }
 

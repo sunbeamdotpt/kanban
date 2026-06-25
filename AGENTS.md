@@ -196,25 +196,84 @@ sunbeam ops restart keto
 
 ## Environment Variables
 
+All configuration is centralized in `src/server.rs` via `clap` derive flags. Every flag below can also be passed as a command-line argument (`--kebab-case`), with CLI values taking precedence over environment variables.
+
+### Core
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `KANBAN_HOST` | `0.0.0.0` | Bind host |
 | `KANBAN_PORT` | `8080` | HTTP/gRPC listen port |
 | `DATABASE_URL` | *required* | Postgres connection string |
+| `KANBAN_DATABASE_MAX_CONNECTIONS` | `20` | Postgres pool size |
+| `KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS` | `10` | Connection acquire timeout |
+| `JWT_SECRET` | `change-me` | JWT validation secret |
+| `JWT_TOKEN_EXPIRY_SECS` | `3600` | JWT token expiry |
+| `POD_NAME` | random UUID | Pod identity for NATS consumers and event envelopes |
+
+### Dependencies
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
 | `NATS_URL` | `nats://localhost:4222` | NATS server |
+| `NATS_AUTH_TOKEN` | — | NATS auth callout token |
 | `VALKEY_URL` | `redis://localhost:6379` | Valkey (logout watermarks) |
 | `KETO_READ_ADDR` | `http://localhost:4466` | Keto read endpoint |
 | `KETO_WRITE_ADDR` | `http://localhost:4467` | Keto write endpoint |
 | `KETO_GRPC_URL` | alias for `KETO_READ_ADDR` | Test alias |
 | `KETO_WRITE_GRPC_URL` | alias for `KETO_WRITE_ADDR` | Test alias |
-| `JWT_SECRET` | `change-me` | JWT validation secret |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *unset* | OpenTelemetry OTLP endpoint |
-| `S3_ENDPOINT` | *unset* | S3-compatible endpoint |
-| `S3_REGION` | `us-east-1` | S3 region |
-| `S3_ACCESS_KEY` | *unset* | S3 access key |
-| `S3_SECRET_KEY` | *unset* | S3 secret key |
-| `S3_BUCKET` | `sunbeam-kanban` | S3 bucket name |
 | `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
-| `POD_NAME` | random UUID | Pod identity for NATS consumer naming |
+| `KANBAN_OPENSEARCH_INDEX` | `sunbeam-kanban-cards-v1` | OpenSearch card index |
+
+### S3 / attachments
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `S3_ENDPOINT` | — | S3-compatible endpoint |
+| `S3_REGION` | `us-east-1` | S3 region |
+| `S3_ACCESS_KEY` | — | S3 access key |
+| `S3_SECRET_KEY` | — | S3 secret key |
+| `S3_BUCKET` | `sunbeam-kanban` | S3 bucket name |
+| `KANBAN_UPLOAD_EXPIRES_SECS` | `900` | Presigned PUT URL lifetime |
+| `KANBAN_DOWNLOAD_EXPIRES_SECS` | `300` | Presigned GET URL lifetime |
+
+### NATS / JetStream
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KANBAN_NATS_LEASE_DURATION_SECS` | `30` | NATS consumer lease duration |
+| `KANBAN_NATS_REPLICAS` | `1` | JetStream stream replicas |
+| `KANBAN_STREAM_MAX_AGE_SECS` | `86400` | Stream max age |
+| `KANBAN_STREAM_MAX_MSGS_PER_SUBJECT` | `10000` | Max messages per subject |
+| `KANBAN_STREAM_RETENTION` | `limits` | `limits`, `interest`, or `work_queue` |
+| `KANBAN_STREAM_STORAGE` | `file` | `file` or `memory` |
+
+### Realtime
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KANBAN_OUTBOX_POLL_INTERVAL_MS` | `250` | Outbox poll interval |
+| `KANBAN_OUTBOX_BATCH_SIZE` | `256` | Outbox drain batch size |
+| `KANBAN_REGISTRY_BROADCAST_CAPACITY` | `256` | Per-board broadcast capacity |
+| `KANBAN_REGISTRY_INACTIVE_THRESHOLD_SECS` | `30` | Ephemeral consumer GC threshold |
+| `KANBAN_HEARTBEAT_INTERVAL_MS` | `15000` | Live stream heartbeat interval |
+| `KANBAN_KETO_RECHECK_INTERVAL_MS` | `30000` | Live stream Keto recheck interval |
+| `KANBAN_CUTOVER_SEEN_CAPACITY` | `1024` | Replay/live dedup capacity |
+
+### Watermark
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KANBAN_LOGOUT_WATERMARK_CACHE_TTL_SECS` | `5` | Local watermark cache TTL |
+| `KANBAN_LOGOUT_WATERMARK_VALKEY_TTL_SECS` | `86400` | Valkey watermark key TTL |
+
+### Observability
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OpenTelemetry OTLP endpoint |
+| `RUST_LOG` | `info` | `tracing-subscriber` log filter |
+| `KANBAN_RPC_DURATION_BUCKETS_SECS` | `0.005,0.01,...` | Prometheus RPC duration buckets |
 
 For Kubernetes-specific guidance, see `docs/operations/configuration.md`.
 
