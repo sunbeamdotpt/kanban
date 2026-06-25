@@ -6,6 +6,12 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc3] - 2026-06-25
+
+### Changed
+
+- Upgraded `sunbeam-g2v` from 0.3.1 to 0.3.2.
+
 ## [1.0.0-rc2] - 2026-06-25
 
 ### Added
@@ -85,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
+[1.0.0-rc3]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc2
 [1.0.0-rc1]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc1
 [1.0.0-rc.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc.0
