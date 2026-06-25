@@ -13,11 +13,22 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sunbeam_g2v::error::ServiceError;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use tokio::time::sleep;
 
 const MAX_RETRIES: usize = 8;
+
+/// Encode a subject identifier so it is safe for Keto relation tuples.
+///
+/// `sunbeam-g2v` 0.3.2 parses subjects containing `:` as subject sets, so
+/// identifiers like `user:alice` must be encoded before being passed to Keto.
+/// Base64 URL-safe encoding keeps the string deterministic, collision-free, and
+/// free of Keto's subject-set delimiters.
+pub(crate) fn keto_subject_id(subject: &str) -> String {
+    URL_SAFE_NO_PAD.encode(subject.as_bytes())
+}
 
 /// Returns `true` if a Keto error message looks like a transient SQLite
 /// serialization conflict.
@@ -74,7 +85,11 @@ impl KetoRetryExt for KetoClient {
         relation: &'a str,
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>> {
-        Box::pin(retry(|| self.grant(namespace, object, relation, subject)))
+        let subject_id = keto_subject_id(subject);
+        Box::pin(retry(move || {
+            let subject_id = subject_id.clone();
+            async move { self.grant(namespace, object, relation, &subject_id).await }
+        }))
     }
 
     fn check_permission_with_retry<'a>(
@@ -84,17 +99,33 @@ impl KetoRetryExt for KetoClient {
         relation: &'a str,
         subject: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, ServiceError>> + Send + 'a>> {
+        let subject_id = keto_subject_id(subject);
         Box::pin(async move {
-            let allowed = retry(|| self.check_permission(namespace, object, relation, subject))
-                .await?;
+            // Keep a separate encoded subject for the post-check polling path;
+            // the retry closure below takes ownership of the original.
+            #[cfg(test)]
+            let subject_id_for_wait = subject_id.clone();
+
+            let allowed = retry(move || {
+                let subject_id = subject_id.clone();
+                async move { self.check_permission(namespace, object, relation, &subject_id).await }
+            })
+            .await?;
 
             // In integration tests the in-memory SQLite Keto image can return
             // `allowed=false` immediately after a successful grant because the
             // read and write API ports do not always share the same connection
             // cache. Poll briefly so tests don't flake on read-after-write races.
             #[cfg(test)]
-            let allowed =
-                wait_for_allowed(self, namespace, object, relation, subject, allowed).await?;
+            let allowed = wait_for_allowed(
+                self,
+                namespace,
+                object,
+                relation,
+                &subject_id_for_wait,
+                allowed,
+            )
+            .await?;
 
             Ok(allowed)
         })

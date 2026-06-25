@@ -174,7 +174,7 @@ async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
             "_kanban_health",
             "probe",
             "health",
-            "user:_kanban_startup_probe",
+            &crate::auth::keto_retry::keto_subject_id("user:_kanban_startup_probe"),
         )
         .await
     {
@@ -852,26 +852,18 @@ fn init_otel_tracing() -> Result<()> {
 /// Reads first and writes only if the tuple is missing. A write failure is
 /// treated as fatal and stops startup.
 async fn ensure_keto_health_tuple(keto: &KetoClient) -> Result<()> {
+    let probe_subject = crate::auth::keto_retry::keto_subject_id("user:_kanban_startup_probe");
+
     let present = keto
-        .check_permission(
-            "_kanban_health",
-            "probe",
-            "health",
-            "user:_kanban_startup_probe",
-        )
+        .check_permission("_kanban_health", "probe", "health", &probe_subject)
         .await
         .context("Keto health-tuple check failed at boot")?;
 
     if !present {
         tracing::info!("_kanban_health tuple absent — writing once");
-        keto.grant(
-            "_kanban_health",
-            "probe",
-            "health",
-            "user:_kanban_startup_probe",
-        )
-        .await
-        .context("fatal: failed to write Keto _kanban_health readiness tuple")?;
+        keto.grant("_kanban_health", "probe", "health", &probe_subject)
+            .await
+            .context("fatal: failed to write Keto _kanban_health readiness tuple")?;
     }
 
     Ok(())

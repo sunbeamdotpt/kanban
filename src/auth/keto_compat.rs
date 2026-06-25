@@ -14,7 +14,7 @@ use sunbeam_g2v::error::{ServiceError, ServiceResult};
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use tonic::transport::Channel;
 
-use crate::auth::keto_retry::retry;
+use crate::auth::keto_retry::{keto_subject_id, retry};
 
 /// List relation tuples from Keto's ReadService.
 pub async fn list_relation_tuples(
@@ -38,7 +38,7 @@ pub async fn list_relation_tuples(
             object: None,
             relation: relation.map(|s| s.to_string()),
             subject: subject.map(|s| Subject {
-                r#ref: Some(crate::keto_proto::subject::Ref::Id(s.to_string())),
+                r#ref: Some(crate::keto_proto::subject::Ref::Id(keto_subject_id(s))),
             }),
         }),
         page_size,
@@ -77,7 +77,7 @@ pub async fn delete_relation_tuples(
             relation: relation.map(|s| s.to_string()),
             subject: subject.map(|s| SgvSubject {
                 r#ref: Some(sunbeam_g2v::middleware::auth::keto_proto::subject::Ref::Id(
-                    s.to_string(),
+                    keto_subject_id(s),
                 )),
             }),
         }),

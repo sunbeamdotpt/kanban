@@ -689,7 +689,12 @@ pub(crate) async fn dispatch_check(
             // 5. Keto permission check.
             let allowed = state
                 .keto
-                .check_permission(entry.namespace, &object_id, entry.relation, subject)
+                .check_permission(
+                    entry.namespace,
+                    &object_id,
+                    entry.relation,
+                    &crate::auth::keto_retry::keto_subject_id(subject),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!(

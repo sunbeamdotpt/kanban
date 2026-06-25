@@ -2171,12 +2171,13 @@ dependencies = [
 
 [[package]]
 name = "kanban"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "anyhow",
  "async-nats",
  "async-stream",
  "axum 0.8.9",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -4445,9 +4446,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sunbeam-g2v"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4d906ec502e032cc2d1d0223bb7a67035f94299e4f115d8c8ac25c910992db"
+checksum = "f595cc3c292f1b056e4b66a339b244a27652171eb9083c8e873a72674bff880c"
 dependencies = [
  "anyhow",
  "arc-swap",
