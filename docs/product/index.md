@@ -47,7 +47,6 @@ Connect-RPC clients  →  Axum/Tonic server
                               ├── Postgres (projections + event_log)
                               ├── NATS JetStream (real-time fanout)
                               ├── Ory Keto (permissions)
-                              ├── Valkey (logout watermarks)
                               ├── OpenSearch (search index)
                               └── S3 (attachments)
 ```

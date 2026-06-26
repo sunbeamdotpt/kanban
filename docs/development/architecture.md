@@ -17,13 +17,13 @@ labels:
 
 ```
 Frontend (React/TS)
-  │ Connect-Web (h2 or SSE) + Bearer JWT
+  │ Connect-Web (h2 or SSE) + Bearer OAuth2 token
   ▼
 kanban-server (Rust Axum) :8080
   │
   ├─ TraceLayer → propagates OpenTelemetry context
   ├─ Prometheus middleware → records RPC metrics
-  ├─ JwtLayer → validates JWT, inserts AuthContext
+  ├─ IntrospectionLayer → introspects token with Hydra, inserts AuthContext
   ├─ keto_dispatch → checks MATRIX, calls Keto, inserts CheckedObjectId
   └─ Handler → reads checked ID, mutates Postgres, emits event_log
        │
@@ -47,10 +47,9 @@ kanban-server (Rust Axum) :8080
 
 | File | Responsibility |
 | --- | --- |
-| `src/server.rs` | Bootstrap: config, OTel, Postgres, NATS, Valkey, Keto, Axum router. |
+| `src/server.rs` | Bootstrap: config, OTel, Postgres, NATS, Keto, Axum router. |
 | `src/auth/keto_dispatch.rs` | Static dispatch matrix and middleware. |
 | `src/auth/keto_expand.rs` | Expand Keto subjects/objects for list post-filtering. |
-| `src/auth/logout_watermark.rs` | Valkey-backed token revocation. |
 | `src/realtime/outbox.rs` | Polls `event_log` and publishes to JetStream. |
 | `src/realtime/registry.rs` | Per-pod consumer registry and broadcast fanout. |
 | `src/realtime/cutover.rs` | Resume-token deduplication for subscribers. |

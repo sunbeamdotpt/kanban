@@ -3,7 +3,7 @@
 # Integration-test runner for the Kanban backend.
 #
 # The Rust test harness in src/test_support.rs uses testcontainers to start
-# Postgres, NATS (JetStream), Valkey, Ory Keto, and MinIO automatically. This
+# Postgres, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically. This
 # script simply points testcontainers at the local Docker-compatible socket
 # (socktainer, docker, or podman) and runs the test suite.
 #
@@ -39,7 +39,6 @@ fi
 
 export KANBAN_TEST_POSTGRES_IMAGE="${KANBAN_TEST_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:16-alpine}"
 export KANBAN_TEST_NATS_IMAGE="${KANBAN_TEST_NATS_IMAGE:-nats:2.10-alpine}"
-export KANBAN_TEST_VALKEY_IMAGE="${KANBAN_TEST_VALKEY_IMAGE:-valkey/valkey:8.0.2-alpine}"
 export KANBAN_TEST_KETO_IMAGE="${KANBAN_TEST_KETO_IMAGE:-oryd/keto:v26.2.0}"
 export KANBAN_TEST_MINIO_IMAGE="${KANBAN_TEST_MINIO_IMAGE:-minio/minio:RELEASE.2025-02-28T09-55-16Z}"
 export KANBAN_TEST_OPENSEARCH_IMAGE="${KANBAN_TEST_OPENSEARCH_IMAGE:-opensearchproject/opensearch:2.19.1}"

@@ -23,7 +23,7 @@ Command-line flags take precedence over environment variables. Run `kanban --hel
 | --- | --- | --- |
 | `DATABASE_URL` | `postgres://user:pass@postgres:5432/kanban` | PostgreSQL connection string. |
 
-`JWT_SECRET` is optional at startup (default `change-me`) but must be set to the Hydra-issued JWT secret in production.
+
 
 ## Server endpoints
 
@@ -33,7 +33,6 @@ Command-line flags take precedence over environment variables. Run `kanban --hel
 | `KANBAN_PORT` | `--port` | `8080` | HTTP/gRPC listen port. |
 | `NATS_URL` | `--nats-url` | `nats://localhost:4222` | NATS server URL. JetStream must be enabled. |
 | `NATS_AUTH_TOKEN` | `--nats-auth-token` | — | Optional NATS auth callout token. |
-| `VALKEY_URL` | `--valkey-url` | `redis://localhost:6379` | Valkey / Redis URL for logout watermarks. |
 | `KETO_READ_ADDR` | `--keto-read-addr` | `http://localhost:4466` | Keto read API (gRPC/HTTP). |
 | `KETO_WRITE_ADDR` | `--keto-write-addr` | `http://localhost:4467` | Keto write API (gRPC/HTTP). |
 | `OPENSEARCH_URL` | `--opensearch-url` | `http://localhost:9200` | OpenSearch URL. |
@@ -48,12 +47,13 @@ Legacy aliases: `KETO_GRPC_URL` and `KETO_WRITE_GRPC_URL` are still accepted by 
 | `KANBAN_DATABASE_MAX_CONNECTIONS` | `--database-max-connections` | `20` | Max Postgres pool size. |
 | `KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS` | `--database-acquire-timeout-secs` | `10` | Connection acquire timeout. |
 
-## Authentication
+## Hydra / OAuth2 introspection
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `JWT_SECRET` | `--jwt-secret` | `change-me` | Secret used to validate Bearer JWTs from Hydra. |
-| `JWT_TOKEN_EXPIRY_SECS` | `--jwt-token-expiry-secs` | `3600` | JWT token expiry in seconds. |
+| `HYDRA_INTROSPECTION_URL` | `--hydra-introspection-url` | `http://localhost:4445/oauth2/introspect` | Hydra OAuth2 introspection endpoint. Every Bearer token is introspected here. |
+| `HYDRA_CLIENT_ID` | `--hydra-client-id` | `''` | OAuth2 client ID for introspection Basic auth. |
+| `HYDRA_CLIENT_SECRET` | `--hydra-client-secret` | `''` | OAuth2 client secret for introspection Basic auth. |
 
 ## Object storage (attachments)
 
@@ -107,13 +107,6 @@ The outbox also embeds `POD_NAME` in every emitted event envelope.
 | `KANBAN_KETO_RECHECK_INTERVAL_MS` | `--keto-recheck-interval-ms` | `30000` | Permission recheck interval during streaming. |
 | `KANBAN_CUTOVER_SEEN_CAPACITY` | `--cutover-seen-capacity` | `1024` | Replay/live deduplication ring-buffer size. |
 
-## Logout watermark
-
-| Variable | Flag | Default | Purpose |
-| --- | --- | --- | --- |
-| `KANBAN_LOGOUT_WATERMARK_CACHE_TTL_SECS` | `--watermark-cache-ttl-secs` | `5` | Local in-memory watermark cache TTL. |
-| `KANBAN_LOGOUT_WATERMARK_VALKEY_TTL_SECS` | `--watermark-valkey-ttl-secs` | `86400` | Valkey watermark key TTL. |
-
 ## Observability
 
 | Variable | Default | Purpose |
@@ -141,7 +134,6 @@ metadata:
 data:
   KANBAN_PORT: "8080"
   NATS_URL: "nats://nats.nats.svc.cluster.local:4222"
-  VALKEY_URL: "redis://valkey.valkey.svc.cluster.local:6379"
   KETO_READ_ADDR: "http://keto-read.ory.svc.cluster.local:4466"
   KETO_WRITE_ADDR: "http://keto-write.ory.svc.cluster.local:4467"
   OPENSEARCH_URL: "http://opensearch.opensearch.svc.cluster.local:9200"
@@ -160,7 +152,8 @@ metadata:
   namespace: kanban
 stringData:
   DATABASE_URL: "postgres://kanban:<password>@postgres.postgres.svc.cluster.local:5432/kanban"
-  JWT_SECRET: "<hydra-jwt-secret>"
+  HYDRA_CLIENT_ID: "<hydra-client-id>"
+  HYDRA_CLIENT_SECRET: "<hydra-client-secret>"
   S3_ACCESS_KEY: "<access-key>"
   S3_SECRET_KEY: "<secret-key>"
 ```

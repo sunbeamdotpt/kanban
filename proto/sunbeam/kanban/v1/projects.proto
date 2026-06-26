@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/projects.proto
 //
-// Auth: every RPC in ProjectService except WhoAmI (which lives in AuthService)
-// requires a valid bearer token. Keto checks are performed by the kanban-local
+// Auth: every RPC in ProjectService requires a valid bearer token. Keto checks
+// are performed by the kanban-local
 // `keto_dispatch` middleware defined in
 // `apps/kanban/src/auth/keto_dispatch.rs`. The per-RPC Keto object is sourced
 // from the `x-sunbeam-object-id` request header for body-bearing RPCs and from

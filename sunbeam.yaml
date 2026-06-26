@@ -20,7 +20,6 @@ targets:
 deps:
   services:
     - postgres
-    - valkey
     - nats
     - opensearch
     - keto

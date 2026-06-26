@@ -20,13 +20,13 @@
 //     to re-grant `owner` on its own and there is no other authz path back in).
 //     Closes Pre-mortem 1.
 //
-//   * Downgrading editor → viewer (or revoking entirely) MUST trigger a write
-//     to the per-subject logout watermark — i.e. `auth.logout.{sub}` in Valkey
-//     — within the same Keto write batch. This is enforced in
-//     `apps/kanban/src/auth/membership.rs`, NOT by Keto. Without the watermark
-//     bump, the now-downgraded user keeps receiving privileged stream events
-//     for up to 30s on cadence-recheck and indefinitely on token-expiry-only
-//     guards. Closes Pre-mortem 4 / MF-8 part 1.
+//   * Downgrading editor → viewer (or revoking entirely) MUST be followed by
+//     revoking the user's Hydra access token so the next introspection fails.
+//     Permission rechecks during live streams rely on Hydra returning `active:
+//     false` for revoked tokens. This is enforced in the membership handler,
+//     NOT by Keto. Without the revocation, the now-downgraded user keeps
+//     receiving privileged stream events until the token expires.
+//     Closes Pre-mortem 4 / MF-8 part 1.
 //
 //   * Namespace evolution is dual-write, never delete-in-place. To change a
 //     relation:

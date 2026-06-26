@@ -18,7 +18,7 @@ labels:
 Every RPC is gated. The middleware stack is:
 
 1. `TraceLayer` — propagates OpenTelemetry context.
-2. `JwtLayer` — validates the Bearer JWT from Hydra and inserts `Extension<AuthContext>`.
+2. `IntrospectionLayer` — introspects the Bearer token against Hydra's `/oauth2/introspect` and inserts `Extension<AuthContext>`.
 3. `keto_dispatch` — looks the RPC up in `MATRIX`, calls Keto, and inserts `Extension<CheckedObjectId>`.
 4. Handler.
 
@@ -26,9 +26,9 @@ Every RPC is gated. The middleware stack is:
 
 The frontend sets `x-sunbeam-object-id: <id>` per RPC. Handlers must read `CheckedObjectId` from request extensions, not from the protobuf body. This prevents body-forgery bypasses on server-streaming RPCs where the body ID could otherwise be manipulated.
 
-## Logout watermark
+## Token revocation
 
-`SignalLogout` writes a timestamp to Valkey. `keto_dispatch` compares the token's `iat_ms` against the watermark on every request. Revoked tokens receive `401 Unauthorized`.
+Logout is handled by Hydra. Because `IntrospectionLayer` introspects every Bearer token on every request, a revoked or expired token is rejected immediately with `401 Unauthorized`.
 
 ## Data integrity
 

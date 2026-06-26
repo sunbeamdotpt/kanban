@@ -28,7 +28,6 @@ Key metrics:
 | `kanban_keto_check_total` | counter | `result` (`allow`, `deny`, `error`) | Keto permission check results. |
 | `kanban_subscribe_active_streams` | gauge | — | Active board subscription streams. |
 | `kanban_jet_stream_lag_seconds` | gauge | `board_id` | JetStream consumer lag per board. |
-| `kanban_logout_watermark_errors_total` | counter | — | Errors reading logout watermark from Valkey. |
 | `kanban_mirror_drift_ratio` | gauge | — | Fraction of `project_member_view` rows that differ from Keto. |
 
 Configure Prometheus or a scraping agent to scrape pods with the annotation `prometheus.io/scrape: "true"` on port `8080`.
@@ -71,4 +70,3 @@ Useful log lines to watch for:
 | Readiness probe failing | `/healthz/ready` != 200 | page |
 | Mirror drift | `kanban_mirror_drift_ratio > 0.001` | warning |
 | NATS consumer lag | `kanban_jet_stream_lag_seconds` p95 > 5s | warning |
-| Watermark read errors | `kanban_logout_watermark_errors_total` increasing | warning |

@@ -318,20 +318,10 @@ mod tests {
     use super::*;
     use prost::Message as ProstMessage;
     use std::time::Duration;
-    use sunbeam_g2v::config::NatsConfig;
 
-    async fn connect_nats() -> Arc<NatsClient> {
-        let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-        Arc::new(
-            NatsClient::connect(&NatsConfig {
-                url,
-                jetstream: true,
-                lease_duration: 30,
-                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-            })
-            .await
-            .expect("NATS connect failed — set NATS_URL"),
-        )
+    async fn setup_nats() -> Arc<NatsClient> {
+        let infra = crate::test_support::containers::setup().await;
+        Arc::clone(&infra.nats)
     }
 
     /// Ensure the KANBAN_BOARD_EVENTS stream exists (idempotent).
@@ -372,7 +362,7 @@ mod tests {
     /// First subscriber opens the consumer and receives a published event.
     #[tokio::test]
     async fn subscribe_first_caller_opens_consumer_and_receives_published_event() {
-        let nats = connect_nats().await;
+        let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
@@ -401,7 +391,7 @@ mod tests {
     /// exists in the boards map, and both receive the same event.
     #[tokio::test]
     async fn subscribe_second_caller_shares_consumer_no_duplicate() {
-        let nats = connect_nats().await;
+        let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
@@ -451,7 +441,7 @@ mod tests {
     /// A subsequent subscribe call opens a fresh consumer.
     #[tokio::test]
     async fn dropping_last_subscriber_tears_down_consumer() {
-        let nats = connect_nats().await;
+        let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());
@@ -511,7 +501,7 @@ mod tests {
     /// Events on board A do not appear on board B's subscriber.
     #[tokio::test]
     async fn subscribe_to_different_boards_isolates_streams() {
-        let nats = connect_nats().await;
+        let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
         let board_a = format!("test-board-{}", Uuid::new_v4().simple());
@@ -553,7 +543,7 @@ mod tests {
     /// receive all 300 events.
     #[tokio::test]
     async fn lagged_receiver_does_not_block_others() {
-        let nats = connect_nats().await;
+        let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
         let board_id = format!("test-board-{}", Uuid::new_v4().simple());

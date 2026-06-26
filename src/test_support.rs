@@ -176,7 +176,7 @@ pub async fn setup_keto() -> std::sync::Arc<sunbeam_g2v::middleware::auth::keto:
 
 // ── Testcontainers-backed dependency harness ───────────────────────────────
 //
-// This module starts Postgres, NATS (JetStream), Valkey, Ory Keto, MinIO, and
+// This module starts Postgres, NATS (JetStream), Ory Keto, MinIO, and
 // OpenSearch in throwaway containers when `containers::setup()` is first called.
 // Containers are started through the Docker-compatible API pointed at by
 // `DOCKER_HOST`; testcontainers' host-port mapping is used, so the harness
@@ -197,7 +197,6 @@ pub(crate) mod containers {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
-    use crate::auth::logout_watermark::LogoutWatermark;
     use crate::integrations::s3::{S3Client, S3Config};
 
     /// Default container images for the harness. Override them with environment variables if needed.
@@ -208,10 +207,6 @@ pub(crate) mod containers {
     const NATS_IMAGE: &str = match option_env!("KANBAN_TEST_NATS_IMAGE") {
         Some(s) => s,
         None => "nats:2.10-alpine",
-    };
-    const VALKEY_IMAGE: &str = match option_env!("KANBAN_TEST_VALKEY_IMAGE") {
-        Some(s) => s,
-        None => "valkey/valkey:8.0.2-alpine",
     };
     const KETO_IMAGE: &str = match option_env!("KANBAN_TEST_KETO_IMAGE") {
         Some(s) => s,
@@ -238,19 +233,16 @@ pub(crate) mod containers {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
         pub keto: Arc<KetoClient>,
-        pub watermark: Arc<LogoutWatermark>,
     }
 
     /// Connection URLs and container handles shared by the whole test process.
     struct SharedInfra {
         database_url: String,
         nats_url: String,
-        valkey_url: String,
         keto_read_url: String,
         keto_write_url: String,
         _pg: Option<ContainerAsync<GenericImage>>,
         _nats: Option<ContainerAsync<GenericImage>>,
-        _valkey: Option<ContainerAsync<GenericImage>>,
         _keto: Option<ContainerAsync<GenericImage>>,
         _minio: Option<ContainerAsync<GenericImage>>,
         _opensearch: Option<ContainerAsync<GenericImage>>,
@@ -260,7 +252,6 @@ pub(crate) mod containers {
     struct SharedUrls {
         database_url: String,
         nats_url: String,
-        valkey_url: String,
         keto_read_url: String,
         keto_write_url: String,
     }
@@ -270,7 +261,6 @@ pub(crate) mod containers {
             SharedUrls {
                 database_url: self.database_url.clone(),
                 nats_url: self.nats_url.clone(),
-                valkey_url: self.valkey_url.clone(),
                 keto_read_url: self.keto_read_url.clone(),
                 keto_write_url: self.keto_write_url.clone(),
             }
@@ -299,7 +289,6 @@ pub(crate) mod containers {
         build_test_infra(
             &urls.database_url,
             &urls.nats_url,
-            &urls.valkey_url,
             &urls.keto_read_url,
             &urls.keto_write_url,
         )
@@ -310,7 +299,6 @@ pub(crate) mod containers {
     async fn from_env() -> Option<SharedInfra> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let nats_url = std::env::var("NATS_URL").ok()?;
-        let valkey_url = std::env::var("VALKEY_URL").ok()?;
         let keto_read_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
             .ok()?;
@@ -324,12 +312,10 @@ pub(crate) mod containers {
         Some(SharedInfra {
             database_url,
             nats_url,
-            valkey_url,
             keto_read_url,
             keto_write_url,
             _pg: None,
             _nats: None,
-            _valkey: None,
             _keto: None,
             _minio: None,
             _opensearch: None,
@@ -338,9 +324,7 @@ pub(crate) mod containers {
 
     /// Start all containers, run migrations, and return the shared URLs/handles.
     async fn start_containers() -> SharedInfra {
-        eprintln!(
-            "[testcontainers] starting Postgres, NATS, Valkey, Keto, MinIO, and OpenSearch..."
-        );
+        eprintln!("[testcontainers] starting Postgres, NATS, Keto, MinIO, and OpenSearch...");
 
         let startup_timeout = Duration::from_secs(600);
 
@@ -351,10 +335,6 @@ pub(crate) mod containers {
         let nats = start_nats(startup_timeout).await;
         let (nats_host, nats_port) = host_port(&nats, 4222).await;
         let nats_url = format!("nats://{nats_host}:{nats_port}");
-
-        let valkey = start_valkey(startup_timeout).await;
-        let (valkey_host, valkey_port) = host_port(&valkey, 6379).await;
-        let valkey_url = format!("redis://{valkey_host}:{valkey_port}");
 
         let keto = start_keto(startup_timeout).await;
         let (keto_host, keto_read_port) = host_port(&keto, 4466).await;
@@ -376,7 +356,6 @@ pub(crate) mod containers {
         unsafe {
             std::env::set_var("DATABASE_URL", &database_url);
             std::env::set_var("NATS_URL", &nats_url);
-            std::env::set_var("VALKEY_URL", &valkey_url);
             std::env::set_var("KETO_GRPC_URL", &keto_read_url);
             std::env::set_var("KETO_READ_ADDR", &keto_read_url);
             std::env::set_var("KETO_WRITE_GRPC_URL", &keto_write_url);
@@ -411,12 +390,10 @@ pub(crate) mod containers {
         SharedInfra {
             database_url,
             nats_url,
-            valkey_url,
             keto_read_url,
             keto_write_url,
             _pg: Some(pg),
             _nats: Some(nats),
-            _valkey: Some(valkey),
             _keto: Some(keto),
             _minio: Some(minio),
             _opensearch: Some(opensearch),
@@ -511,35 +488,6 @@ pub(crate) mod containers {
         }
 
         panic!("NATS did not become ready in time");
-    }
-
-    async fn start_valkey(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let parts: Vec<&str> = VALKEY_IMAGE.rsplitn(2, ':').collect();
-        let (name, tag) = match parts.as_slice() {
-            [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (VALKEY_IMAGE.to_string(), "latest".to_string()),
-        };
-
-        let container = GenericImage::new(name, tag)
-            .with_exposed_port(6379.tcp())
-            .with_startup_timeout(timeout)
-            .start()
-            .await
-            .expect("failed to start Valkey container");
-
-        let (host, port) = host_port(&container, 6379).await;
-
-        for _ in 0..120 {
-            let url = format!("redis://{host}:{port}");
-            if let Ok(client) = redis::Client::open(url.as_str()) {
-                if client.get_multiplexed_async_connection().await.is_ok() {
-                    return container;
-                }
-            }
-            sleep(Duration::from_millis(250)).await;
-        }
-
-        panic!("Valkey did not become ready in time");
     }
 
     async fn start_keto(timeout: Duration) -> ContainerAsync<GenericImage> {
@@ -727,13 +675,11 @@ serve:
     async fn build_test_infra(
         database_url: &str,
         nats_url: &str,
-        valkey_url: &str,
         keto_read_url: &str,
         keto_write_url: &str,
     ) -> TestInfra {
         let pool = connect_pool(database_url).await;
         let nats = connect_nats(nats_url).await;
-        let watermark = Arc::new(LogoutWatermark::new(valkey_url).expect("LogoutWatermark::new"));
         let keto = Arc::new(KetoClient::new(
             sunbeam_g2v::middleware::auth::keto::KetoConfig {
                 grpc_endpoint: keto_read_url.to_string(),
@@ -741,12 +687,7 @@ serve:
             },
         ));
 
-        TestInfra {
-            pool,
-            nats,
-            keto,
-            watermark,
-        }
+        TestInfra { pool, nats, keto }
     }
 
     async fn connect_pool(database_url: &str) -> sqlx::PgPool {

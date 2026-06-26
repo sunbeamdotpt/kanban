@@ -32,7 +32,6 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
 use crate::auth::keto_retry::KetoRetryExt;
-use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
     AddMemberRequest, BoardEventEnvelope, CreateProjectRequest, DeleteProjectRequest,
@@ -53,7 +52,6 @@ pub struct ProjectServiceImpl {
     pub pool: PgPool,
     pub keto: Arc<KetoClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
-    pub watermark: Arc<LogoutWatermark>,
 }
 
 // ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
@@ -594,8 +592,6 @@ mod tests {
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
         let nats_url =
             std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-        let valkey_url =
-            std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
         let nats = Arc::new(
             sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
                 url: nats_url,
@@ -607,12 +603,10 @@ mod tests {
             .expect("NATS connect failed"),
         );
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-projects"));
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).expect("LogoutWatermark::new"));
         ProjectServiceImpl {
             pool,
             keto,
             registry,
-            watermark,
         }
     }
 

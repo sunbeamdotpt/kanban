@@ -10,8 +10,8 @@
 //!
 //! `SubscribeBoard` is fully wired up: it sends a `Cutover` envelope,
 //! tails live events from the `BoardSubscriberRegistry`, emits periodic
-//! heartbeats, and revalidates the JWT/watermark and Keto permissions on
-//! every yield.
+//! heartbeats, and revalidates the token and Keto permissions on every
+//! yield.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,7 +33,6 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_retry::KetoRetryExt;
-use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::board_service_server::BoardService;
 use crate::pb::{
     AddColumnRequest, Board, BoardDetail, BoardEventEnvelope, Column, CreateBoardRequest, Cutover,
@@ -55,7 +54,6 @@ pub struct BoardServiceImpl {
     pub pool: PgPool,
     pub keto: Arc<KetoClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
-    pub watermark: Arc<LogoutWatermark>,
     pub heartbeat_interval: Duration,
     pub keto_recheck_interval: Duration,
     pub cutover_seen_capacity: usize,
@@ -235,39 +233,25 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
     }
 }
 
-/// Check whether the caller's token is still valid.
+/// Check whether the caller's token has expired.
 ///
-/// Returns `Ok(true)` while the JWT has not expired and the logout
-/// watermark has not been raised, `Ok(false)` if the token was revoked,
-/// and `Err` if Valkey is unavailable (fail-closed).
-async fn revalidate_token(watermark: &LogoutWatermark, auth: &AuthContext) -> Result<bool, Status> {
-    let subject = auth.subject.as_deref().unwrap_or("");
-
-    // Check JWT exp.
+/// Returns `Ok(true)` while the introspected token expiry (`AuthContext.exp`)
+/// is still in the future, `Ok(false)` if it has expired, and never fails.
+/// Token revocation is handled by Hydra during the introspection call that
+/// creates the `AuthContext`, so no additional revocation check is needed here.
+fn revalidate_token(auth: &AuthContext) -> Result<bool, Status> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    if let Some(claims) = &auth.claims
-        && claims.exp < now_secs
+
+    if let Some(exp) = auth.exp
+        && exp < now_secs
     {
         return Ok(false);
     }
 
-    // Check logout watermark.
-    let iat_ms: u64 = auth
-        .claims
-        .as_ref()
-        .map(|c| (c.iat as u64).saturating_mul(1000))
-        .unwrap_or(0);
-
-    match watermark.is_token_valid(subject, iat_ms).await {
-        Ok(valid) => Ok(valid),
-        Err(e) => {
-            warn!(subject, error = %e, "stream: logout watermark unavailable");
-            Err(Status::unavailable("authorization service unavailable"))
-        }
-    }
+    Ok(true)
 }
 
 /// Recheck Keto authorization for a live board stream.
@@ -295,7 +279,6 @@ async fn revalidate_keto(
 pub struct SubscribeBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
     pub keto: Arc<KetoClient>,
-    pub watermark: Arc<LogoutWatermark>,
     pub auth: AuthContext,
     pub board_id: String,
     pub is_private: bool,
@@ -317,7 +300,6 @@ pub async fn build_subscribe_board_stream(
     let SubscribeBoardArgs {
         registry,
         keto,
-        watermark,
         auth,
         board_id,
         is_private,
@@ -353,10 +335,10 @@ pub async fn build_subscribe_board_stream(
 
         loop {
             // ── Step A: token revalidation (every yield) ──────────────────────
-            match revalidate_token(&watermark, &auth).await {
+            match revalidate_token(&auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    yield Err(Status::unauthenticated("token revoked"));
+                    yield Err(Status::unauthenticated("token expired"));
                     break;
                 }
                 Err(status) => {
@@ -1113,7 +1095,6 @@ impl BoardService for BoardServiceImpl {
         let stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry: Arc::clone(&self.registry),
             keto: Arc::clone(&self.keto),
-            watermark: Arc::clone(&self.watermark),
             auth,
             board_id,
             is_private,
@@ -1145,10 +1126,6 @@ mod tests {
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
     }
 
-    fn valkey_url() -> String {
-        std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string())
-    }
-
     async fn connect_nats() -> Arc<NatsClient> {
         Arc::new(
             NatsClient::connect(&NatsConfig {
@@ -1170,16 +1147,7 @@ mod tests {
     }
 
     fn make_auth_with_future_exp(subject: &str) -> AuthContext {
-        use sunbeam_g2v::middleware::auth::JwtClaims;
-        let claims = JwtClaims {
-            sub: subject.to_string(),
-            iat: 0,
-            exp: i64::MAX,
-            iss: None,
-            aud: None,
-            extra: Default::default(),
-        };
-        AuthContext::authenticated(subject, Some(claims))
+        AuthContext::authenticated(subject, None).with_exp(i64::MAX)
     }
 
     async fn make_registry(nats: Arc<NatsClient>) -> Arc<BoardSubscriberRegistry> {
@@ -1199,7 +1167,6 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -1219,7 +1186,6 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1271,7 +1237,6 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -1289,7 +1254,6 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark: Arc::clone(&watermark),
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1364,7 +1328,6 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -1383,7 +1346,6 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1425,23 +1387,22 @@ mod tests {
         .await;
     }
 
-    /// When the caller's logout watermark is raised, the stream closes with
-    /// `Status::Unauthenticated`.
+    /// When the caller's access token expires mid-stream, the stream closes
+    /// with `Status::Unauthenticated`.
     ///
-    /// Uses a short Keto recheck interval and a one-second token
-    /// revalidation cadence so the test does not wait for the defaults.
+    /// Uses a short heartbeat interval so the test does not wait for the
+    /// production defaults.
     #[tokio::test]
-    async fn subscribe_closes_with_unauthenticated_when_token_revoked() {
+    async fn subscribe_closes_with_unauthenticated_when_token_expires() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
-        // Issue a token with iat=0 so that once watermark > 0, it's revoked.
-        let auth = make_auth_with_future_exp(&subject_str);
+        // Issue an already-expired token (exp = 0).
+        let auth = AuthContext::authenticated(&subject_str, None).with_exp(0);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -1456,14 +1417,9 @@ mod tests {
             .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
             .await;
 
-        // Use a 100ms heartbeat so the loop iterates rapidly and picks up the
-        // watermark quickly.
-        let wm_clone = Arc::clone(&watermark);
-        let sub_clone = subject_str.clone();
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark: Arc::clone(&watermark),
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1478,12 +1434,6 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
             .expect("timeout on cutover");
-
-        // Signal logout in a background task — set watermark > iat_ms=0.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = wm_clone.signal_logout(&sub_clone).await;
-        });
 
         // The stream should close with Unauthenticated within 2s.
         let err = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1501,7 +1451,7 @@ mod tests {
         assert_eq!(
             err.code(),
             tonic::Code::Unauthenticated,
-            "expected Unauthenticated when token revoked, got {err:?}"
+            "expected Unauthenticated when token expired, got {err:?}"
         );
 
         let _ = crate::auth::keto_compat::delete_relation_tuples(
@@ -1528,7 +1478,6 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -1552,7 +1501,6 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1620,18 +1568,15 @@ mod tests {
 
     /// Build a `BoardServiceImpl` for integration tests.
     ///
-    /// Connects to NATS and Valkey using the standard environment variables
-    /// so the registry and watermark fields are always populated.
+    /// Connects to NATS using the standard environment variables so the registry
+    /// field is always populated.
     async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> BoardServiceImpl {
         let nats = connect_nats().await;
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test"));
-        let watermark =
-            Arc::new(LogoutWatermark::new(&valkey_url()).expect("LogoutWatermark::new"));
         BoardServiceImpl {
             pool,
             keto,
             registry,
-            watermark,
             heartbeat_interval: Duration::from_millis(15_000),
             keto_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
@@ -2875,7 +2820,6 @@ mod tests {
         let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
         let auth = make_auth_with_future_exp(&subject_str);
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url()).expect("watermark"));
         let keto_url =
             std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
         let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
@@ -2892,7 +2836,6 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             keto: Arc::clone(&keto),
-            watermark,
             auth,
             board_id: board_id.clone(),
             is_private: false,

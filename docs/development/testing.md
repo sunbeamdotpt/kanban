@@ -27,7 +27,14 @@ The easiest way to run tests is the provided wrapper:
 ./test.sh --coverage         # cargo llvm-cov + summary
 ```
 
-`test.sh` uses `testcontainers` to start Postgres 16, NATS (JetStream), Valkey, Ory Keto, MinIO, and OpenSearch automatically. It detects the local container socket (Docker, Podman, OrbStack, or Apple Container's `container`) and points `DOCKER_HOST` at it.
+`test.sh` uses `testcontainers` to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically. It detects the local container socket (Docker, Podman, OrbStack, or Apple Container's `container`) and points `DOCKER_HOST` at it.
+
+On macOS with a Lima-based Docker context (e.g. `lima-docker`), auto-detection does not work. Set `DOCKER_HOST` manually:
+
+```sh
+export DOCKER_HOST="unix://${HOME}/.lima/docker/sock/docker.sock"
+./test.sh
+```
 
 ### Reusing an existing stack
 
@@ -36,7 +43,6 @@ If you already have services running, set the standard env vars instead:
 ```sh
 export DATABASE_URL='postgres://sunbeam:sunbeam@localhost:5432/kanban'
 export NATS_URL='nats://localhost:4222'
-export VALKEY_URL='redis://localhost:6379'
 export KETO_READ_ADDR='http://localhost:4466'
 export KETO_WRITE_ADDR='http://localhost:4467'
 export OPENSEARCH_URL='http://localhost:9200'
@@ -50,7 +56,7 @@ cargo test
 ### Test categories
 
 - **Unit tests** — no external dependencies (e.g., `matrix_covers_all_rpcs`).
-- **Integration tests** — require Postgres, Valkey, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
+- **Integration tests** — require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
 - **No `#[ignore]` attributes** — all tests run by default.
 
 ### Writing a service integration test

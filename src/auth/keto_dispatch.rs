@@ -18,20 +18,18 @@
 //! a header-vs-body bypass: a handler reading from the body would only get an
 //! ID that has already passed authorization.
 //!
-//! # IAT units
+//! # Authentication
 //!
-//! `JwtClaims.iat` is an `i64` in **seconds**, as defined by the JWT standard.
-//! The logout watermark stores and compares values in **milliseconds**. We
-//! convert once here: `iat_ms = (claims.iat as u64) * 1000`. All comparisons
-//! inside `LogoutWatermark::is_token_valid` use milliseconds.
-
+//! This middleware runs after `IntrospectionLayer`, which validates the
+//! `Authorization: Bearer <token>` header with Hydra and inserts
+//! `Extension<AuthContext>`. Token revocation is handled by Hydra, so no
+//! additional local revocation check is performed here.
+//!
 use std::{fmt, sync::Arc};
 
 use axum::{Extension, extract::Request, http::StatusCode, middleware::Next, response::Response};
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
-
-use crate::auth::logout_watermark::LogoutWatermark;
 
 // ============================================================================
 // Public types
@@ -59,8 +57,8 @@ pub enum ObjectIdSource {
     /// No specific object check is required.
     ///
     /// Used for RPCs that are open to any authenticated user (e.g.
-    /// `ListProjects`, `WhoAmI`, `SearchCards`), where the handler filters
-    /// the result set afterwards via `keto_expand`.
+    /// `ListProjects`, `SearchCards`), where the handler filters the result set
+    /// afterwards via `keto_expand`.
     None,
 }
 
@@ -87,7 +85,6 @@ pub struct DispatchEntry {
 /// Shared state carried by `Extension<Arc<DispatchState>>`.
 pub struct DispatchState {
     pub keto: Arc<KetoClient>,
-    pub watermark: Arc<LogoutWatermark>,
 }
 
 // ============================================================================
@@ -104,20 +101,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 70] = [
-    // ── AuthService (2) ─────────────────────────────────────────────────────
-    DispatchEntry {
-        method: "/sunbeam.kanban.v1.AuthService/WhoAmI",
-        namespace: "",
-        relation: "",
-        object_id_source: ObjectIdSource::None,
-    },
-    DispatchEntry {
-        method: "/sunbeam.kanban.v1.AuthService/SignalLogout",
-        namespace: "",
-        relation: "",
-        object_id_source: ObjectIdSource::None,
-    },
+static MATRIX: [DispatchEntry; 68] = [
     // ── ProjectService (9) ──────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.ProjectService/ListProjects",
@@ -548,8 +532,9 @@ static MATRIX: [DispatchEntry; 70] = [
 
 /// RPC methods that bypass the `keto_dispatch` middleware entirely.
 ///
-/// These are served by a separate Axum router that does not run `JwtLayer` or
-/// `keto_dispatch`, so they must not be counted by the matrix coverage checks.
+/// These are served by a separate Axum router that does not run
+/// `IntrospectionLayer` or `keto_dispatch`, so they must not be counted by the
+/// matrix coverage checks.
 pub const BYPASSED_METHODS: &[&str] = &[
     "/sunbeam.kanban.v1.PublicBoardService/GetPublicBoard",
     "/sunbeam.kanban.v1.PublicBoardService/ListPublicBoards",
@@ -579,8 +564,8 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 
 /// Per-RPC authorization dispatcher.
 ///
-/// Must run *after* `JwtLayer` (which inserts `Extension<AuthContext>`) and
-/// *before* the Connect-RPC service handlers.
+/// Must run *after* `IntrospectionLayer` (which inserts `Extension<AuthContext>`)
+/// and *before* the Connect-RPC service handlers.
 ///
 /// Register with:
 /// ```rust,ignore
@@ -633,36 +618,7 @@ pub(crate) async fn dispatch_check(
         }
     };
 
-    // 3. Logout watermark check.
-    //
-    // IAT conversion: JwtClaims.iat is i64 seconds (standard JWT RFC 7519).
-    // LogoutWatermark stores unix milliseconds.  Convert once here.
-    let iat_ms: u64 = auth
-        .claims
-        .as_ref()
-        .map(|c| (c.iat as u64).saturating_mul(1000))
-        .unwrap_or(0);
-
-    match state.watermark.is_token_valid(subject, iat_ms).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                method,
-                subject_hash = %hash_subject_prefix(subject),
-                "keto_dispatch: token revoked by logout watermark"
-            );
-            return Err((StatusCode::UNAUTHORIZED, "token revoked".to_string()));
-        }
-        Err(e) => {
-            tracing::error!(method, error = %e, "keto_dispatch: logout watermark unavailable");
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authorization service unavailable".to_string(),
-            ));
-        }
-    }
-
-    // 4–6. Object-id dispatch.
+    // 3–5. Object-id dispatch.
     match entry.object_id_source {
         ObjectIdSource::None => {
             // No specific object to authorize; the handler filters results.
@@ -848,21 +804,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_rejects_unauthenticated() {
-        // Use a None-source entry (WhoAmI) so we never reach the Keto check.
+        // Use a None-source entry so we never reach the Keto check.
         let auth = make_auth(false);
-        let mut req = make_request("/sunbeam.kanban.v1.AuthService/WhoAmI", auth);
+        let mut req = make_request("/sunbeam.kanban.v1.ProjectService/ListProjects", auth);
 
         // We need Extension<Arc<DispatchState>> too — but dispatch checks
         // is_authenticated first, so we can use a dummy state.
         let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let watermark = Arc::new(
-            LogoutWatermark::new("redis://127.0.0.1:6379")
-                .expect("LogoutWatermark::new should not connect eagerly"),
-        );
-        let state = Arc::new(DispatchState {
-            keto: dummy_keto,
-            watermark,
-        });
+        let state = Arc::new(DispatchState { keto: dummy_keto });
         req.extensions_mut().insert(state);
 
         let result = dispatch_raw(req).await;
@@ -875,40 +824,25 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_returns_400_when_header_missing_for_header_source() {
-        // GetBoard requires ObjectIdSource::Header.
+        // DeleteBoard requires ObjectIdSource::Header.
         let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.BoardService/GetBoard", auth.clone());
+        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
 
         let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let watermark = Arc::new(LogoutWatermark::new("redis://127.0.0.1:6379").unwrap());
-        let state = Arc::new(DispatchState {
-            keto: dummy_keto,
-            watermark,
-        });
+        let state = Arc::new(DispatchState { keto: dummy_keto });
         req.extensions_mut().insert(auth);
         req.extensions_mut().insert(state);
 
-        // No x-sunbeam-object-id header — should get 400.
-        // We need the watermark to not fail, but since iat_ms=0 and no
-        // watermark exists in Valkey, the check will error (fail-closed).
-        // That returns 503, not 400.  So we skip the watermark by using a
-        // None-source entry that still has the header-check reachable...
-        //
-        // Actually: for an authenticated user with no claims, iat_ms=0.
-        // The watermark will attempt to connect to Valkey; it will error.
-        // We document this: the 400-on-missing-header test needs a reachable
-        // watermark.  Mark this test as ignored without shared Valkey.
-        //
-        // See dispatch_returns_400_when_header_missing_for_header_source_unit
-        // for a pure unit test that does not hit Valkey.
+        // No x-sunbeam-object-id header — should get 400 before Keto is called.
+        let result = dispatch_raw(req).await;
+        assert_eq!(
+            result,
+            StatusCode::BAD_REQUEST,
+            "missing x-sunbeam-object-id header must yield 400"
+        );
     }
 
     /// Verify that `GetBoard` uses `ObjectIdSource::None`.
-    ///
-    /// This is a stand-in for the missing-header-400 path: the real header-missing
-    /// test needs a live Valkey because the watermark check runs first, so we at
-    /// least confirm the method in question does not require a header.
-    ///
     #[test]
     fn object_id_source_none_entry_exists_for_get_board() {
         let entry = MATRIX
@@ -926,8 +860,6 @@ mod tests {
             if entry.object_id_source == ObjectIdSource::None {
                 // Verify the None-source entries are the ones we expect.
                 let none_methods = [
-                    "/sunbeam.kanban.v1.AuthService/WhoAmI",
-                    "/sunbeam.kanban.v1.AuthService/SignalLogout",
                     "/sunbeam.kanban.v1.ProjectService/ListProjects",
                     "/sunbeam.kanban.v1.ProjectService/CreateProject",
                     "/sunbeam.kanban.v1.BoardService/ListBoards",
@@ -959,8 +891,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_70() {
-        assert_eq!(MATRIX.len(), 70, "matrix must contain exactly 70 entries");
+    fn matrix_size_is_68() {
+        assert_eq!(MATRIX.len(), 68, "matrix must contain exactly 68 entries");
     }
 
     #[test]
@@ -978,80 +910,11 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ── Integration tests (needs shared Valkey + Keto) ───────────────────────
-
-    #[tokio::test]
-    async fn dispatch_rejects_revoked_token() {
-        // Start shared test infrastructure and export service URLs.
-        let _infra = crate::test_support::containers::setup().await;
-
-        // Signal a logout for the test subject, then verify dispatch rejects
-        // a token whose iat_ms is before the watermark.
-        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
-
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
-        let keto = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: keto_url,
-            write_grpc_endpoint: keto_write_url,
-        }));
-        let state = Arc::new(DispatchState {
-            keto,
-            watermark: watermark.clone(),
-        });
-
-        let subject = "user:test-revoke";
-        // Write a watermark at t=1000ms (i.e. token iat must be >= 1000ms).
-        {
-            let mut conn = redis::Client::open(valkey_url.as_str())
-                .unwrap()
-                .get_multiplexed_async_connection()
-                .await
-                .unwrap();
-            let _: () = redis::AsyncCommands::set_ex(
-                &mut conn,
-                format!("auth.logout.{subject}"),
-                1000u64,
-                86400u64,
-            )
-            .await
-            .unwrap();
-        }
-
-        // Build a request with iat=0 (0 * 1000 = 0ms < 1000ms watermark).
-        use sunbeam_g2v::middleware::auth::JwtClaims;
-        let claims = JwtClaims {
-            sub: subject.to_string(),
-            iat: 0,
-            exp: i64::MAX,
-            iss: None,
-            aud: None,
-            extra: Default::default(),
-        };
-        let auth = AuthContext::authenticated(subject, Some(claims));
-        let mut req = make_request("/sunbeam.kanban.v1.AuthService/WhoAmI", auth.clone());
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(
-            result,
-            StatusCode::UNAUTHORIZED,
-            "revoked token must be rejected"
-        );
-    }
+    // ── Integration tests (needs shared Keto) ────────────────────────────────
 
     #[tokio::test]
     async fn dispatch_returns_403_on_keto_denial() {
         let _infra = crate::test_support::containers::setup().await;
-        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
         let keto_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4466".to_string());
@@ -1059,30 +922,18 @@ mod tests {
             .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
-        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
         let keto = Arc::new(KetoClient::new(KetoConfig {
             grpc_endpoint: keto_url,
             write_grpc_endpoint: keto_write_url,
         }));
-        let state = Arc::new(DispatchState { keto, watermark });
+        let state = Arc::new(DispatchState { keto });
 
-        // Token issued well in the future (iat=99999999999s) — no watermark
-        // will block it.  Object id points to a non-existent board → Keto
-        // returns false → 403. Use DeleteBoard because GetBoard now bypasses
-        // the Keto middleware for visibility filtering in the handler.
-        let subject = "user:test-403";
-        let claims = JwtClaims {
-            sub: subject.to_string(),
-            iat: 99_999_999_999,
-            exp: i64::MAX,
-            iss: None,
-            aud: None,
-            extra: Default::default(),
-        };
-        let auth = AuthContext::authenticated(subject, Some(claims));
+        // Object id points to a non-existent board → Keto returns false → 403.
+        // Use DeleteBoard because GetBoard bypasses the Keto middleware for
+        // visibility filtering in the handler.
+        let auth = make_auth(true);
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
         req.headers_mut().insert(
             "x-sunbeam-object-id",
@@ -1101,14 +952,7 @@ mod tests {
         let mut req = make_request("/sunbeam.kanban.v1.UnknownService/UnknownRpc", auth.clone());
 
         let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let watermark = Arc::new(
-            LogoutWatermark::new("redis://127.0.0.1:6379")
-                .expect("LogoutWatermark::new should not connect eagerly"),
-        );
-        let state = Arc::new(DispatchState {
-            keto: dummy_keto,
-            watermark,
-        });
+        let state = Arc::new(DispatchState { keto: dummy_keto });
         req.extensions_mut().insert(auth);
         req.extensions_mut().insert(state);
 
@@ -1119,7 +963,6 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_400_when_header_missing() {
         let _infra = crate::test_support::containers::setup().await;
-        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
         let keto_url = std::env::var("KETO_GRPC_URL")
             .or_else(|_| std::env::var("KETO_READ_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4466".to_string());
@@ -1127,26 +970,15 @@ mod tests {
             .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
             .unwrap_or_else(|_| "http://localhost:4467".to_string());
 
-        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
         let keto = Arc::new(KetoClient::new(KetoConfig {
             grpc_endpoint: keto_url,
             write_grpc_endpoint: keto_write_url,
         }));
-        let state = Arc::new(DispatchState { keto, watermark });
+        let state = Arc::new(DispatchState { keto });
 
-        let subject = "user:test-missing-header";
-        let claims = JwtClaims {
-            sub: subject.to_string(),
-            iat: 99_999_999_999,
-            exp: i64::MAX,
-            iss: None,
-            aud: None,
-            extra: Default::default(),
-        };
-        let auth = AuthContext::authenticated(subject, Some(claims));
+        let auth = make_auth(true);
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
         req.extensions_mut().insert(auth);
         req.extensions_mut().insert(state);
@@ -1158,28 +990,16 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_500_on_keto_error() {
         let _infra = crate::test_support::containers::setup().await;
-        let valkey_url = std::env::var("VALKEY_URL").expect("VALKEY_URL not set");
 
-        use sunbeam_g2v::middleware::auth::JwtClaims;
         use sunbeam_g2v::middleware::auth::keto::KetoConfig;
 
-        let watermark = Arc::new(LogoutWatermark::new(&valkey_url).unwrap());
         let keto = Arc::new(KetoClient::new(KetoConfig {
             grpc_endpoint: "http://127.0.0.1:1".to_string(),
             write_grpc_endpoint: "http://127.0.0.1:1".to_string(),
         }));
-        let state = Arc::new(DispatchState { keto, watermark });
+        let state = Arc::new(DispatchState { keto });
 
-        let subject = "user:test-keto-error";
-        let claims = JwtClaims {
-            sub: subject.to_string(),
-            iat: 99_999_999_999,
-            exp: i64::MAX,
-            iss: None,
-            aud: None,
-            extra: Default::default(),
-        };
-        let auth = AuthContext::authenticated(subject, Some(claims));
+        let auth = make_auth(true);
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
         req.headers_mut().insert(
             "x-sunbeam-object-id",
@@ -1190,34 +1010,6 @@ mod tests {
 
         let result = dispatch_raw(req).await;
         assert_eq!(result, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_503_on_watermark_error() {
-        let _infra = crate::test_support::containers::setup().await;
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
-
-        let watermark = Arc::new(LogoutWatermark::new("redis://127.0.0.1:1").unwrap());
-        let keto = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: keto_url,
-            write_grpc_endpoint: keto_write_url,
-        }));
-        let state = Arc::new(DispatchState { keto, watermark });
-
-        let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.AuthService/WhoAmI", auth.clone());
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

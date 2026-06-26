@@ -26,7 +26,6 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_expand::{ExpandQuery, expand_objects};
 use crate::auth::keto_retry::KetoRetryExt;
-use crate::auth::logout_watermark::LogoutWatermark;
 use crate::pb::aggregated_board_service_server::AggregatedBoardService;
 use crate::pb::{
     AddSourceBoardRequest, AggregatedBoard, AggregatedBoardChunk, AggregatedCardBatch,
@@ -57,7 +56,6 @@ pub struct AggregatedBoardServiceImpl {
     pub pool: PgPool,
     pub keto: Arc<KetoClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
-    pub watermark: Arc<LogoutWatermark>,
     pub heartbeat_interval: Duration,
     pub keto_recheck_interval: Duration,
     pub cutover_seen_capacity: usize,
@@ -345,29 +343,19 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
     }
 }
 
-async fn revalidate_token(watermark: &LogoutWatermark, auth: &AuthContext) -> Result<bool, Status> {
-    let subject = auth.subject.as_deref().unwrap_or("");
+fn revalidate_token(auth: &AuthContext) -> Result<bool, Status> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    if let Some(claims) = &auth.claims
-        && claims.exp < now_secs
+
+    if let Some(exp) = auth.exp
+        && exp < now_secs
     {
         return Ok(false);
     }
-    let iat_ms: u64 = auth
-        .claims
-        .as_ref()
-        .map(|c| (c.iat as u64).saturating_mul(1000))
-        .unwrap_or(0);
-    match watermark.is_token_valid(subject, iat_ms).await {
-        Ok(valid) => Ok(valid),
-        Err(e) => {
-            warn!(subject, error = %e, "aggregate stream: logout watermark unavailable");
-            Err(Status::unavailable("authorization service unavailable"))
-        }
-    }
+
+    Ok(true)
 }
 
 async fn revalidate_keto(
@@ -982,12 +970,10 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let registry = Arc::clone(&self.registry);
         let keto = Arc::clone(&self.keto);
-        let watermark = Arc::clone(&self.watermark);
 
         let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
             registry,
             keto,
-            watermark,
             auth,
             aggregated_board_id,
             source_board_ids,
@@ -1029,7 +1015,6 @@ impl AggregatedBoardServiceImpl {
 pub struct SubscribeAggregatedBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
     pub keto: Arc<KetoClient>,
-    pub watermark: Arc<LogoutWatermark>,
     pub auth: AuthContext,
     pub aggregated_board_id: String,
     pub source_board_ids: Vec<Uuid>,
@@ -1045,7 +1030,6 @@ pub async fn build_subscribe_aggregated_board_stream(
     let SubscribeAggregatedBoardArgs {
         registry,
         keto,
-        watermark,
         auth,
         aggregated_board_id,
         source_board_ids,
@@ -1119,10 +1103,10 @@ pub async fn build_subscribe_aggregated_board_stream(
         let mut last_keto_recheck = Instant::now();
 
         loop {
-            match revalidate_token(&watermark, &auth).await {
+            match revalidate_token(&auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    yield Err(Status::unauthenticated("token revoked"));
+                    yield Err(Status::unauthenticated("token expired"));
                     break;
                 }
                 Err(status) => {
@@ -1210,7 +1194,6 @@ mod tests {
             pool: infra.pool.clone(),
             keto: Arc::clone(&infra.keto),
             registry,
-            watermark: Arc::clone(&infra.watermark),
             heartbeat_interval: Duration::from_millis(15_000),
             keto_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
@@ -1226,7 +1209,6 @@ mod tests {
             pool: infra.pool.clone(),
             keto: Arc::clone(&infra.keto),
             registry,
-            watermark: Arc::clone(&infra.watermark),
             heartbeat_interval: Duration::from_millis(15_000),
             keto_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
@@ -2384,7 +2366,6 @@ mod tests {
         let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
             registry,
             keto: Arc::clone(&infra.keto),
-            watermark: Arc::clone(&infra.watermark),
             auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(&owner, None),
             aggregated_board_id: Uuid::new_v4().to_string(),
             source_board_ids: vec![board_id],

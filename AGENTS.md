@@ -5,10 +5,10 @@
 
 ## Project Overview
 
-Sunbeam Kanban is a real-time collaborative board-management backend. It is a Rust service built on Axum + Tonic (Connect-RPC/gRPC), talking to PostgreSQL, NATS JetStream, Keto (permissions), Valkey (logout watermarks), OpenSearch (search), and S3 (attachments). All RPCs are defined in Protobuf at `proto/sunbeam/kanban/v1/`.
+Sunbeam Kanban is a real-time collaborative board-management backend. It is a Rust service built on Axum + Tonic (Connect-RPC/gRPC), talking to PostgreSQL, NATS JetStream, Keto (permissions), OpenSearch (search), and S3 (attachments). All RPCs are defined in Protobuf at `proto/sunbeam/kanban/v1/`.
 
 - **Protocol:** Connect-RPC over h2 with SSE fallback.
-- **Auth:** Hydra issues JWTs; Keto checks per-object permissions; `x-sunbeam-object-id` header gates every mutating RPC.
+- **Auth:** Hydra issues opaque OAuth2 tokens; `sunbeam-g2v`'s `IntrospectionLayer` validates every request against Hydra's `/oauth2/introspect`, and Keto checks per-object permissions. The `x-sunbeam-object-id` header gates every mutating RPC.
 - **Realtime:** Mutations write to Postgres `event_log` → outbox dispatcher publishes to NATS JetStream `kanban.board.{id}.events` → per-pod `BoardSubscriberRegistry` fans out via `tokio::sync::broadcast`.
 
 ---
@@ -37,8 +37,7 @@ If a `sunbeam-memory` MCP server is available in your environment, use it for co
 | Migrations | `sqlx::migrate!("./migrations")` embedded at compile time, applied on boot |
 | Message queue | NATS JetStream (`async-nats` 0.47) |
 | Permissions | Ory Keto (gRPC read 4466 / write 4467) |
-| Auth middleware | `sunbeam-g2v` JwtLayer + local `keto_dispatch` middleware |
-| Cache / watermark | Valkey (Redis protocol) via `redis` crate |
+| Auth middleware | `sunbeam-g2v` `IntrospectionLayer` + local `keto_dispatch` middleware |
 | Search | OpenSearch |
 | Object storage | S3 (presigned URLs) |
 | Observability | OpenTelemetry OTLP + Prometheus metrics + `tracing` |
@@ -81,12 +80,19 @@ cargo test
 cargo run --bin keto-coverage
 ```
 
-**Recommended:** run `./test.sh` for a self-contained test stack. It detects the available container runtime, starts Postgres 16, NATS (JetStream), Valkey, Ory Keto, MinIO, and OpenSearch, runs migrations, creates the MinIO bucket, exports the standard env vars, and runs `cargo test`:
+**Recommended:** run `./test.sh` for a self-contained test stack. It detects the available container runtime, starts Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch, runs migrations, creates the MinIO bucket, exports the standard env vars, and runs `cargo test`:
 
 ```sh
 ./test.sh                    # full suite
 ./test.sh services::boards   # run a subset
 ./test.sh --coverage         # cargo llvm-cov + summary
+```
+
+**macOS with lima-docker:** if your Docker context points to a Lima VM, `test.sh` (and `cargo test` directly) will not auto-detect the socket. Export `DOCKER_HOST` first:
+
+```sh
+export DOCKER_HOST="unix://${HOME}/.lima/docker/sock/docker.sock"
+./test.sh
 ```
 
 **Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.
@@ -102,7 +108,7 @@ See `docs/development/testing.md`.
 Backend Rust tests are **inline** inside `#[cfg(test)]` modules at the bottom of each source file. There are **no separate `*_tests.rs` files**.
 
 - **Unit tests:** No external dependencies.
-- **Integration tests:** Require Postgres, Valkey, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
+- **Integration tests:** Require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
 - **No `#[ignore]` attributes:** All tests run by default.
 
 For details and examples, see `docs/development/testing.md`.
@@ -129,11 +135,11 @@ For details and examples, see `docs/development/testing.md`.
 
 - **Every RPC is gated.** The middleware stack is:
   1. `TraceLayer`
-  2. `JwtLayer`
+  2. `IntrospectionLayer`
   3. `keto_dispatch`
   4. Handler
 - **Object IDs come from headers, never the body.** Handlers must read `CheckedObjectId` from request extensions, not from the protobuf body.
-- **Logout watermark:** `SignalLogout` writes a timestamp to Valkey. `keto_dispatch` compares `iat_ms` against the watermark on every request.
+- **Token revocation:** Logout is handled by Hydra. Because every request is introspected, revoked tokens are rejected immediately.
 
 For the full security model, see `docs/development/security.md`.
 
@@ -207,9 +213,15 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `DATABASE_URL` | *required* | Postgres connection string |
 | `KANBAN_DATABASE_MAX_CONNECTIONS` | `20` | Postgres pool size |
 | `KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS` | `10` | Connection acquire timeout |
-| `JWT_SECRET` | `change-me` | JWT validation secret |
-| `JWT_TOKEN_EXPIRY_SECS` | `3600` | JWT token expiry |
 | `POD_NAME` | random UUID | Pod identity for NATS consumers and event envelopes |
+
+### Hydra / OAuth2 introspection
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HYDRA_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | Hydra OAuth2 introspection endpoint |
+| `HYDRA_CLIENT_ID` | `''` | OAuth2 client ID for introspection Basic auth |
+| `HYDRA_CLIENT_SECRET` | `''` | OAuth2 client secret for introspection Basic auth |
 
 ### Dependencies
 
@@ -217,7 +229,6 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 |----------|---------|---------|
 | `NATS_URL` | `nats://localhost:4222` | NATS server |
 | `NATS_AUTH_TOKEN` | — | NATS auth callout token |
-| `VALKEY_URL` | `redis://localhost:6379` | Valkey (logout watermarks) |
 | `KETO_READ_ADDR` | `http://localhost:4466` | Keto read endpoint |
 | `KETO_WRITE_ADDR` | `http://localhost:4467` | Keto write endpoint |
 | `KETO_GRPC_URL` | alias for `KETO_READ_ADDR` | Test alias |
@@ -259,13 +270,6 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `KANBAN_HEARTBEAT_INTERVAL_MS` | `15000` | Live stream heartbeat interval |
 | `KANBAN_KETO_RECHECK_INTERVAL_MS` | `30000` | Live stream Keto recheck interval |
 | `KANBAN_CUTOVER_SEEN_CAPACITY` | `1024` | Replay/live dedup capacity |
-
-### Watermark
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `KANBAN_LOGOUT_WATERMARK_CACHE_TTL_SECS` | `5` | Local watermark cache TTL |
-| `KANBAN_LOGOUT_WATERMARK_VALKEY_TTL_SECS` | `86400` | Valkey watermark key TTL |
 
 ### Observability
 

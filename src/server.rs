@@ -3,10 +3,10 @@
 //!
 //! This is where the whole process comes together: load configuration from the
 //! environment, set up OpenTelemetry tracing, connect to Postgres and run
-//! migrations, bootstrap the NATS JetStream board-events stream, start the
-//! Valkey-backed logout watermark, warm up the Keto readiness tuple, register
-//! Prometheus metrics, build the axum router, and finally start listening on
-//! `KANBAN_PORT` until the process receives a shutdown signal.
+//! migrations, bootstrap the NATS JetStream board-events stream, warm up the
+//! Keto readiness tuple, register Prometheus metrics, build the axum router,
+//! and finally start listening on `KANBAN_PORT` until the process receives a
+//! shutdown signal.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,21 +23,19 @@ use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use sunbeam_g2v::config::AuthConfig;
+use sunbeam_g2v::config::HydraConfig;
 use sunbeam_g2v::config::NatsConfig;
-use sunbeam_g2v::middleware::auth::jwt::{JwtLayer, JwtValidator};
+use sunbeam_g2v::middleware::auth::introspection::{IntrospectionClient, IntrospectionLayer};
 use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
 use sunbeam_g2v::mq::NatsClient;
 
 use crate::auth::keto_dispatch::{DispatchState, dispatch};
-use crate::auth::logout_watermark::{LogoutWatermark, WatermarkConfig};
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
     aggregated_board_service_server::AggregatedBoardServiceServer,
-    attachment_service_server::AttachmentServiceServer, auth_service_server::AuthServiceServer,
-    board_service_server::BoardServiceServer, card_service_server::CardServiceServer,
-    github_link_service_server::GithubLinkServiceServer,
+    attachment_service_server::AttachmentServiceServer, board_service_server::BoardServiceServer,
+    card_service_server::CardServiceServer, github_link_service_server::GithubLinkServiceServer,
     project_service_server::ProjectServiceServer,
     public_board_service_server::PublicBoardServiceServer,
     search_service_server::SearchServiceServer, templates_service_server::TemplatesServiceServer,
@@ -45,9 +43,9 @@ use crate::pb::{
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
-    auth::AuthServiceImpl, boards::BoardServiceImpl, cards::CardServiceImpl,
-    github::GitHubServiceImpl, projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl,
-    search::SearchServiceImpl, templates::TemplatesServiceImpl,
+    boards::BoardServiceImpl, cards::CardServiceImpl, github::GitHubServiceImpl,
+    projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl, search::SearchServiceImpl,
+    templates::TemplatesServiceImpl,
 };
 
 // ── JetStream stream name & config ──────────────────────────────────────────
@@ -62,8 +60,6 @@ pub struct KanbanMetrics {
     pub registry: Arc<Registry>,
     /// Counter for Keto permission checks, labeled `result` (allow, deny, or error).
     pub keto_check_total: CounterVec,
-    /// Total errors while reading the logout watermark from Valkey.
-    pub logout_watermark_errors_total: prometheus::Counter,
     /// Number of active board subscription streams.
     pub subscribe_active_streams: prometheus::Gauge,
     /// JetStream consumer lag in seconds, labeled by board.
@@ -91,12 +87,6 @@ impl KanbanMetrics {
             &["result"],
         )?;
         registry.register(Box::new(keto_check_total.clone()))?;
-
-        let logout_watermark_errors_total = prometheus::Counter::with_opts(Opts::new(
-            "kanban_logout_watermark_errors_total",
-            "Errors reading logout watermark from Valkey",
-        ))?;
-        registry.register(Box::new(logout_watermark_errors_total.clone()))?;
 
         let subscribe_active_streams = prometheus::Gauge::with_opts(Opts::new(
             "kanban_subscribe_active_streams",
@@ -141,7 +131,6 @@ impl KanbanMetrics {
         Ok(Self {
             registry,
             keto_check_total,
-            logout_watermark_errors_total,
             subscribe_active_streams,
             jet_stream_lag_seconds,
             mirror_drift_ratio,
@@ -238,13 +227,21 @@ pub struct Cli {
     )]
     database_acquire_timeout_secs: u64,
 
-    /// Secret used to validate Bearer JWTs.
-    #[arg(long, env = "JWT_SECRET", default_value = "change-me")]
-    jwt_secret: String,
+    /// Hydra token introspection endpoint URL.
+    #[arg(
+        long,
+        env = "HYDRA_INTROSPECTION_URL",
+        default_value = "http://localhost:4445/oauth2/introspect"
+    )]
+    hydra_introspection_url: String,
 
-    /// JWT token expiry in seconds.
-    #[arg(long, env = "JWT_TOKEN_EXPIRY_SECS", default_value = "3600")]
-    jwt_token_expiry_secs: u64,
+    /// Hydra OAuth2 client ID used for introspection Basic authentication.
+    #[arg(long, env = "HYDRA_CLIENT_ID", default_value = "")]
+    hydra_client_id: String,
+
+    /// Hydra OAuth2 client secret used for introspection Basic authentication.
+    #[arg(long, env = "HYDRA_CLIENT_SECRET", default_value = "")]
+    hydra_client_secret: String,
 
     /// NATS server URL.
     #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
@@ -253,10 +250,6 @@ pub struct Cli {
     /// Optional NATS authentication token (supports NATS auth callout).
     #[arg(long, env = "NATS_AUTH_TOKEN")]
     nats_auth_token: Option<String>,
-
-    /// Valkey / Redis URL for logout watermarks.
-    #[arg(long, env = "VALKEY_URL", default_value = "redis://localhost:6379")]
-    valkey_url: String,
 
     /// Keto read API endpoint.
     #[arg(long, env = "KETO_READ_ADDR", default_value = "http://localhost:4466")]
@@ -379,23 +372,6 @@ pub struct Cli {
     #[arg(long, env = "KANBAN_CUTOVER_SEEN_CAPACITY", default_value = "1024")]
     cutover_seen_capacity: usize,
 
-    // ── Logout watermark ──────────────────────────────────────────────────────
-    /// Local watermark cache TTL in seconds.
-    #[arg(
-        long,
-        env = "KANBAN_LOGOUT_WATERMARK_CACHE_TTL_SECS",
-        default_value = "5"
-    )]
-    watermark_cache_ttl_secs: u64,
-
-    /// Valkey watermark key TTL in seconds.
-    #[arg(
-        long,
-        env = "KANBAN_LOGOUT_WATERMARK_VALKEY_TTL_SECS",
-        default_value = "86400"
-    )]
-    watermark_valkey_ttl_secs: u64,
-
     // ── Attachment presigned URLs ─────────────────────────────────────────────
     /// Presigned PUT URL lifetime in seconds.
     #[arg(long, env = "KANBAN_UPLOAD_EXPIRES_SECS", default_value = "900")]
@@ -431,15 +407,15 @@ impl Cli {
         Ok(AppConfig {
             addr,
             host: self.host,
-            jwt_secret: self.jwt_secret,
-            jwt_token_expiry_secs: self.jwt_token_expiry_secs,
+            hydra_introspection_url: self.hydra_introspection_url,
+            hydra_client_id: self.hydra_client_id,
+            hydra_client_secret: self.hydra_client_secret,
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             database_acquire_timeout_secs: self.database_acquire_timeout_secs,
             nats_url: self.nats_url,
             nats_auth_token: self.nats_auth_token,
             nats_lease_duration_secs: self.nats_lease_duration_secs,
-            valkey_url: self.valkey_url,
             keto_read_addr: self.keto_read_addr,
             keto_write_addr: self.keto_write_addr,
             opensearch_url: self.opensearch_url,
@@ -463,8 +439,6 @@ impl Cli {
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             keto_recheck_interval_ms: self.keto_recheck_interval_ms,
             cutover_seen_capacity: self.cutover_seen_capacity,
-            watermark_cache_ttl_secs: self.watermark_cache_ttl_secs,
-            watermark_valkey_ttl_secs: self.watermark_valkey_ttl_secs,
             upload_expires_secs: self.upload_expires_secs,
             download_expires_secs: self.download_expires_secs,
         })
@@ -475,15 +449,15 @@ impl Cli {
 pub struct AppConfig {
     pub addr: SocketAddr,
     pub host: String,
-    pub jwt_secret: String,
-    pub jwt_token_expiry_secs: u64,
+    pub hydra_introspection_url: String,
+    pub hydra_client_id: String,
+    pub hydra_client_secret: String,
     pub database_url: String,
     pub database_max_connections: u32,
     pub database_acquire_timeout_secs: u64,
     pub nats_url: String,
     pub nats_auth_token: Option<String>,
     pub nats_lease_duration_secs: u64,
-    pub valkey_url: String,
     pub keto_read_addr: String,
     pub keto_write_addr: String,
     pub opensearch_url: String,
@@ -507,8 +481,6 @@ pub struct AppConfig {
     pub heartbeat_interval_ms: u64,
     pub keto_recheck_interval_ms: u64,
     pub cutover_seen_capacity: usize,
-    pub watermark_cache_ttl_secs: u64,
-    pub watermark_valkey_ttl_secs: u64,
     pub upload_expires_secs: u64,
     pub download_expires_secs: u64,
 }
@@ -618,21 +590,7 @@ pub async fn run_with_config(
 
     info!("BoardSubscriberRegistry constructed");
 
-    // ── 5. Valkey / logout watermark ────────────────────────────────────────
-    let watermark = Arc::new(
-        LogoutWatermark::new_with_config(
-            &config.valkey_url,
-            WatermarkConfig {
-                cache_ttl: Duration::from_secs(config.watermark_cache_ttl_secs),
-                valkey_ttl_secs: config.watermark_valkey_ttl_secs,
-            },
-        )
-        .context("failed to construct LogoutWatermark")?,
-    );
-
-    info!("Valkey client initialised");
-
-    // ── 6. Keto client + synthetic readiness tuple ──────────────────────────
+    // ── 5. Keto client + synthetic readiness tuple ──────────────────────────
     let keto = Arc::new(KetoClient::new(KetoConfig {
         grpc_endpoint: config.keto_read_addr,
         write_grpc_endpoint: config.keto_write_addr,
@@ -674,10 +632,7 @@ pub async fn run_with_config(
     );
 
     // ── Build tonic gRPC router ─────────────────────────────────────────────
-    let grpc_axum = TonicRoutes::new(AuthServiceServer::new(AuthServiceImpl {
-        watermark: Arc::clone(&watermark),
-    }))
-    .add_service(AttachmentServiceServer::new(AttachmentServiceImpl {
+    let grpc_axum = TonicRoutes::new(AttachmentServiceServer::new(AttachmentServiceImpl {
         pool: pg_pool.clone(),
         s3: Arc::clone(&s3_client),
         upload_expires_secs: config.upload_expires_secs,
@@ -687,7 +642,6 @@ pub async fn run_with_config(
         pool: pg_pool.clone(),
         keto: Arc::clone(&keto),
         registry: Arc::clone(&board_registry),
-        watermark: Arc::clone(&watermark),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
         keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
         cutover_seen_capacity: config.cutover_seen_capacity,
@@ -702,7 +656,6 @@ pub async fn run_with_config(
             pool: pg_pool.clone(),
             keto: Arc::clone(&keto),
             registry: Arc::clone(&board_registry),
-            watermark: Arc::clone(&watermark),
             heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
             keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
             cutover_seen_capacity: config.cutover_seen_capacity,
@@ -712,7 +665,6 @@ pub async fn run_with_config(
         pool: pg_pool.clone(),
         keto: Arc::clone(&keto),
         registry: Arc::clone(&board_registry),
-        watermark: Arc::clone(&watermark),
     }))
     .add_service(SearchServiceServer::new(SearchServiceImpl {
         pool: pg_pool.clone(),
@@ -726,7 +678,7 @@ pub async fn run_with_config(
     }))
     .into_axum_router();
 
-    // Public, unauthenticated RPCs (no JWT / Keto middleware).
+    // Public, unauthenticated RPCs (no introspection / Keto middleware).
     // We route each method directly to the tonic service so the resulting
     // axum Router has no fallback; this lets us merge it with the main gRPC
     // router (which does have a fallback) without a runtime panic.
@@ -749,19 +701,19 @@ pub async fn run_with_config(
     //   Layer order in axum is last-applied = outermost:
     //     .layer(A).layer(B).layer(C)  →  A wraps B wraps C wraps handler
     //
-    //   We want: tracing → prometheus → JwtLayer → keto_dispatch → routing
-    //   So apply in reverse: keto_dispatch first, then JwtLayer, then
+    //   We want: tracing → prometheus → IntrospectionLayer → keto_dispatch → routing
+    //   So apply in reverse: keto_dispatch first, then IntrospectionLayer, then
     //   prometheus placeholder, then tracing.
 
     let dispatch_state = Arc::new(DispatchState {
         keto: Arc::clone(&keto),
-        watermark: Arc::clone(&watermark),
     });
 
-    let jwt_validator = JwtValidator::new(AuthConfig {
-        jwt_secret: config.jwt_secret.clone(),
-        token_expiry: config.jwt_token_expiry_secs,
-    });
+    let introspection = IntrospectionLayer::new(IntrospectionClient::new(HydraConfig {
+        introspection_url: config.hydra_introspection_url,
+        client_id: config.hydra_client_id,
+        client_secret: config.hydra_client_secret,
+    }));
 
     let app_state = AppState {
         keto: Arc::clone(&keto),
@@ -781,8 +733,8 @@ pub async fn run_with_config(
     let grpc_auth = grpc_axum
         // keto_dispatch (innermost applied = innermost executed)
         .layer(middleware::from_fn_with_state(dispatch_state, dispatch))
-        // JwtLayer — validates Bearer, inserts Extension<AuthContext>
-        .layer(JwtLayer::new(jwt_validator))
+        // IntrospectionLayer — validates Bearer with Hydra, inserts Extension<AuthContext>
+        .layer(introspection)
         // Tracing / OTel propagation (outermost)
         .layer(TraceLayer::new_for_http());
 
@@ -912,6 +864,9 @@ mod tests {
     async fn metrics_handler_renders_prometheus_text() {
         let infra = containers::setup().await;
         let metrics = Arc::new(KanbanMetrics::new().unwrap());
+        // Increment the counter so the metric family is emitted by the text
+        // encoder regardless of test ordering.
+        metrics.keto_check_total.with_label_values(&["allow"]).inc();
         let state = AppState {
             keto: Arc::clone(&infra.keto),
             metrics,
@@ -920,8 +875,8 @@ mod tests {
         let (status, body) = metrics_handler(State(state)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body.contains("kanban_logout_watermark_errors_total"),
-            "metrics body should contain kanban_logout_watermark_errors_total: {body}"
+            body.contains("kanban_keto_check_total"),
+            "metrics body should contain kanban_keto_check_total: {body}"
         );
     }
 
@@ -956,10 +911,8 @@ mod tests {
 
         let prefixes: &[&str] = &[
             "DATABASE_URL",
-            "JWT_SECRET",
-            "JWT_TOKEN_EXPIRY_SECS",
+            "HYDRA_",
             "NATS_",
-            "VALKEY_URL",
             "KETO_",
             "OPENSEARCH_URL",
             "KANBAN_",
@@ -992,15 +945,15 @@ mod tests {
         let cfg = parse_config_args(&[
             "--port=1234",
             "--host=127.0.0.1",
-            "--jwt-secret=secret",
+            "--hydra-introspection-url=http://hydra:4445/oauth2/introspect",
+            "--hydra-client-id=kanban-client",
+            "--hydra-client-secret=kanban-secret",
             "--database-url=postgres://db",
             "--database-max-connections=50",
             "--database-acquire-timeout-secs=5",
-            "--jwt-token-expiry-secs=7200",
             "--nats-url=nats://nats",
             "--nats-auth-token=callout-token",
             "--nats-lease-duration-secs=60",
-            "--valkey-url=redis://valkey",
             "--keto-read-addr=http://keto-read",
             "--keto-write-addr=http://keto-write",
             "--opensearch-url=http://opensearch",
@@ -1024,8 +977,6 @@ mod tests {
             "--heartbeat-interval-ms=7000",
             "--keto-recheck-interval-ms=15000",
             "--cutover-seen-capacity=2048",
-            "--watermark-cache-ttl-secs=10",
-            "--watermark-valkey-ttl-secs=43200",
             "--upload-expires-secs=600",
             "--download-expires-secs=120",
         ])
@@ -1033,15 +984,18 @@ mod tests {
 
         assert_eq!(cfg.addr, "127.0.0.1:1234".parse().unwrap());
         assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.jwt_secret, "secret");
+        assert_eq!(
+            cfg.hydra_introspection_url,
+            "http://hydra:4445/oauth2/introspect"
+        );
+        assert_eq!(cfg.hydra_client_id, "kanban-client");
+        assert_eq!(cfg.hydra_client_secret, "kanban-secret");
         assert_eq!(cfg.database_url, "postgres://db");
         assert_eq!(cfg.database_max_connections, 50);
         assert_eq!(cfg.database_acquire_timeout_secs, 5);
-        assert_eq!(cfg.jwt_token_expiry_secs, 7200);
         assert_eq!(cfg.nats_url, "nats://nats");
         assert_eq!(cfg.nats_auth_token, Some("callout-token".into()));
         assert_eq!(cfg.nats_lease_duration_secs, 60);
-        assert_eq!(cfg.valkey_url, "redis://valkey");
         assert_eq!(cfg.keto_read_addr, "http://keto-read");
         assert_eq!(cfg.keto_write_addr, "http://keto-write");
         assert_eq!(cfg.opensearch_url, "http://opensearch");
@@ -1065,8 +1019,6 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval_ms, 7000);
         assert_eq!(cfg.keto_recheck_interval_ms, 15000);
         assert_eq!(cfg.cutover_seen_capacity, 2048);
-        assert_eq!(cfg.watermark_cache_ttl_secs, 10);
-        assert_eq!(cfg.watermark_valkey_ttl_secs, 43200);
         assert_eq!(cfg.upload_expires_secs, 600);
         assert_eq!(cfg.download_expires_secs, 120);
     }
@@ -1078,14 +1030,17 @@ mod tests {
 
         assert_eq!(cfg.addr.port(), 8080);
         assert_eq!(cfg.host, "0.0.0.0");
-        assert_eq!(cfg.jwt_secret, "change-me");
-        assert_eq!(cfg.jwt_token_expiry_secs, 3600);
+        assert_eq!(
+            cfg.hydra_introspection_url,
+            "http://localhost:4445/oauth2/introspect"
+        );
+        assert_eq!(cfg.hydra_client_id, "");
+        assert_eq!(cfg.hydra_client_secret, "");
         assert_eq!(cfg.database_max_connections, 20);
         assert_eq!(cfg.database_acquire_timeout_secs, 10);
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
         assert!(cfg.nats_auth_token.is_none());
         assert_eq!(cfg.nats_lease_duration_secs, 30);
-        assert_eq!(cfg.valkey_url, "redis://localhost:6379");
         assert_eq!(cfg.keto_read_addr, "http://localhost:4466");
         assert_eq!(cfg.keto_write_addr, "http://localhost:4467");
         assert_eq!(cfg.opensearch_url, "http://localhost:9200");
@@ -1110,8 +1065,6 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval_ms, 15_000);
         assert_eq!(cfg.keto_recheck_interval_ms, 30_000);
         assert_eq!(cfg.cutover_seen_capacity, 1024);
-        assert_eq!(cfg.watermark_cache_ttl_secs, 5);
-        assert_eq!(cfg.watermark_valkey_ttl_secs, 86_400);
         assert_eq!(cfg.upload_expires_secs, 900);
         assert_eq!(cfg.download_expires_secs, 300);
     }
@@ -1142,15 +1095,15 @@ mod tests {
         let config = AppConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             host: "127.0.0.1".into(),
-            jwt_secret: "test-secret".into(),
-            jwt_token_expiry_secs: 3600,
+            hydra_introspection_url: "http://localhost:4445/oauth2/introspect".into(),
+            hydra_client_id: String::new(),
+            hydra_client_secret: String::new(),
             database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL"),
             database_max_connections: 20,
             database_acquire_timeout_secs: 10,
             nats_url: std::env::var("NATS_URL").expect("NATS_URL"),
             nats_auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             nats_lease_duration_secs: 30,
-            valkey_url: std::env::var("VALKEY_URL").expect("VALKEY_URL"),
             keto_read_addr: std::env::var("KETO_READ_ADDR").expect("KETO_READ_ADDR"),
             keto_write_addr: std::env::var("KETO_WRITE_ADDR").expect("KETO_WRITE_ADDR"),
             opensearch_url: std::env::var("OPENSEARCH_URL")
@@ -1177,8 +1130,6 @@ mod tests {
             heartbeat_interval_ms: 15_000,
             keto_recheck_interval_ms: 30_000,
             cutover_seen_capacity: 1024,
-            watermark_cache_ttl_secs: 5,
-            watermark_valkey_ttl_secs: 86_400,
             upload_expires_secs: 900,
             download_expires_secs: 300,
         };

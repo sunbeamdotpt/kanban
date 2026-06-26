@@ -6,6 +6,14 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc4] - 2026-06-26
+
+### Changed
+
+- Replaced local JWT validation with Hydra opaque-token introspection using `sunbeam-g2v` 0.3.3's `IntrospectionLayer`. Every request is now introspected against Hydra's `/oauth2/introspect` endpoint.
+- Removed the `AuthService`, `WhoAmI`, and `SignalLogout` RPCs and the `auth.proto` definition. Logout revocation is now handled by Hydra.
+- Removed the Valkey-backed logout watermark subsystem, the `redis` dependency, and all related configuration and metrics.
+
 ## [1.0.0-rc3] - 2026-06-25
 
 ### Changed

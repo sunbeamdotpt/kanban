@@ -165,6 +165,5 @@ Before the Deployment is rolled out, the following must already be available:
 - PostgreSQL database and user.
 - NATS with JetStream enabled.
 - Ory Keto with the Kanban namespaces loaded (see `.integration/keto-namespaces.config.ts`).
-- Valkey.
 - OpenSearch.
 - S3-compatible object store with the attachments bucket created.

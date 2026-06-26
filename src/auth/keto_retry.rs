@@ -108,7 +108,10 @@ impl KetoRetryExt for KetoClient {
 
             let allowed = retry(move || {
                 let subject_id = subject_id.clone();
-                async move { self.check_permission(namespace, object, relation, &subject_id).await }
+                async move {
+                    self.check_permission(namespace, object, relation, &subject_id)
+                        .await
+                }
             })
             .await?;
 
