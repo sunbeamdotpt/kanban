@@ -27,7 +27,13 @@
 //!
 use std::{fmt, sync::Arc};
 
-use axum::{Extension, extract::Request, http::StatusCode, middleware::Next, response::Response};
+use axum::{
+    Extension,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::Response,
+};
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
@@ -573,7 +579,7 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 /// router.layer(middleware::from_fn_with_state(state, dispatch))
 /// ```
 pub async fn dispatch(
-    Extension(state): Extension<Arc<DispatchState>>,
+    State(state): State<Arc<DispatchState>>,
     Extension(auth): Extension<AuthContext>,
     req: Request,
     next: Next,

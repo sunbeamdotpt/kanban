@@ -6,6 +6,12 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc5] - 2026-06-26
+
+### Fixed
+
+- Fixed Keto dispatch middleware state extraction: changed `Extension(state)` to `State(state)` so `from_fn_with_state` correctly passes `Arc<DispatchState>`. This resolves the `500 Internal Server Error` caused by a missing request extension on every authenticated RPC.
+
 ## [1.0.0-rc4] - 2026-06-26
 
 ### Changed
