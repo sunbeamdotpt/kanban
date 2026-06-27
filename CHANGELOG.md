@@ -6,6 +6,22 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc6] - 2026-06-27
+
+### Added
+
+- Added a startup `system_migrations` framework that runs after SQLx schema migrations and records progress in a `system_migrations` ledger table.
+- Added `Id::from_uuid_with_timestamp` for deterministic UUID-to-ULID encoding, preserving the original creation timestamp in the ULID.
+- Added the `uuid_to_ulids` system migration, which rewrites legacy UUID identifiers to ULIDs across Postgres, Keto, and OpenSearch in a single deterministic pass. The migration persists its UUID→ULID mapping to a backup table so it can resume safely if interrupted after the Postgres rewrite.
+
+### Changed
+
+- Server boot now runs system migrations immediately after SQLx migrations and before NATS JetStream bootstrap.
+
+### Fixed
+
+- OpenSearch migration now processes the first page returned by the initial scroll request and skips gracefully when the target index does not exist.
+
 ## [1.0.0-rc5] - 2026-06-26
 
 ### Fixed

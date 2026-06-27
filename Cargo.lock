@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "kanban"
-version = "1.0.0-rc5"
+version = "1.0.0-rc6"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2197,8 +2197,8 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry 0.28.0",
  "tracing-subscriber",
+ "ulid",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -4032,7 +4032,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
- "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -4189,7 +4188,6 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
  "whoami 1.6.1",
 ]
 
@@ -4254,7 +4252,6 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
- "uuid",
  "whoami 1.6.1",
 ]
 
@@ -4316,7 +4313,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -5155,6 +5151,17 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "serde",
+ "web-time",
+]
 
 [[package]]
 name = "uncased"
