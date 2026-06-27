@@ -30,6 +30,7 @@ use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
 use sunbeam_g2v::mq::NatsClient;
 
 use crate::auth::keto_dispatch::{DispatchState, dispatch};
+use crate::id::Id;
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
 use crate::pb::{
@@ -526,6 +527,25 @@ pub async fn run_with_config(
 
     info!("Postgres connected and migrations applied");
 
+    // ── 3b. System migrations (data fixes across Postgres, Keto, OpenSearch) ─
+    let opensearch_client_for_migrations = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+        url: config.opensearch_url.clone(),
+    }));
+    let keto_for_migrations = Arc::new(KetoClient::new(KetoConfig {
+        grpc_endpoint: config.keto_read_addr.clone(),
+        write_grpc_endpoint: config.keto_write_addr.clone(),
+    }));
+    crate::system_migrations::MigrationRunner::new(crate::system_migrations::all_migrations())
+        .run_all(&crate::system_migrations::MigrationContext::new(
+            pg_pool.clone(),
+            keto_for_migrations,
+            opensearch_client_for_migrations,
+            config.opensearch_index_name.clone(),
+        ))
+        .await
+        .context("system migrations failed")?;
+    info!("system migrations applied");
+
     // ── 4. NATS + JetStream bootstrap (fatal on failure) ───────────────────
     let nats = Arc::new(
         NatsClient::connect(&NatsConfig {
@@ -557,9 +577,7 @@ pub async fn run_with_config(
     );
 
     // Stable pod identity used by the outbox dispatcher and NATS consumers.
-    let pod_id = config
-        .pod_name
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let pod_id = config.pod_name.unwrap_or_else(|| Id::new().to_string());
 
     // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
     // Drains undispatched event_log rows to NATS JetStream at 250ms poll
@@ -1090,7 +1108,41 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_config_starts_and_serves_health() {
+        use std::time::Duration;
+
+        use sqlx::postgres::PgPoolOptions;
+
+        use crate::id::Id;
+
         let _infra = containers::setup().await;
+
+        // `run_with_config` runs system migrations which drop and recreate
+        // foreign keys, so point it at an isolated database instead of the
+        // shared test database.
+        let shared_pool = crate::test_support::setup_pool().await;
+        let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let db_name = format!(
+            "kanban_server_test_{}",
+            Id::new().to_string().to_lowercase()
+        );
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&shared_pool)
+            .await
+            .expect("failed to create isolated server test database");
+
+        let mut isolated_url = url::Url::parse(&base_url).expect("invalid DATABASE_URL");
+        isolated_url.set_path(&format!("/{db_name}"));
+        let isolated_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect(isolated_url.as_str())
+            .await
+            .expect("failed to connect to isolated server test database");
+
+        sqlx::migrate!("./migrations")
+            .run(&isolated_pool)
+            .await
+            .expect("failed to run schema migrations on isolated database");
 
         let config = AppConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1098,7 +1150,7 @@ mod tests {
             hydra_introspection_url: "http://localhost:4445/oauth2/introspect".into(),
             hydra_client_id: String::new(),
             hydra_client_secret: String::new(),
-            database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL"),
+            database_url: isolated_url.to_string(),
             database_max_connections: 20,
             database_acquire_timeout_secs: 10,
             nats_url: std::env::var("NATS_URL").expect("NATS_URL"),

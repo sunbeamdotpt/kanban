@@ -129,6 +129,35 @@ impl OpenSearchClient {
         }
     }
 
+    /// Expose the HTTP client for advanced callers (e.g., migrations).
+    pub fn http(&self) -> &Client {
+        &self.http
+    }
+
+    /// Expose the configured base URL for advanced callers.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Delete a single document by `_id`.
+    pub async fn delete_doc(&self, index: &str, id: &str) -> Result<()> {
+        let url = format!("{}/{}/_doc/{}", self.base_url, index, id);
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("opensearch DELETE doc {url} failed"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("opensearch delete doc {status}: {text}");
+        }
+
+        Ok(())
+    }
+
     /// Run `POST /<index>/_search` with the given query body.
     ///
     /// Returns `Ok(None)` when the target index does not exist, so callers

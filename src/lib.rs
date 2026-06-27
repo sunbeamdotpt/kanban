@@ -13,12 +13,14 @@
 
 pub mod auth;
 pub mod config;
+pub mod id;
 pub mod integrations;
 pub mod keto_proto;
 pub mod pb;
 pub mod realtime;
 pub mod server;
 pub mod services;
+pub mod system_migrations;
 
 #[cfg(test)]
 pub(crate) mod test_support;
