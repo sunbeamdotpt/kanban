@@ -12,13 +12,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::id::Id;
 use async_stream::stream;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -87,7 +87,7 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
 
 fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
-    let id: Uuid = row.get("id");
+    let id: Id = row.get("id");
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let icon: Option<String> = row.get("icon");
@@ -110,14 +110,15 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
 
 async fn insert_event_log(
     tx: &mut Transaction<'_, Postgres>,
-    aggregated_board_id: Uuid,
+    aggregated_board_id: Id,
     event_type: &str,
     payload: serde_json::Value,
 ) -> Result<(), Status> {
     sqlx::query(
         "INSERT INTO event_log (id, aggregated_board_id, event_type, payload, created_at)
-         VALUES (gen_random_uuid(), $1, $2, $3::jsonb, now())",
+         VALUES ($1, $2, $3, $4::jsonb, now())",
     )
+    .bind(Id::new())
     .bind(aggregated_board_id)
     .bind(event_type)
     .bind(payload)
@@ -134,8 +135,8 @@ async fn insert_event_log(
 
 async fn fetch_ordered_source_ids(
     tx: &mut Transaction<'_, Postgres>,
-    aggregated_board_id: Uuid,
-) -> Result<Vec<Uuid>, Status> {
+    aggregated_board_id: Id,
+) -> Result<Vec<Id>, Status> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources \
          WHERE aggregated_board_id = $1 \
@@ -146,13 +147,13 @@ async fn fetch_ordered_source_ids(
     .await
     .map_err(|e| internal("failed to fetch ordered source board ids", e))?;
 
-    Ok(rows.iter().map(|r| r.get::<Uuid, _>("board_id")).collect())
+    Ok(rows.iter().map(|r| r.get::<Id, _>("board_id")).collect())
 }
 
 async fn apply_source_order(
     tx: &mut Transaction<'_, Postgres>,
-    aggregated_board_id: Uuid,
-    ordered_ids: &[Uuid],
+    aggregated_board_id: Id,
+    ordered_ids: &[Id],
 ) -> Result<(), Status> {
     for (i, board_id) in ordered_ids.iter().enumerate() {
         sqlx::query(
@@ -171,7 +172,7 @@ async fn apply_source_order(
 
 async fn fetch_source_boards(
     pool: &PgPool,
-    aggregated_board_id: Uuid,
+    aggregated_board_id: Id,
 ) -> Result<Vec<SourceBoardRef>, Status> {
     let rows = sqlx::query(
         r#"
@@ -190,8 +191,8 @@ async fn fetch_source_boards(
     Ok(rows
         .iter()
         .map(|r| {
-            let id: Uuid = r.get("id");
-            let project_id: Uuid = r.get("project_id");
+            let id: Id = r.get("id");
+            let project_id: Id = r.get("project_id");
             let name: String = r.get("name");
             let icon: Option<String> = r.get("icon");
             let position: i32 = r.get("position");
@@ -206,10 +207,7 @@ async fn fetch_source_boards(
         .collect())
 }
 
-async fn fetch_source_board_ids(
-    pool: &PgPool,
-    aggregated_board_id: Uuid,
-) -> Result<Vec<Uuid>, Status> {
+async fn fetch_source_board_ids(pool: &PgPool, aggregated_board_id: Id) -> Result<Vec<Id>, Status> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources
          WHERE aggregated_board_id = $1
@@ -220,14 +218,14 @@ async fn fetch_source_board_ids(
     .await
     .map_err(|e| internal("failed to fetch source board ids", e))?;
 
-    Ok(rows.iter().map(|r| r.get::<Uuid, _>("board_id")).collect())
+    Ok(rows.iter().map(|r| r.get::<Id, _>("board_id")).collect())
 }
 
 /// Keep only the board ids that are public or internal.
 async fn fetch_public_internal_board_ids(
     pool: &PgPool,
-    board_ids: &[Uuid],
-) -> Result<std::collections::HashSet<Uuid>, Status> {
+    board_ids: &[Id],
+) -> Result<std::collections::HashSet<Id>, Status> {
     if board_ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
@@ -240,21 +238,21 @@ async fn fetch_public_internal_board_ids(
     .await
     .map_err(|e| internal("failed to fetch source board visibilities", e))?;
 
-    Ok(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect())
+    Ok(rows.iter().map(|r| r.get::<Id, _>("id")).collect())
 }
 
 // ── Card helpers ──────────────────────────────────────────────────────────────
 
 async fn fetch_cards_for_boards(
     pool: &PgPool,
-    board_ids: &[Uuid],
-    visible_board_ids: &[Uuid],
+    board_ids: &[Id],
+    visible_board_ids: &[Id],
 ) -> Result<Vec<Card>, Status> {
     if board_ids.is_empty() {
         return Ok(vec![]);
     }
 
-    let visible_set: std::collections::HashSet<Uuid> = visible_board_ids.iter().copied().collect();
+    let visible_set: std::collections::HashSet<Id> = visible_board_ids.iter().copied().collect();
 
     let rows = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
@@ -271,8 +269,8 @@ async fn fetch_cards_for_boards(
 
     let mut cards = Vec::with_capacity(rows.len());
     for row in &rows {
-        let card_id: Uuid = row.get("id");
-        let board_id: Uuid = row.get("board_id");
+        let card_id: Id = row.get("id");
+        let board_id: Id = row.get("board_id");
         if !visible_set.contains(&board_id) {
             continue;
         }
@@ -391,7 +389,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             return Err(Status::invalid_argument("name is required"));
         }
 
-        let aggregated_board_id = Uuid::new_v4();
+        let aggregated_board_id = Id::new();
         let visibility = proto_to_db(req.visibility);
 
         let mut tx = self
@@ -417,7 +415,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         // Insert initial source boards if any.
         for (position, board_id_str) in req.source_board_ids.iter().enumerate() {
-            let board_id = Uuid::parse_str(board_id_str)
+            let board_id = board_id_str
+                .parse::<Id>()
                 .map_err(|_| Status::invalid_argument("invalid source_board_id"))?;
             sqlx::query(
                 "INSERT INTO aggregated_board_sources (aggregated_board_id, board_id, position) \
@@ -494,7 +493,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     ) -> Result<Response<AggregatedBoardStream>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let aggregated_board_id = Uuid::parse_str(&req.aggregated_board_id)
+        let aggregated_board_id = req
+            .aggregated_board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let row = sqlx::query(
@@ -528,9 +529,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let metadata = aggregated_board_from_row(&row);
         let source_boards = fetch_source_boards(&self.pool, aggregated_board_id).await?;
-        let board_ids: Vec<Uuid> = source_boards
+        let board_ids: Vec<Id> = source_boards
             .iter()
-            .filter_map(|s| Uuid::parse_str(&s.board_id).ok())
+            .filter_map(|s| s.board_id.parse::<Id>().ok())
             .collect();
 
         // Source boards are visible if public/internal or if private and the
@@ -550,7 +551,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let public_internal_ids = fetch_public_internal_board_ids(&self.pool, &board_ids).await?;
 
-        let allowed_source_ids: std::collections::HashSet<Uuid> = board_ids
+        let allowed_source_ids: std::collections::HashSet<Id> = board_ids
             .iter()
             .copied()
             .filter(|id| {
@@ -558,9 +559,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             })
             .collect();
 
-        let visible_board_uuids: Vec<Uuid> = allowed_source_ids.iter().copied().collect();
+        let visible_board_ids: Vec<Id> = allowed_source_ids.iter().copied().collect();
 
-        let cards = fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_uuids).await?;
+        let cards = fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_ids).await?;
 
         let mut chunks: Vec<AggregatedBoardChunk> = Vec::new();
         chunks.push(AggregatedBoardChunk {
@@ -569,7 +570,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let filtered_source_boards: Vec<_> = source_boards
             .into_iter()
             .filter(|sb| {
-                Uuid::parse_str(&sb.board_id)
+                sb.board_id
+                    .parse::<Id>()
                     .map(|id| allowed_source_ids.contains(&id))
                     .unwrap_or(false)
             })
@@ -617,7 +619,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     ) -> Result<Response<AggregatedBoard>, Status> {
         let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let aggregated_board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let req = request.into_inner();
@@ -698,7 +701,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<DeleteAggregatedBoardRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let aggregated_board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let result = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1")
@@ -752,7 +756,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let aggregated_boards: Vec<AggregatedBoard> = rows
             .iter()
             .filter(|row| {
-                let id: Uuid = row.get("id");
+                let id: Id = row.get("id");
                 let visibility: String = row.get("visibility");
                 is_public_or_internal(&visibility) || allowed_private_ids.contains(&id.to_string())
             })
@@ -770,11 +774,14 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<AddSourceBoardRequest>,
     ) -> Result<Response<AggregatedBoard>, Status> {
         let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let aggregated_board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let req = request.into_inner();
-        let board_id = Uuid::parse_str(&req.board_id)
+        let board_id = req
+            .board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
@@ -852,11 +859,14 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<RemoveSourceBoardRequest>,
     ) -> Result<Response<AggregatedBoard>, Status> {
         let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let aggregated_board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let req = request.into_inner();
-        let board_id = Uuid::parse_str(&req.board_id)
+        let board_id = req
+            .board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
@@ -903,11 +913,14 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<MoveSourceBoardRequest>,
     ) -> Result<Response<AggregatedBoard>, Status> {
         let object_id = checked_object_id(&request)?;
-        let aggregated_board_id = Uuid::parse_str(&object_id)
+        let aggregated_board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
         let req = request.into_inner();
-        let board_id = Uuid::parse_str(&req.board_id)
+        let board_id = req
+            .board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
@@ -951,7 +964,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let visibility: String =
             sqlx::query_scalar("SELECT visibility FROM aggregated_boards WHERE id = $1")
                 .bind(
-                    Uuid::parse_str(&aggregated_board_id)
+                    aggregated_board_id
+                        .parse::<Id>()
                         .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
                 )
                 .fetch_optional(&self.pool)
@@ -963,7 +977,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let source_board_ids = fetch_source_board_ids(
             &self.pool,
-            Uuid::parse_str(&aggregated_board_id)
+            aggregated_board_id
+                .parse::<Id>()
                 .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
         )
         .await?;
@@ -993,7 +1008,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 impl AggregatedBoardServiceImpl {
     async fn get_aggregate_metadata(
         &self,
-        aggregated_board_id: Uuid,
+        aggregated_board_id: Id,
     ) -> Result<Response<AggregatedBoard>, Status> {
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
@@ -1017,7 +1032,7 @@ pub struct SubscribeAggregatedBoardArgs {
     pub keto: Arc<KetoClient>,
     pub auth: AuthContext,
     pub aggregated_board_id: String,
-    pub source_board_ids: Vec<Uuid>,
+    pub source_board_ids: Vec<Id>,
     pub is_private: bool,
     pub heartbeat_interval: Duration,
     pub keto_recheck_interval: Duration,
@@ -1222,9 +1237,9 @@ mod tests {
         }
     }
 
-    async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let pid = Uuid::new_v4();
-        let slug = format!("tp-{}", &pid.to_string()[..8]);
+    async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Id {
+        let pid = Id::new();
+        let slug = format!("tp-{}", &pid.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
         )
@@ -1238,14 +1253,14 @@ mod tests {
         pid
     }
 
-    async fn cleanup_project(pool: &sqlx::PgPool, project_id: Uuid) {
+    async fn cleanup_project(pool: &sqlx::PgPool, project_id: Id) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
             .execute(pool)
             .await;
     }
 
-    async fn cleanup_aggregated_board(pool: &sqlx::PgPool, aggregated_board_id: Uuid) {
+    async fn cleanup_aggregated_board(pool: &sqlx::PgPool, aggregated_board_id: Id) {
         let _ = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1")
             .bind(aggregated_board_id)
             .execute(pool)
@@ -1255,10 +1270,10 @@ mod tests {
     /// Create a source board and add a default column so tests can create cards right away.
     async fn create_source_board(
         svc: &BoardServiceImpl,
-        project_id: Uuid,
+        project_id: Id,
         name: &str,
         subject: &str,
-    ) -> Uuid {
+    ) -> Id {
         create_source_board_with_visibility(
             svc,
             project_id,
@@ -1271,11 +1286,11 @@ mod tests {
 
     async fn create_source_board_with_visibility(
         svc: &BoardServiceImpl,
-        project_id: Uuid,
+        project_id: Id,
         name: &str,
         subject: &str,
         visibility: i32,
-    ) -> Uuid {
+    ) -> Id {
         let board = svc
             .create_board(authed_request_with_object(
                 CreateBoardRequest {
@@ -1292,7 +1307,7 @@ mod tests {
             .await
             .expect("create_board failed")
             .into_inner();
-        let board_id = Uuid::parse_str(&board.id).expect("board id is uuid");
+        let board_id = board.id.parse::<Id>().expect("board id is ulid");
 
         // BoardService only writes the parent tuple; test Keto does not evaluate
         // derived permissions, so grant the creator an explicit view tuple.
@@ -1306,7 +1321,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'todo', 0)",
         )
-        .bind(Uuid::new_v4())
+        .bind(Id::new())
         .bind(board_id)
         .execute(&svc.pool)
         .await
@@ -1320,7 +1335,7 @@ mod tests {
     /// The Keto instance used in tests does not evaluate derived permissions,
     /// so tests that read a board must grant `view` directly instead of relying
     /// on the project parent.
-    async fn grant_board_view(keto: &KetoClient, board_id: Uuid, subject: &str) {
+    async fn grant_board_view(keto: &KetoClient, board_id: Id, subject: &str) {
         keto.grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
             .await
             .expect("grant board view failed");
@@ -1345,7 +1360,7 @@ mod tests {
         let agg_svc = make_service(&infra).await;
         let board_svc = make_board_service(&infra).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
 
         let board_a = create_source_board(&board_svc, project_id, "Source A", &subject).await;
@@ -1405,7 +1420,7 @@ mod tests {
         assert!(source_ids.contains(&board_a.to_string()));
         assert!(source_ids.contains(&board_b.to_string()));
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -1415,7 +1430,7 @@ mod tests {
         let agg_svc = make_service(&infra).await;
         let board_svc = make_board_service(&infra).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let board_id = create_source_board(&board_svc, project_id, "Source", &subject).await;
 
@@ -1474,7 +1489,7 @@ mod tests {
         let agg_svc = make_service(&infra).await;
         let board_svc = make_board_service(&infra).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let board_a = create_source_board(&board_svc, project_id, "A", &subject).await;
         let board_b = create_source_board(&board_svc, project_id, "B", &subject).await;
@@ -1571,7 +1586,7 @@ mod tests {
 
         assert_eq!(source_ids, vec![board_c.to_string(), board_a.to_string()]);
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -1582,7 +1597,7 @@ mod tests {
         let board_svc = make_board_service(&infra).await;
         let card_svc = make_card_service(&infra);
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let board_id = create_source_board(&board_svc, project_id, "Cards Board", &subject).await;
         grant_board_view(&infra.keto, board_id, &subject).await;
@@ -1665,7 +1680,7 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].title, "Card One");
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -1675,8 +1690,8 @@ mod tests {
         let agg_svc = make_service(&infra).await;
         let board_svc = make_board_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let other = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let other = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &owner).await;
         let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
 
@@ -1711,7 +1726,7 @@ mod tests {
             "other subject should not see the aggregate"
         );
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -1722,8 +1737,8 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
 
         let created = agg_svc
             .create_aggregated_board(authed_request(
@@ -1764,7 +1779,7 @@ mod tests {
             .expect("metadata chunk missing");
         assert_eq!(metadata.id, agg_id);
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
     }
 
     #[tokio::test]
@@ -1772,8 +1787,8 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
 
         let created = agg_svc
             .create_aggregated_board(authed_request(
@@ -1812,7 +1827,7 @@ mod tests {
             "private aggregate must return PermissionDenied"
         );
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
     }
 
     #[tokio::test]
@@ -1820,9 +1835,9 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let viewer = format!("user:test-{}", Uuid::new_v4());
-        let non_viewer = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let viewer = format!("user:test-{}", Id::new());
+        let non_viewer = format!("user:test-{}", Id::new());
 
         let public_agg = agg_svc
             .create_aggregated_board(authed_request(
@@ -1928,9 +1943,9 @@ mod tests {
             "internal aggregate must still be listed"
         );
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&public_agg.id).unwrap()).await;
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&internal_agg.id).unwrap()).await;
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&private_agg.id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, public_agg.id.parse::<Id>().unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, internal_agg.id.parse::<Id>().unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, private_agg.id.parse::<Id>().unwrap()).await;
     }
 
     #[tokio::test]
@@ -1938,7 +1953,7 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
 
         let created = agg_svc
             .create_aggregated_board(authed_request(
@@ -1999,7 +2014,7 @@ mod tests {
             "visibility must be persisted as public"
         );
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2009,8 +2024,8 @@ mod tests {
         let board_svc = make_board_service(&infra).await;
         let card_svc = make_card_service(&infra);
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &owner).await;
 
         let public_board_id = create_source_board_with_visibility(
@@ -2151,7 +2166,7 @@ mod tests {
         assert_eq!(cards.len(), 1, "only card from public source board visible");
         assert_eq!(cards[0].title, "Public Card");
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&agg_id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, agg_id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -2162,7 +2177,7 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
         let created = agg_svc
             .create_aggregated_board(authed_request(
                 CreateAggregatedBoardRequest {
@@ -2191,7 +2206,7 @@ mod tests {
             .expect("delete failed");
 
         let count: i64 = sqlx::query("SELECT COUNT(*) FROM aggregated_boards WHERE id = $1")
-            .bind(Uuid::parse_str(&created.id).unwrap())
+            .bind(created.id.parse::<Id>().unwrap())
             .fetch_one(&infra.pool)
             .await
             .unwrap()
@@ -2204,8 +2219,8 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let missing_id = Uuid::new_v4().to_string();
+        let owner = format!("user:test-{}", Id::new());
+        let missing_id = Id::new().to_string();
         let result = agg_svc
             .delete_aggregated_board(authed_request_with_object(
                 DeleteAggregatedBoardRequest {
@@ -2225,7 +2240,7 @@ mod tests {
         let infra = containers::setup().await;
         let agg_svc = make_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
         let created = agg_svc
             .create_aggregated_board(authed_request(
                 CreateAggregatedBoardRequest {
@@ -2276,7 +2291,7 @@ mod tests {
         assert_eq!(updated.name, "Renamed");
         assert_eq!(updated.description, "New desc");
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&created.id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, created.id.parse::<Id>().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2285,7 +2300,7 @@ mod tests {
         let agg_svc = make_service(&infra).await;
         let board_svc = make_board_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &owner).await;
         let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
 
@@ -2338,7 +2353,7 @@ mod tests {
             "first payload should be a cutover"
         );
 
-        cleanup_aggregated_board(&infra.pool, Uuid::parse_str(&created.id).unwrap()).await;
+        cleanup_aggregated_board(&infra.pool, created.id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
     }
 
@@ -2347,7 +2362,7 @@ mod tests {
         let infra = containers::setup().await;
         let board_svc = make_board_service(&infra).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &owner).await;
         let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
 
@@ -2367,7 +2382,7 @@ mod tests {
             registry,
             keto: Arc::clone(&infra.keto),
             auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(&owner, None),
-            aggregated_board_id: Uuid::new_v4().to_string(),
+            aggregated_board_id: Id::new().to_string(),
             source_board_ids: vec![board_id],
             is_private: false,
             heartbeat_interval: Duration::from_millis(10),

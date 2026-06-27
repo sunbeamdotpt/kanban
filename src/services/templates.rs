@@ -12,12 +12,12 @@
 
 use std::sync::Arc;
 
+use crate::id::Id;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use sqlx::{PgPool, Row};
 use tonic::{Request, Response, Status};
 use tracing::error;
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -66,8 +66,8 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
 }
 
-fn parse_uuid(s: &str, field: &str) -> Result<Uuid, Status> {
-    match Uuid::parse_str(s) {
+fn parse_id(s: &str, field: &str) -> Result<Id, Status> {
+    match s.parse::<Id>() {
         Ok(id) => Ok(id),
         Err(_) => Err(Status::invalid_argument(format!("invalid {field}"))),
     }
@@ -77,7 +77,7 @@ fn parse_uuid(s: &str, field: &str) -> Result<Uuid, Status> {
 
 async fn check_project_permission(
     keto: &KetoClient,
-    project_id: Uuid,
+    project_id: Id,
     relation: &str,
     subject: &str,
 ) -> Result<(), Status> {
@@ -162,8 +162,8 @@ fn checklist_from_json(value: &serde_json::Value) -> Vec<TemplateChecklistItem> 
 // ── Row → proto helpers ───────────────────────────────────────────────────────
 
 fn board_template_from_row(row: &sqlx::postgres::PgRow) -> BoardTemplate {
-    let id: Uuid = row.get("id");
-    let project_id: Option<Uuid> = row.get("project_id");
+    let id: Id = row.get("id");
+    let project_id: Option<Id> = row.get("project_id");
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let columns: serde_json::Value = row.get("columns");
@@ -184,8 +184,8 @@ fn board_template_from_row(row: &sqlx::postgres::PgRow) -> BoardTemplate {
 }
 
 fn card_template_from_row(row: &sqlx::postgres::PgRow) -> CardTemplate {
-    let id: Uuid = row.get("id");
-    let project_id: Option<Uuid> = row.get("project_id");
+    let id: Id = row.get("id");
+    let project_id: Option<Id> = row.get("project_id");
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let title: Option<String> = row.get("title");
@@ -248,7 +248,7 @@ impl TemplatesService for TemplatesServiceImpl {
         // If a project is requested, include its scoped templates when the user
         // has view permission on the project.
         if !req.project_id.is_empty() {
-            let project_id = parse_uuid(&req.project_id, "project_id")?;
+            let project_id = parse_id(&req.project_id, "project_id")?;
             let visible = check_project_permission(&self.keto, project_id, "view", &subject)
                 .await
                 .is_ok();
@@ -276,7 +276,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<BoardTemplate>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, description, columns, is_global, created_at, updated_at \
@@ -290,7 +290,7 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let is_global: bool = row.get("is_global");
         if !is_global {
-            let project_id: Option<Uuid> = row.get("project_id");
+            let project_id: Option<Id> = row.get("project_id");
             if let Some(pid) = project_id {
                 check_project_permission(&self.keto, pid, "view", &subject).await?;
             }
@@ -317,18 +317,20 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id = parse_uuid(&req.project_id, "project_id")?;
+        let project_id = parse_id(&req.project_id, "project_id")?;
         check_project_permission(&self.keto, project_id, "manage", &subject).await?;
 
         let columns = columns_to_json(&req.columns);
+        let template_id = Id::new();
 
         let row = sqlx::query(
             r#"
-            INSERT INTO board_templates (project_id, name, description, columns, is_global, created_by)
-            VALUES ($1, $2, $3, $4, false, $5)
+            INSERT INTO board_templates (id, project_id, name, description, columns, is_global, created_by)
+            VALUES ($1, $2, $3, $4, $5, false, $6)
             RETURNING id, project_id, name, description, columns, is_global, created_at, updated_at
             "#,
         )
+        .bind(template_id)
         .bind(project_id)
         .bind(&req.name)
         .bind(&req.description)
@@ -347,7 +349,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<BoardTemplate>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing =
             sqlx::query("SELECT project_id, is_global FROM board_templates WHERE id = $1")
@@ -364,7 +366,7 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id: Option<Uuid> = existing.get("project_id");
+        let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
             check_project_permission(&self.keto, pid, "manage", &subject).await?;
         }
@@ -413,7 +415,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<()>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing =
             sqlx::query("SELECT project_id, is_global FROM board_templates WHERE id = $1")
@@ -430,7 +432,7 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id: Option<Uuid> = existing.get("project_id");
+        let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
             check_project_permission(&self.keto, pid, "manage", &subject).await?;
         }
@@ -470,7 +472,7 @@ impl TemplatesService for TemplatesServiceImpl {
             global_rows.iter().map(card_template_from_row).collect();
 
         if !req.project_id.is_empty() {
-            let project_id = parse_uuid(&req.project_id, "project_id")?;
+            let project_id = parse_id(&req.project_id, "project_id")?;
             let visible = check_project_permission(&self.keto, project_id, "view", &subject)
                 .await
                 .is_ok();
@@ -499,7 +501,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<CardTemplate>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, description, title, default_description, \
@@ -514,7 +516,7 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let is_global: bool = row.get("is_global");
         if !is_global {
-            let project_id: Option<Uuid> = row.get("project_id");
+            let project_id: Option<Id> = row.get("project_id");
             if let Some(pid) = project_id {
                 check_project_permission(&self.keto, pid, "view", &subject).await?;
             }
@@ -540,22 +542,24 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id = parse_uuid(&req.project_id, "project_id")?;
+        let project_id = parse_id(&req.project_id, "project_id")?;
         check_project_permission(&self.keto, project_id, "manage", &subject).await?;
 
         let checklist = checklist_to_json(&req.checklist_items);
+        let template_id = Id::new();
 
         let row = sqlx::query(
             r#"
             INSERT INTO card_templates (
-                project_id, name, description, title, default_description,
+                id, project_id, name, description, title, default_description,
                 label_names, checklist_items, is_global, created_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)
             RETURNING id, project_id, name, description, title, default_description,
                       label_names, checklist_items, is_global, created_at, updated_at
             "#,
         )
+        .bind(template_id)
         .bind(project_id)
         .bind(&req.name)
         .bind(&req.description)
@@ -577,7 +581,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<CardTemplate>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing =
             sqlx::query("SELECT project_id, is_global FROM card_templates WHERE id = $1")
@@ -594,7 +598,7 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id: Option<Uuid> = existing.get("project_id");
+        let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
             check_project_permission(&self.keto, pid, "manage", &subject).await?;
         }
@@ -665,7 +669,7 @@ impl TemplatesService for TemplatesServiceImpl {
     ) -> Result<Response<()>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let template_id = parse_uuid(&req.template_id, "template_id")?;
+        let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing =
             sqlx::query("SELECT project_id, is_global FROM card_templates WHERE id = $1")
@@ -682,7 +686,7 @@ impl TemplatesService for TemplatesServiceImpl {
             ));
         }
 
-        let project_id: Option<Uuid> = existing.get("project_id");
+        let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
             check_project_permission(&self.keto, pid, "manage", &subject).await?;
         }
@@ -728,9 +732,9 @@ mod tests {
     }
 
     /// Create a minimal project and grant the test subject manage and view on it.
-    async fn create_test_project(pool: &PgPool, keto: &KetoClient, subject: &str) -> Uuid {
-        let project_id = Uuid::new_v4();
-        let slug = format!("tp-{}", &project_id.to_string()[..8]);
+    async fn create_test_project(pool: &PgPool, keto: &KetoClient, subject: &str) -> Id {
+        let project_id = Id::new();
+        let slug = format!("tp-{}", &project_id.to_string()[18..26]);
 
         sqlx::query(
             "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
@@ -753,14 +757,14 @@ mod tests {
         project_id
     }
 
-    async fn cleanup_project(pool: &PgPool, project_id: Uuid) {
+    async fn cleanup_project(pool: &PgPool, project_id: Id) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
             .execute(pool)
             .await;
     }
 
-    async fn cleanup_template(pool: &PgPool, table: &str, template_id: Uuid) {
+    async fn cleanup_template(pool: &PgPool, table: &str, template_id: Id) {
         let _ = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
             .bind(template_id)
             .execute(pool)
@@ -772,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn list_templates_includes_global_seeds() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         let list = svc
             .list_templates(authed_request(
@@ -796,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_board_template() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -848,7 +852,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "board_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -857,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn list_templates_includes_project_scoped_when_authorized() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -923,7 +927,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "board_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -932,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn update_template_applies_mask() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -982,7 +986,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "board_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -991,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn delete_template_removes_row() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -1035,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_card_template() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -1084,7 +1088,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "card_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -1093,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn list_card_templates_includes_project_scoped_when_authorized() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -1134,7 +1138,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "card_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -1143,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn update_card_template_applies_mask() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc
@@ -1191,7 +1195,7 @@ mod tests {
         cleanup_template(
             &svc.pool,
             "card_templates",
-            Uuid::parse_str(&created.id).unwrap(),
+            created.id.parse::<Id>().unwrap(),
         )
         .await;
         cleanup_project(&svc.pool, project_id).await;
@@ -1200,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn delete_card_template_removes_row() {
         let svc = make_service().await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
 
         let created = svc

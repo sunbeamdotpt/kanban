@@ -18,13 +18,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::id::Id;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use sqlx::PgPool;
 use sqlx::Row;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 
@@ -112,8 +112,8 @@ fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
 // ── Row builder ───────────────────────────────────────────────────────────────
 
 fn attachment_from_row(row: &sqlx::postgres::PgRow) -> Attachment {
-    let id: Uuid = row.get("id");
-    let card_id: Uuid = row.get("card_id");
+    let id: Id = row.get("id");
+    let card_id: Id = row.get("card_id");
     let s3_key: String = row.get("s3_key");
     let filename: String = row.get("filename");
     let mimetype: String = row.get("mimetype");
@@ -145,7 +145,8 @@ impl AttachmentService for AttachmentServiceImpl {
     ) -> Result<Response<RequestPresignedUploadResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let card_id_str = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&card_id_str)
+        let card_id = card_id_str
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id in x-sunbeam-object-id"))?;
 
         let req = request.into_inner();
@@ -157,7 +158,7 @@ impl AttachmentService for AttachmentServiceImpl {
             return Err(Status::invalid_argument("mime_type is required"));
         }
 
-        let attachment_id = Uuid::new_v4();
+        let attachment_id = Id::new();
         let safe_filename = sanitize_filename(&req.filename);
         let s3_key = format!(
             "kanban/cards/{}/{}/{}",
@@ -203,7 +204,9 @@ impl AttachmentService for AttachmentServiceImpl {
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
-        let attachment_id = Uuid::parse_str(&req.attachment_id)
+        let attachment_id = req
+            .attachment_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
         // Fetch the attachment row; verify card_id matches the checked object.
@@ -216,7 +219,7 @@ impl AttachmentService for AttachmentServiceImpl {
         .map_err(|e| internal("failed to fetch attachment", e))?
         .ok_or_else(|| Status::not_found("attachment not found"))?;
 
-        let db_card_id: Uuid = row.get("card_id");
+        let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
             warn!(
                 attachment_id = %attachment_id,
@@ -265,7 +268,9 @@ impl AttachmentService for AttachmentServiceImpl {
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
-        let attachment_id = Uuid::parse_str(&req.attachment_id)
+        let attachment_id = req
+            .attachment_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
         let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
@@ -275,7 +280,7 @@ impl AttachmentService for AttachmentServiceImpl {
             .map_err(|e| internal("failed to fetch attachment", e))?
             .ok_or_else(|| Status::not_found("attachment not found"))?;
 
-        let db_card_id: Uuid = row.get("card_id");
+        let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
             warn!(
                 attachment_id = %attachment_id,
@@ -307,7 +312,9 @@ impl AttachmentService for AttachmentServiceImpl {
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
-        let attachment_id = Uuid::parse_str(&req.attachment_id)
+        let attachment_id = req
+            .attachment_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
         let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
@@ -317,7 +324,7 @@ impl AttachmentService for AttachmentServiceImpl {
             .map_err(|e| internal("failed to fetch attachment", e))?
             .ok_or_else(|| Status::not_found("attachment not found"))?;
 
-        let db_card_id: Uuid = row.get("card_id");
+        let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
             warn!(
                 attachment_id = %attachment_id,
@@ -362,7 +369,8 @@ impl AttachmentService for AttachmentServiceImpl {
         // CheckedObjectId is the card_id; we also accept it from the request body
         // for symmetry, but the authoritative value is the checked extension.
         let card_id_str = checked_object_id(&request)?;
-        let card_id = Uuid::parse_str(&card_id_str)
+        let card_id = card_id_str
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id in x-sunbeam-object-id"))?;
 
         let rows = sqlx::query(
@@ -422,7 +430,7 @@ mod tests {
     }
 
     // Clean up a card_attachments row directly.
-    async fn cleanup_attachment(pool: &PgPool, id: Uuid) {
+    async fn cleanup_attachment(pool: &PgPool, id: Id) {
         let _ = sqlx::query("DELETE FROM card_attachments WHERE id = $1")
             .bind(id)
             .execute(pool)
@@ -431,7 +439,7 @@ mod tests {
 
     /// Create a project, board, column, and card for tests and return the card id.
     /// Wraps `test_support::seed_card_chain` so existing tests can call it directly.
-    async fn seed_card_chain(pool: &PgPool) -> Uuid {
+    async fn seed_card_chain(pool: &PgPool) -> Id {
         let (_project_id, _board_id, _column_id, card_id) =
             crate::test_support::seed_card_chain(pool).await;
         card_id
@@ -445,7 +453,7 @@ mod tests {
         let pool = infra.pool.clone();
 
         let card_id = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         let resp = svc
             .request_presigned_upload(authed_request_with_object(
@@ -480,7 +488,7 @@ mod tests {
         assert!(resp.expires_at.is_some(), "expires_at must be present");
 
         // Cleanup
-        let att_id = Uuid::parse_str(&resp.attachment_id).unwrap();
+        let att_id = resp.attachment_id.parse::<Id>().unwrap();
         cleanup_attachment(&pool, att_id).await;
         let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
             .bind(card_id)
@@ -496,7 +504,7 @@ mod tests {
         let http = reqwest::Client::new();
 
         let card_id = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         // Step 1: RequestPresignedUpload
         let upload_resp = svc
@@ -581,7 +589,7 @@ mod tests {
         // Teardown: delete from S3 + SQL
         let s3_client = S3Client::new(s3_cfg);
         let _ = s3_client.delete_object(&s3_key).await;
-        let att_id = Uuid::parse_str(&attachment_id).unwrap();
+        let att_id = attachment_id.parse::<Id>().unwrap();
         cleanup_attachment(&pool, att_id).await;
         let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
             .bind(card_id)
@@ -595,7 +603,7 @@ mod tests {
         let pool = infra.pool.clone();
 
         let card_id = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         // Create a pending attachment but never PUT to S3.
         let upload_resp = svc
@@ -639,7 +647,7 @@ mod tests {
         );
 
         // Cleanup
-        let att_id = Uuid::parse_str(&attachment_id).unwrap();
+        let att_id = attachment_id.parse::<Id>().unwrap();
         cleanup_attachment(&pool, att_id).await;
         let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
             .bind(card_id)
@@ -655,7 +663,7 @@ mod tests {
         let http = reqwest::Client::new();
 
         let card_id = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         // Upload a real file.
         let upload_resp = svc
@@ -705,8 +713,8 @@ mod tests {
         .expect("delete_attachment failed");
 
         // Verify SQL row is gone.
-        let att_id = Uuid::parse_str(&attachment_id).unwrap();
-        let sql_row: Option<Uuid> = sqlx::query("SELECT id FROM card_attachments WHERE id = $1")
+        let att_id = attachment_id.parse::<Id>().unwrap();
+        let sql_row: Option<Id> = sqlx::query("SELECT id FROM card_attachments WHERE id = $1")
             .bind(att_id)
             .fetch_optional(&pool)
             .await
@@ -737,12 +745,12 @@ mod tests {
 
         let card_a = seed_card_chain(&pool).await;
         let card_b = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         // Insert attachment for card_a directly (skip S3 — we only need SQL rows for list test).
-        let att_a1 = Uuid::new_v4();
-        let att_a2 = Uuid::new_v4();
-        let att_b1 = Uuid::new_v4();
+        let att_a1 = Id::new();
+        let att_a2 = Id::new();
+        let att_b1 = Id::new();
 
         for (att_id, cid) in &[(att_a1, card_a), (att_a2, card_a), (att_b1, card_b)] {
             sqlx::query(
@@ -811,7 +819,7 @@ mod tests {
 
         let card_legit = seed_card_chain(&pool).await;
         let card_attacker = seed_card_chain(&pool).await;
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         // Create an attachment on card_legit.
         let upload_resp = svc
@@ -856,7 +864,7 @@ mod tests {
         );
 
         // Cleanup
-        let att_id = Uuid::parse_str(&attachment_id).unwrap();
+        let att_id = attachment_id.parse::<Id>().unwrap();
         cleanup_attachment(&pool, att_id).await;
         for cid in &[card_legit, card_attacker] {
             let _ = sqlx::query("DELETE FROM cards WHERE id = $1")

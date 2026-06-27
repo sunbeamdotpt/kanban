@@ -56,6 +56,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::id::Id;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -64,7 +65,6 @@ use prost_types::Timestamp;
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::mq::NatsClient;
 
@@ -114,7 +114,7 @@ pub struct OutboxDispatcher {
     /// row; `Some(board_id)` restricts to one board so concurrent integration
     /// tests don't eat each other's rows.
     #[cfg(test)]
-    board_filter: Option<Uuid>,
+    board_filter: Option<Id>,
 }
 
 impl OutboxDispatcher {
@@ -134,7 +134,7 @@ impl OutboxDispatcher {
     /// Restrict drain to a single board. Test-only — production drains every
     /// undispatched row regardless of board.
     #[cfg(test)]
-    pub fn with_board_filter(mut self, board_id: Uuid) -> Self {
+    pub fn with_board_filter(mut self, board_id: Id) -> Self {
         self.board_filter = Some(board_id);
         self
     }
@@ -196,13 +196,13 @@ impl OutboxDispatcher {
         #[cfg(test)]
         let board_filter = self.board_filter;
         #[cfg(not(test))]
-        let board_filter: Option<Uuid> = None;
+        let board_filter: Option<Id> = None;
 
         let rows = sqlx::query(
             "SELECT id, board_id, aggregated_board_id, event_type, payload, created_at \
              FROM event_log \
              WHERE nats_seq IS NULL \
-               AND ($2::uuid IS NULL OR board_id = $2 OR aggregated_board_id = $2) \
+               AND ($2::text IS NULL OR board_id = $2 OR aggregated_board_id = $2) \
              ORDER BY id \
              LIMIT $1",
         )
@@ -215,10 +215,10 @@ impl OutboxDispatcher {
         let mut dispatched = 0usize;
 
         for row in &rows {
-            let row_id: Uuid = row.get("id");
-            let object_id: Uuid = match row
-                .get::<Option<Uuid>, _>("aggregated_board_id")
-                .or_else(|| row.get::<Option<Uuid>, _>("board_id"))
+            let row_id: Id = row.get("id");
+            let object_id: Id = match row
+                .get::<Option<Id>, _>("aggregated_board_id")
+                .or_else(|| row.get::<Option<Id>, _>("board_id"))
             {
                 Some(id) => id,
                 None => panic!("event_log row has neither board_id nor aggregated_board_id"),
@@ -313,8 +313,8 @@ impl OutboxDispatcher {
 /// the card event types emitted by `cards.rs`; unknown event types leave the
 /// oneof empty until their proto shapes are wired in.
 fn build_envelope(
-    row_id: Uuid,
-    board_id: Uuid,
+    row_id: Id,
+    board_id: Id,
     event_type: &str,
     payload_json: &JsonValue,
     created_at: DateTime<Utc>,
@@ -470,12 +470,12 @@ mod tests {
         Arc::clone(&containers::setup().await.nats)
     }
 
-    fn make_dispatcher(pool: PgPool, nats: Arc<NatsClient>, board_id: Uuid) -> OutboxDispatcher {
+    fn make_dispatcher(pool: PgPool, nats: Arc<NatsClient>, board_id: Id) -> OutboxDispatcher {
         OutboxDispatcher::new(pool, nats, OutboxConfig::default()).with_board_filter(board_id)
     }
 
     /// Count event_log rows for a board where nats_seq IS NOT NULL.
-    async fn count_dispatched(pool: &PgPool, board_id: Uuid) -> i64 {
+    async fn count_dispatched(pool: &PgPool, board_id: Id) -> i64 {
         sqlx::query(
             "SELECT COUNT(*) AS cnt FROM event_log \
              WHERE board_id = $1 AND nats_seq IS NOT NULL",
@@ -490,7 +490,7 @@ mod tests {
     /// Cleanup helper: delete all event_log rows for a board, then cascade-delete
     /// the board's cards/columns/board/project via DELETE on boards (CASCADE
     /// defined in migrations).
-    async fn cleanup(pool: &PgPool, board_id: Uuid, project_id: Uuid) {
+    async fn cleanup(pool: &PgPool, board_id: Id, project_id: Id) {
         let _ = sqlx::query("DELETE FROM event_log WHERE board_id = $1")
             .bind(board_id)
             .execute(pool)
@@ -556,7 +556,7 @@ mod tests {
         // Verify the event_ids returned by the envelope match the inserted row ids.
         // We can't easily subscribe post-hoc without a consumer, but we can verify
         // that the row ids are the expected set.
-        let row_ids: Vec<Uuid> = rows.iter().map(|r| r.get("id")).collect();
+        let row_ids: Vec<Id> = rows.iter().map(|r| r.get("id")).collect();
         assert!(row_ids.contains(&id1));
         assert!(row_ids.contains(&id2));
         assert!(row_ids.contains(&id3));
@@ -748,8 +748,8 @@ mod tests {
 
     #[test]
     fn build_envelope_populates_fields() {
-        let row_id = Uuid::new_v4();
-        let board_id = Uuid::new_v4();
+        let row_id = Id::new();
+        let board_id = Id::new();
         let created_at = Utc::now();
         let payload = serde_json::json!({
             "card_id": "card-1",
@@ -878,8 +878,8 @@ mod tests {
 
     #[test]
     fn build_envelope_uses_emitter_pod_id() {
-        let row_id = Uuid::new_v4();
-        let board_id = Uuid::new_v4();
+        let row_id = Id::new();
+        let board_id = Id::new();
         let payload = serde_json::json!({ "card_id": "card-1" });
         let env = build_envelope(
             row_id,

@@ -56,7 +56,7 @@ cargo test
 ### Test categories
 
 - **Unit tests** — no external dependencies (e.g., `matrix_covers_all_rpcs`).
-- **Integration tests** — require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
+- **Integration tests** — require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh ULIDs so parallel runs do not collide.
 - **No `#[ignore]` attributes** — all tests run by default.
 
 ### Writing a service integration test

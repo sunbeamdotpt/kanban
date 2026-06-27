@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::id::Id;
 use async_stream::stream;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
@@ -26,7 +27,6 @@ use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -98,8 +98,8 @@ pub(crate) fn board_from_row(
     columns_count: i32,
     cards_count: i32,
 ) -> Board {
-    let id: Uuid = row.get("id");
-    let project_id: Uuid = row.get("project_id");
+    let id: Id = row.get("id");
+    let project_id: Id = row.get("project_id");
     let name: String = row.get("name");
     let description: Option<String> = row.get("description");
     let icon: Option<String> = row.get("icon");
@@ -122,8 +122,8 @@ pub(crate) fn board_from_row(
 }
 
 fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
-    let id: Uuid = row.get("id");
-    let board_id: Uuid = row.get("board_id");
+    let id: Id = row.get("id");
+    let board_id: Id = row.get("board_id");
     let title: String = row.get("title");
     let accent: Option<String> = row.get("accent");
     let wip_limit: Option<i32> = row.get("wip_limit");
@@ -145,7 +145,7 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
 
 // ── Count helpers ─────────────────────────────────────────────────────────────
 
-pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Uuid) -> i32 {
+pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Id) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM columns WHERE board_id = $1")
         .bind(board_id)
         .fetch_one(pool)
@@ -157,7 +157,7 @@ pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Uuid) -> i32 {
         .unwrap_or(0)
 }
 
-pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Uuid) -> i32 {
+pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Id) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM cards WHERE board_id = $1")
         .bind(board_id)
         .fetch_one(pool)
@@ -169,7 +169,7 @@ pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Uuid) -> i32 {
         .unwrap_or(0)
 }
 
-async fn fetch_board_columns(pool: &PgPool, board_id: Uuid) -> Result<Vec<Column>, Status> {
+async fn fetch_board_columns(pool: &PgPool, board_id: Id) -> Result<Vec<Column>, Status> {
     let rows = sqlx::query(
         "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
          FROM columns WHERE board_id = $1 ORDER BY position ASC",
@@ -411,7 +411,9 @@ impl BoardService for BoardServiceImpl {
     ) -> Result<Response<ListBoardsResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let project_id = Uuid::parse_str(&req.project_id)
+        let project_id = req
+            .project_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
@@ -440,7 +442,7 @@ impl BoardService for BoardServiceImpl {
 
         let mut boards = Vec::with_capacity(rows.len());
         for row in &rows {
-            let bid: Uuid = row.get("id");
+            let bid: Id = row.get("id");
             let visibility: String = row.get("visibility");
             if !is_public_or_internal(&visibility)
                 && !allowed_private_ids.contains(&bid.to_string())
@@ -466,7 +468,9 @@ impl BoardService for BoardServiceImpl {
     ) -> Result<Response<BoardDetail>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let board_id = Uuid::parse_str(&req.board_id)
+        let board_id = req
+            .board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let row = sqlx::query(
@@ -515,14 +519,15 @@ impl BoardService for BoardServiceImpl {
         request: Request<CreateBoardRequest>,
     ) -> Result<Response<Board>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let req = request.into_inner();
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Uuid>> =
+            let cached: Option<Option<Id>> =
                 sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
                     .bind(&req.idempotency_key)
                     .fetch_optional(&self.pool)
@@ -556,7 +561,7 @@ impl BoardService for BoardServiceImpl {
             return Err(Status::invalid_argument("name is required"));
         }
 
-        let board_id = Uuid::new_v4();
+        let board_id = Id::new();
         let slug = slug_from_name(&req.name);
         let visibility = proto_to_db(req.visibility);
 
@@ -637,7 +642,8 @@ impl BoardService for BoardServiceImpl {
     ) -> Result<Response<Board>, Status> {
         let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -714,7 +720,8 @@ impl BoardService for BoardServiceImpl {
         request: Request<DeleteBoardRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let result = sqlx::query("DELETE FROM boards WHERE id = $1")
@@ -747,7 +754,8 @@ impl BoardService for BoardServiceImpl {
         request: Request<AddColumnRequest>,
     ) -> Result<Response<Column>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -758,7 +766,7 @@ impl BoardService for BoardServiceImpl {
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Uuid>> =
+            let cached: Option<Option<Id>> =
                 sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
                     .bind(&req.idempotency_key)
                     .fetch_optional(&self.pool)
@@ -782,7 +790,7 @@ impl BoardService for BoardServiceImpl {
             }
         }
 
-        let column_id = Uuid::new_v4();
+        let column_id = Id::new();
 
         let row = if req.position == 0 {
             // Append at the end: position = MAX(position) + 1.
@@ -871,11 +879,14 @@ impl BoardService for BoardServiceImpl {
         request: Request<UpdateColumnRequest>,
     ) -> Result<Response<Column>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
-        let col_id = Uuid::parse_str(&req.column_id)
+        let col_id = req
+            .column_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
         let patch = req.column.unwrap_or_default();
 
@@ -923,11 +934,14 @@ impl BoardService for BoardServiceImpl {
         request: Request<RemoveColumnRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
-        let col_id = Uuid::parse_str(&req.column_id)
+        let col_id = req
+            .column_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
         // Verify the column belongs to this board.
@@ -995,11 +1009,14 @@ impl BoardService for BoardServiceImpl {
         request: Request<MoveColumnRequest>,
     ) -> Result<Response<MoveColumnResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
-        let col_id = Uuid::parse_str(&req.column_id)
+        let col_id = req
+            .column_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
         if req.to_position < 1 {
@@ -1082,7 +1099,8 @@ impl BoardService for BoardServiceImpl {
 
         let visibility: String = sqlx::query_scalar("SELECT visibility FROM boards WHERE id = $1")
             .bind(
-                Uuid::parse_str(&board_id)
+                board_id
+                    .parse::<Id>()
                     .map_err(|_| Status::invalid_argument("invalid board_id"))?,
             )
             .fetch_optional(&self.pool)
@@ -1163,8 +1181,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         let auth = make_auth_with_future_exp(&subject_str);
 
         let keto_url =
@@ -1233,8 +1251,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         let auth = make_auth_with_future_exp(&subject_str);
 
         let keto_url =
@@ -1270,7 +1288,7 @@ mod tests {
             .expect("timeout on cutover");
 
         // Publish a live event.
-        let live_event_id = format!("live-{}", uuid::Uuid::new_v4().simple());
+        let live_event_id = format!("live-{}", Id::new());
         let envelope = BoardEventEnvelope {
             board_id: board_id.clone(),
             event_id: live_event_id.clone(),
@@ -1324,8 +1342,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         let auth = make_auth_with_future_exp(&subject_str);
 
         let keto_url =
@@ -1398,8 +1416,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         // Issue an already-expired token (exp = 0).
         let auth = AuthContext::authenticated(&subject_str, None).with_exp(0);
 
@@ -1474,8 +1492,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         let auth = make_auth_with_future_exp(&subject_str);
 
         let keto_url =
@@ -1600,9 +1618,9 @@ mod tests {
     }
 
     /// Insert a project row directly for a test, bypassing ProjectService.
-    async fn create_test_project(pool: &PgPool, subject: &str) -> Uuid {
-        let pid = Uuid::new_v4();
-        let slug = format!("tp-{}", &pid.to_string()[..8]);
+    async fn create_test_project(pool: &PgPool, subject: &str) -> Id {
+        let pid = Id::new();
+        let slug = format!("tp-{}", &pid.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
         )
@@ -1619,13 +1637,13 @@ mod tests {
     /// Insert a card row directly for a test.
     async fn create_test_card(
         pool: &PgPool,
-        project_id: Uuid,
-        board_id: Uuid,
-        column_id: Uuid,
+        project_id: Id,
+        board_id: Id,
+        column_id: Id,
         subject: &str,
         ref_: &str,
-    ) -> Uuid {
-        let card_id = Uuid::new_v4();
+    ) -> Id {
+        let card_id = Id::new();
         sqlx::query(
             "INSERT INTO cards (id, project_id, board_id, column_id, ref, title, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
@@ -1642,7 +1660,7 @@ mod tests {
         card_id
     }
 
-    async fn cleanup_project(pool: &PgPool, project_id: Uuid) {
+    async fn cleanup_project(pool: &PgPool, project_id: Id) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
             .execute(pool)
@@ -1657,7 +1675,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let created = svc
@@ -1717,7 +1735,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_a = create_test_project(&pool, &subject).await;
         let project_b = create_test_project(&pool, &subject).await;
 
@@ -1810,7 +1828,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let created = svc
@@ -1874,7 +1892,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -1894,7 +1912,7 @@ mod tests {
             .expect("create_board failed")
             .into_inner();
 
-        let board_id = Uuid::parse_str(&board.id).unwrap();
+        let board_id = board.id.parse::<Id>().unwrap();
 
         // Add a column to confirm cascade.
         let col = svc
@@ -1914,7 +1932,7 @@ mod tests {
             .expect("add_column failed")
             .into_inner();
 
-        let col_id = Uuid::parse_str(&col.id).unwrap();
+        let col_id = col.id.parse::<Id>().unwrap();
 
         // Seed a card in the column.
         create_test_card(&pool, project_id, board_id, col_id, &subject, "TEST-1").await;
@@ -1957,7 +1975,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -2044,7 +2062,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -2123,7 +2141,7 @@ mod tests {
         // Verify "Second" was shifted to 2.
         let second_pos: i32 =
             sqlx::query("SELECT position FROM columns WHERE board_id = $1 AND title = 'Second'")
-                .bind(Uuid::parse_str(&bid).unwrap())
+                .bind(bid.parse::<Id>().unwrap())
                 .fetch_one(&pool)
                 .await
                 .unwrap()
@@ -2139,7 +2157,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -2218,7 +2236,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -2239,7 +2257,7 @@ mod tests {
             .into_inner();
 
         let bid = board.id.clone();
-        let board_uuid = Uuid::parse_str(&bid).unwrap();
+        let board_id = bid.parse::<Id>().unwrap();
 
         let col = svc
             .add_column(authed_request_with_object(
@@ -2258,15 +2276,15 @@ mod tests {
             .expect("add_column failed")
             .into_inner();
 
-        let col_uuid = Uuid::parse_str(&col.id).unwrap();
+        let column_id = col.id.parse::<Id>().unwrap();
 
         // Seed 3 cards in the doomed column.
         for i in 0..3 {
             create_test_card(
                 &pool,
                 project_id,
-                board_uuid,
-                col_uuid,
+                board_id,
+                column_id,
                 &subject,
                 &format!("DEL-{i}"),
             )
@@ -2275,7 +2293,7 @@ mod tests {
 
         // Verify cards exist.
         let card_count_before: i64 = sqlx::query("SELECT COUNT(*) FROM cards WHERE column_id = $1")
-            .bind(col_uuid)
+            .bind(column_id)
             .fetch_one(&pool)
             .await
             .unwrap()
@@ -2295,7 +2313,7 @@ mod tests {
 
         // Cards should be cascade-deleted.
         let card_count_after: i64 = sqlx::query("SELECT COUNT(*) FROM cards WHERE board_id = $1")
-            .bind(board_uuid)
+            .bind(board_id)
             .fetch_one(&pool)
             .await
             .unwrap()
@@ -2307,7 +2325,7 @@ mod tests {
 
         // Column should be gone.
         let col_exists: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM columns WHERE id = $1)")
-            .bind(col_uuid)
+            .bind(column_id)
             .fetch_one(&pool)
             .await
             .unwrap()
@@ -2323,7 +2341,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_a = create_test_project(&pool, &subject).await;
         let project_b = create_test_project(&pool, &subject).await;
 
@@ -2412,7 +2430,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
@@ -2505,8 +2523,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
@@ -2548,8 +2566,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
@@ -2594,8 +2612,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
-        let stranger = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
+        let stranger = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &owner).await;
 
         // Public board.
@@ -2715,7 +2733,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-{}", Uuid::new_v4());
+        let owner = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
@@ -2816,8 +2834,8 @@ mod tests {
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", uuid::Uuid::new_v4().simple());
-        let subject_str = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("test-board-{}", Id::new());
+        let subject_str = format!("user:test-{}", Id::new());
         let auth = make_auth_with_future_exp(&subject_str);
 
         let keto_url =

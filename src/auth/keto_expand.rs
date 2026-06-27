@@ -133,8 +133,8 @@ pub async fn expand_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::Id;
     use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
-    use uuid::Uuid;
 
     use crate::auth::keto_retry::KetoRetryExt;
 
@@ -213,7 +213,7 @@ mod tests {
     async fn expand_returns_empty_set_for_unknown_subject() {
         let Some(ctx) = probe().await else { return };
 
-        let subject = format!("user:_test_unknown_{}", Uuid::new_v4());
+        let subject = format!("user:_test_unknown_{}", Id::new());
 
         let result = expand_objects(
             &ctx.client,
@@ -236,8 +236,8 @@ mod tests {
     async fn expand_paginates_when_results_exceed_page() {
         let Some(ctx) = probe().await else { return };
 
-        let subject = format!("user:_test_expand_{}", Uuid::new_v4());
-        let base_id = format!("obj-{}", Uuid::new_v4());
+        let subject = format!("user:_test_expand_{}", Id::new());
+        let base_id = format!("obj-{}", Id::new());
         let seeded = seed_tuples(&ctx, &subject, &base_id, 5).await;
 
         let result = expand_objects(
@@ -265,8 +265,8 @@ mod tests {
     async fn expand_errors_when_exceeds_ceiling() {
         let Some(ctx) = probe().await else { return };
 
-        let subject = format!("user:_test_ceiling_{}", Uuid::new_v4());
-        let base_id = format!("obj-{}", Uuid::new_v4());
+        let subject = format!("user:_test_ceiling_{}", Id::new());
+        let base_id = format!("obj-{}", Id::new());
         seed_tuples(&ctx, &subject, &base_id, 5).await;
 
         let result = expand_objects(
@@ -296,7 +296,7 @@ mod tests {
     async fn expand_errors_when_max_results_is_zero() {
         let Some(ctx) = probe().await else { return };
 
-        let subject = format!("user:_test_zero_ceiling_{}", Uuid::new_v4());
+        let subject = format!("user:_test_zero_ceiling_{}", Id::new());
 
         let result = expand_objects(
             &ctx.client,
@@ -325,8 +325,8 @@ mod tests {
     async fn expand_caps_page_size_at_1000() {
         let Some(ctx) = probe().await else { return };
 
-        let subject = format!("user:_test_page_cap_{}", Uuid::new_v4());
-        let base_id = format!("obj-{}", Uuid::new_v4());
+        let subject = format!("user:_test_page_cap_{}", Id::new());
+        let base_id = format!("obj-{}", Id::new());
         let seeded = seed_tuples(&ctx, &subject, &base_id, 5).await;
 
         let result = expand_objects(

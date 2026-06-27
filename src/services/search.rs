@@ -9,10 +9,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::id::Id;
 use serde_json::{Value, json};
 use tonic::{Request, Response, Status};
 use tracing::error;
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -58,8 +58,8 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
 /// Filter a list of board ids down to those with public or internal visibility.
 async fn fetch_public_internal_board_ids(
     pool: &sqlx::PgPool,
-    board_ids: &[Uuid],
-) -> Result<BTreeSet<Uuid>, sqlx::Error> {
+    board_ids: &[Id],
+) -> Result<BTreeSet<Id>, sqlx::Error> {
     use sqlx::Row;
 
     let rows = sqlx::query(
@@ -71,7 +71,7 @@ async fn fetch_public_internal_board_ids(
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| r.try_get::<Uuid, _>("id").ok())
+        .filter_map(|r| r.try_get::<Id, _>("id").ok())
         .collect())
 }
 
@@ -313,9 +313,9 @@ impl SearchService for SearchServiceImpl {
         .await
         .map_err(|e| internal("keto expand failed during search post-filter", e))?;
 
-        let board_ids: Vec<Uuid> = raw_hits
+        let board_ids: Vec<Id> = raw_hits
             .iter()
-            .filter_map(|h| Uuid::parse_str(&h.source.board_id).ok())
+            .filter_map(|h| h.source.board_id.parse::<Id>().ok())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -544,6 +544,8 @@ mod tests {
     }
 
     /// Generate a unique OpenSearch index name for this test run.
+    /// OpenSearch index names must be lowercase, so the ULID suffix is
+    /// downcased (uniqueness is preserved).
     fn test_index() -> String {
         format!(
             "sunbeam-kanban-cards-test-{}-{}",
@@ -551,7 +553,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            uuid::Uuid::new_v4()
+            Id::new().to_string().to_lowercase()
         )
     }
 
@@ -566,7 +568,7 @@ mod tests {
             id: id.to_string(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
-            card_ref: format!("KB-{}", &id[..4]),
+            card_ref: format!("KB-{}", &id[22..26]),
             title: title.to_string(),
             description: format!("Description for {title}"),
             priority: "medium".to_string(),
@@ -630,10 +632,10 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = format!("board-{}", uuid::Uuid::new_v4());
-        let project_id = format!("proj-{}", uuid::Uuid::new_v4());
-        let card_id = format!("{}", uuid::Uuid::new_v4());
-        let subject = format!("user:test-{}", uuid::Uuid::new_v4());
+        let board_id = format!("board-{}", Id::new());
+        let project_id = format!("proj-{}", Id::new());
+        let card_id = format!("{}", Id::new());
+        let subject = format!("user:test-{}", Id::new());
 
         // Grant Keto view on the board.
         keto.grant_with_retry("KanbanBoard", &board_id, "view", &subject)
@@ -696,12 +698,12 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let project_a = format!("proj-a-{}", uuid::Uuid::new_v4());
-        let project_b = format!("proj-b-{}", uuid::Uuid::new_v4());
-        let board_id = format!("board-{}", uuid::Uuid::new_v4());
+        let project_a = format!("proj-a-{}", Id::new());
+        let project_b = format!("proj-b-{}", Id::new());
+        let board_id = format!("board-{}", Id::new());
 
-        let card_a = format!("{}", uuid::Uuid::new_v4());
-        let card_b = format!("{}", uuid::Uuid::new_v4());
+        let card_a = format!("{}", Id::new());
+        let card_b = format!("{}", Id::new());
 
         let doc_a = sample_card(
             &card_a,
@@ -767,11 +769,11 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = format!("board-{}", uuid::Uuid::new_v4());
-        let project_id = format!("proj-{}", uuid::Uuid::new_v4());
+        let board_id = format!("board-{}", Id::new());
+        let project_id = format!("proj-{}", Id::new());
 
-        let card_bug = format!("{}", uuid::Uuid::new_v4());
-        let card_feat = format!("{}", uuid::Uuid::new_v4());
+        let card_bug = format!("{}", Id::new());
+        let card_feat = format!("{}", Id::new());
 
         let doc_bug = sample_card(&card_bug, &board_id, &project_id, "A bug card", vec!["bug"]);
         let doc_feat = sample_card(
@@ -829,18 +831,18 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let project_id = format!("proj-{}", uuid::Uuid::new_v4());
-        let board_allowed = format!("board-allowed-{}", uuid::Uuid::new_v4());
-        let board_denied = format!("board-denied-{}", uuid::Uuid::new_v4());
-        let subject = format!("user:test-postfilter-{}", uuid::Uuid::new_v4());
+        let project_id = format!("proj-{}", Id::new());
+        let board_allowed = format!("board-allowed-{}", Id::new());
+        let board_denied = format!("board-denied-{}", Id::new());
+        let subject = format!("user:test-postfilter-{}", Id::new());
 
         // Grant view only on board_allowed.
         keto.grant_with_retry("KanbanBoard", &board_allowed, "view", &subject)
             .await
             .expect("keto grant allowed board");
 
-        let card_allowed = format!("{}", uuid::Uuid::new_v4());
-        let card_denied = format!("{}", uuid::Uuid::new_v4());
+        let card_allowed = format!("{}", Id::new());
+        let card_denied = format!("{}", Id::new());
 
         let doc_a = sample_card(
             &card_allowed,
@@ -937,13 +939,13 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = format!("board-{}", uuid::Uuid::new_v4());
-        let project_id = format!("proj-{}", uuid::Uuid::new_v4());
+        let board_id = format!("board-{}", Id::new());
+        let project_id = format!("proj-{}", Id::new());
 
         // Index 5 cards.
         let mut all_ids = vec![];
         for i in 0..5usize {
-            let id = format!("{}", uuid::Uuid::new_v4());
+            let id = format!("{}", Id::new());
             let doc = sample_card(
                 &id,
                 &board_id,
@@ -1020,9 +1022,9 @@ mod tests {
 
     // ── Visibility post-filter tests ───────────────────────────────────────────
 
-    async fn insert_test_board(pool: &sqlx::PgPool, board_id: Uuid, visibility: &str) {
+    async fn insert_test_board(pool: &sqlx::PgPool, board_id: Id, visibility: &str) {
         let project_id = crate::test_support::seed_project(pool).await;
-        let slug = format!("bd-{}", &board_id.to_string()[..8]);
+        let slug = format!("bd-{}", &board_id.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
              VALUES ($1, $2, $3, $4, '', '', $5)",
@@ -1062,17 +1064,17 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let card_id = format!("{}", uuid::Uuid::new_v4());
-        let subject = format!("user:test-public-search-{}", uuid::Uuid::new_v4());
+        let board_id = Id::new();
+        let card_id = format!("{}", Id::new());
+        let subject = format!("user:test-public-search-{}", Id::new());
 
         insert_test_board(&infra.pool, board_id, "public").await;
 
         let doc = CardDocument {
             id: card_id.clone(),
             board_id: board_id.to_string(),
-            project_id: Uuid::new_v4().to_string(),
-            card_ref: format!("KB-{}", &card_id[..4]),
+            project_id: Id::new().to_string(),
+            card_ref: format!("KB-{}", &card_id[22..26]),
             title: "Public Visibility Hit".to_string(),
             description: "Find me".to_string(),
             priority: "medium".to_string(),
@@ -1116,17 +1118,17 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let card_id = format!("{}", uuid::Uuid::new_v4());
-        let subject = format!("user:test-private-search-{}", uuid::Uuid::new_v4());
+        let board_id = Id::new();
+        let card_id = format!("{}", Id::new());
+        let subject = format!("user:test-private-search-{}", Id::new());
 
         insert_test_board(&infra.pool, board_id, "private").await;
 
         let doc = CardDocument {
             id: card_id.clone(),
             board_id: board_id.to_string(),
-            project_id: Uuid::new_v4().to_string(),
-            card_ref: format!("KB-{}", &card_id[..4]),
+            project_id: Id::new().to_string(),
+            card_ref: format!("KB-{}", &card_id[22..26]),
             title: "Private Visibility Hit".to_string(),
             description: "Hide me".to_string(),
             priority: "medium".to_string(),
@@ -1208,7 +1210,7 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
+        let board_id = Id::new();
         insert_test_board(&infra.pool, board_id, "public").await;
 
         let svc = SearchServiceImpl {
@@ -1239,9 +1241,9 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let project_a = Uuid::new_v4();
-        let project_b = Uuid::new_v4();
+        let board_id = Id::new();
+        let project_a = Id::new();
+        let project_b = Id::new();
         insert_test_board_with_project(&infra.pool, board_id, project_a, "public").await;
 
         let card_a =
@@ -1279,9 +1281,9 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_a = Uuid::new_v4();
-        let board_b = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
+        let board_a = Id::new();
+        let board_b = Id::new();
+        let project_id = Id::new();
         insert_test_board_with_project(&infra.pool, board_a, project_id, "public").await;
         insert_test_board_with_project(&infra.pool, board_b, project_id, "public").await;
 
@@ -1320,8 +1322,8 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
+        let board_id = Id::new();
+        let project_id = Id::new();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let card_bug = index_public_card(
@@ -1375,8 +1377,8 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
+        let board_id = Id::new();
+        let project_id = Id::new();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let card_alice = index_public_card(
@@ -1430,12 +1432,12 @@ mod tests {
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
 
-        let board_id = Uuid::new_v4();
-        let project_id = Uuid::new_v4();
+        let board_id = Id::new();
+        let project_id = Id::new();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let doc = CardDocument {
-            id: Uuid::new_v4().to_string(),
+            id: Id::new().to_string(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
             card_ref: "KB-DONE".to_string(),
@@ -1471,11 +1473,11 @@ mod tests {
 
     async fn insert_test_board_with_project(
         pool: &sqlx::PgPool,
-        board_id: Uuid,
-        project_id: Uuid,
+        board_id: Id,
+        project_id: Id,
         visibility: &str,
     ) {
-        let slug = format!("bd-{}", &board_id.to_string()[..8]);
+        let slug = format!("bd-{}", &board_id.to_string()[18..26]);
 
         // Ensure the parent project exists; callers that already seeded one will
         // hit ON CONFLICT DO NOTHING.
@@ -1508,18 +1510,18 @@ mod tests {
     async fn index_public_card(
         os: &Arc<OpenSearchClient>,
         index: &str,
-        board_id: Uuid,
-        project_id: Uuid,
+        board_id: Id,
+        project_id: Id,
         title: &str,
         labels: Vec<&str>,
         assignees: Vec<&str>,
     ) -> String {
-        let card_id = Uuid::new_v4().to_string();
+        let card_id = Id::new().to_string();
         let doc = CardDocument {
             id: card_id.clone(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
-            card_ref: format!("KB-{}", &card_id[..4]),
+            card_ref: format!("KB-{}", &card_id[22..26]),
             title: title.to_string(),
             description: format!("Description for {title}"),
             priority: "medium".to_string(),
@@ -1600,8 +1602,8 @@ mod tests {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
-        let board_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4().to_string();
+        let board_id = Id::new();
+        let card_id = Id::new().to_string();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let (addr, _handle) = start_mock_hit_server(&card_id, &board_id.to_string()).await;
@@ -1651,7 +1653,7 @@ mod tests {
                                     "_source": {
                                         "id": card_id,
                                         "board_id": board_id,
-                                        "project_id": Uuid::new_v4().to_string(),
+                                        "project_id": Id::new().to_string(),
                                         "ref": "KB-1",
                                         "title": "Mock hit",
                                         "description": "Desc",
@@ -1807,8 +1809,8 @@ mod tests {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
-        let board_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4().to_string();
+        let board_id = Id::new();
+        let card_id = Id::new().to_string();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "private").await;
 
         let (addr, _handle) = start_mock_hit_server(&card_id, &board_id.to_string()).await;
@@ -1823,7 +1825,7 @@ mod tests {
             index_name: None,
         };
 
-        let subject = format!("user:test-private-drop-{}", Uuid::new_v4());
+        let subject = format!("user:test-private-drop-{}", Id::new());
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
             subject: Some(subject.clone()),
@@ -1839,11 +1841,11 @@ mod tests {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
-        let board_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4().to_string();
+        let board_id = Id::new();
+        let card_id = Id::new().to_string();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "private").await;
 
-        let subject = format!("user:test-private-allow-{}", Uuid::new_v4());
+        let subject = format!("user:test-private-allow-{}", Id::new());
         infra
             .keto
             .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", &subject)
@@ -1893,7 +1895,7 @@ mod tests {
                 let card_ids = card_ids.clone();
                 let board_id = board_id.clone();
                 async move {
-                    let project_id = Uuid::new_v4().to_string();
+                    let project_id = Id::new().to_string();
                     let hits: Vec<Value> = card_ids
                         .into_iter()
                         .enumerate()
@@ -1945,8 +1947,8 @@ mod tests {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
-        let board_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4().to_string();
+        let board_id = Id::new();
+        let card_id = Id::new().to_string();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let (addr, _handle) =
@@ -1979,8 +1981,8 @@ mod tests {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
-        let board_id = Uuid::new_v4();
-        let card_id = Uuid::new_v4().to_string();
+        let board_id = Id::new();
+        let card_id = Id::new().to_string();
         insert_test_board_with_project(&infra.pool, board_id, project_id, "public").await;
 
         let (addr, _handle) =

@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
+use crate::id::Id;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -141,10 +141,10 @@ pub(crate) fn card_from_row(
     checklist: Vec<ChecklistItem>,
     aggregates: CardAggregates,
 ) -> Card {
-    let id: Uuid = row.get("id");
-    let project_id: Uuid = row.get("project_id");
-    let board_id: Uuid = row.get("board_id");
-    let column_id: Uuid = row.get("column_id");
+    let id: Id = row.get("id");
+    let project_id: Id = row.get("project_id");
+    let board_id: Id = row.get("board_id");
+    let column_id: Id = row.get("column_id");
     let ref_: String = row.get("ref");
     let title: String = row.get("title");
     let description: Option<String> = row.get("description");
@@ -155,7 +155,7 @@ pub(crate) fn card_from_row(
     let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
     let blocked: bool = row.get("blocked");
     let cover: Option<String> = row.get("cover");
-    let milestone_id: Option<Uuid> = row.get("milestone_id");
+    let milestone_id: Option<Id> = row.get("milestone_id");
     let revision: i64 = row.get("revision");
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
@@ -191,8 +191,8 @@ pub(crate) fn card_from_row(
 }
 
 fn comment_from_row(row: &sqlx::postgres::PgRow) -> Comment {
-    let id: Uuid = row.get("id");
-    let card_id: Uuid = row.get("card_id");
+    let id: Id = row.get("id");
+    let card_id: Id = row.get("card_id");
     let author_sub: String = row.get("author_sub");
     let body: String = row.get("body");
     let created_at: DateTime<Utc> = row.get("created_at");
@@ -209,7 +209,7 @@ fn comment_from_row(row: &sqlx::postgres::PgRow) -> Comment {
 }
 
 fn checklist_item_from_row(row: &sqlx::postgres::PgRow) -> ChecklistItem {
-    let id: Uuid = row.get("id");
+    let id: Id = row.get("id");
     let text: String = row.get("text");
     let done: bool = row.get("done");
     let position: i32 = row.get("position");
@@ -223,7 +223,7 @@ fn checklist_item_from_row(row: &sqlx::postgres::PgRow) -> ChecklistItem {
 
 // ── Fetch helpers for embedded sub-entities ───────────────────────────────────
 
-pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
+pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id) -> Vec<Label> {
     sqlx::query(
         "SELECT l.id, l.project_id, l.name, l.style \
          FROM labels l \
@@ -237,8 +237,8 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
     .unwrap_or_default()
     .iter()
     .map(|r| {
-        let lid: Uuid = r.get("id");
-        let pid: Uuid = r.get("project_id");
+        let lid: Id = r.get("id");
+        let pid: Id = r.get("project_id");
         Label {
             id: lid.to_string(),
             project_id: pid.to_string(),
@@ -249,7 +249,7 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Uuid) -> Vec<Label> {
     .collect()
 }
 
-pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Uuid) -> Vec<Assignee> {
+pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id) -> Vec<Assignee> {
     sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 ORDER BY assigned_at")
         .bind(card_id)
         .fetch_all(pool)
@@ -264,7 +264,7 @@ pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Uuid) -> Vec<Assigne
         .collect()
 }
 
-pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Uuid) -> Vec<ChecklistItem> {
+pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Id) -> Vec<ChecklistItem> {
     sqlx::query(
         "SELECT id, text, done, position FROM checklist_items \
          WHERE card_id = $1 ORDER BY position ASC",
@@ -278,7 +278,7 @@ pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Uuid) -> Vec<Checkli
     .collect()
 }
 
-pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Uuid) -> i32 {
+pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Id) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM comments WHERE card_id = $1")
         .bind(card_id)
         .fetch_one(pool)
@@ -290,7 +290,7 @@ pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Uuid) -> i32 {
         .unwrap_or(0)
 }
 
-pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32 {
+pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Id) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM card_attachments WHERE card_id = $1")
         .bind(card_id)
         .fetch_one(pool)
@@ -302,7 +302,7 @@ pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Uuid) -> i32
         .unwrap_or(0)
 }
 
-pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Uuid) -> Vec<String> {
+pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Id) -> Vec<String> {
     sqlx::query(
         "SELECT depends_on_card_id FROM card_dependencies WHERE card_id = $1 ORDER BY created_at",
     )
@@ -312,13 +312,13 @@ pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Uuid) -> Vec<Stri
     .unwrap_or_default()
     .iter()
     .map(|r| {
-        let id: Uuid = r.get("depends_on_card_id");
+        let id: Id = r.get("depends_on_card_id");
         id.to_string()
     })
     .collect()
 }
 
-pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Uuid) -> Vec<String> {
+pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id) -> Vec<String> {
     sqlx::query(
         "SELECT card_id FROM card_dependencies WHERE depends_on_card_id = $1 ORDER BY created_at",
     )
@@ -328,14 +328,14 @@ pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Uuid) -> Vec<String
     .unwrap_or_default()
     .iter()
     .map(|r| {
-        let id: Uuid = r.get("card_id");
+        let id: Id = r.get("card_id");
         id.to_string()
     })
     .collect()
 }
 
 /// Load a complete card, including its relationships, by id.
-async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
+async fn fetch_full_card(pool: &PgPool, card_id: Id) -> Result<Card, Status> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
                 position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
@@ -387,7 +387,7 @@ async fn fetch_full_card(pool: &PgPool, card_id: Uuid) -> Result<Card, Status> {
 
 async fn allocate_card_ref(
     tx: &mut Transaction<'_, Postgres>,
-    project_id: Uuid,
+    project_id: Id,
 ) -> Result<String, Status> {
     // Advisory lock scoped to this transaction — serialises per project.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
@@ -421,15 +421,16 @@ async fn allocate_card_ref(
 
 async fn insert_event_log(
     tx: &mut Transaction<'_, Postgres>,
-    board_id: Uuid,
+    board_id: Id,
     event_type: &str,
     payload: serde_json::Value,
     card_revision: i64,
 ) -> Result<(), Status> {
     sqlx::query(
         "INSERT INTO event_log (id, board_id, event_type, payload, created_at)
-         VALUES (gen_random_uuid(), $1, $2, $3::jsonb, now())",
+         VALUES ($1, $2, $3, $4::jsonb, now())",
     )
+    .bind(Id::new())
     .bind(board_id)
     .bind(event_type)
     .bind(payload)
@@ -449,7 +450,7 @@ async fn insert_event_log(
 /// was already processed.
 ///
 /// Returns `Ok(Some(card_id))` for a replayed key and `Ok(None)` for a new key.
-async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Uuid>, Status> {
+async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Id>, Status> {
     if key.is_empty() {
         return Ok(None);
     }
@@ -462,13 +463,13 @@ async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Uuid>
     match row {
         None => Ok(None),
         Some(r) => {
-            let id: Option<Uuid> = r.get("response_card_id");
+            let id: Option<Id> = r.get("response_card_id");
             Ok(id)
         }
     }
 }
 
-async fn store_idempotency_card(pool: &PgPool, key: &str, card_id: Uuid) {
+async fn store_idempotency_card(pool: &PgPool, key: &str, card_id: Id) {
     if key.is_empty() {
         return;
     }
@@ -495,8 +496,9 @@ impl CardService for CardServiceImpl {
 
     async fn get_card(&self, request: Request<GetCardRequest>) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
         Ok(Response::new(card))
@@ -513,7 +515,8 @@ impl CardService for CardServiceImpl {
         request: Request<BatchGetCardsRequest>,
     ) -> Result<Response<BatchGetCardsResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -522,10 +525,10 @@ impl CardService for CardServiceImpl {
         }
 
         // Parse card_ids; skip invalid ones rather than erroring.
-        let ids: Vec<Uuid> = req
+        let ids: Vec<Id> = req
             .card_ids
             .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
+            .filter_map(|s| s.parse::<Id>().ok())
             .collect();
 
         // Fetch rows that are actually on this board.
@@ -545,7 +548,7 @@ impl CardService for CardServiceImpl {
 
         let mut cards = Vec::with_capacity(rows.len());
         for row in &rows {
-            let cid: Uuid = row.get("id");
+            let cid: Id = row.get("id");
             let labels = fetch_labels(&self.pool, cid).await;
             let assignees = fetch_assignees(&self.pool, cid).await;
             let checklist = fetch_checklist(&self.pool, cid).await;
@@ -580,7 +583,8 @@ impl CardService for CardServiceImpl {
         request: Request<ListCardsByBoardRequest>,
     ) -> Result<Response<ListCardsByBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -591,20 +595,22 @@ impl CardService for CardServiceImpl {
             limit
         };
 
-        let col_filter: Option<Uuid> = if req.column_id.is_empty() {
+        let col_filter: Option<Id> = if req.column_id.is_empty() {
             None
         } else {
             Some(
-                Uuid::parse_str(&req.column_id)
+                req.column_id
+                    .parse::<Id>()
                     .map_err(|_| Status::invalid_argument("invalid column_id"))?,
             )
         };
 
-        let cursor_id: Option<Uuid> = if req.cursor.is_empty() {
+        let cursor_id: Option<Id> = if req.cursor.is_empty() {
             None
         } else {
             Some(
-                Uuid::parse_str(&req.cursor)
+                req.cursor
+                    .parse::<Id>()
                     .map_err(|_| Status::invalid_argument("invalid cursor"))?,
             )
         };
@@ -679,7 +685,7 @@ impl CardService for CardServiceImpl {
         let next_cursor = if has_more {
             rows.last()
                 .map(|r| {
-                    let id: Uuid = r.get("id");
+                    let id: Id = r.get("id");
                     id.to_string()
                 })
                 .unwrap_or_default()
@@ -689,7 +695,7 @@ impl CardService for CardServiceImpl {
 
         let mut cards = Vec::with_capacity(rows.len());
         for row in rows {
-            let cid: Uuid = row.get("id");
+            let cid: Id = row.get("id");
             let labels = fetch_labels(&self.pool, cid).await;
             let assignees = fetch_assignees(&self.pool, cid).await;
             let checklist = fetch_checklist(&self.pool, cid).await;
@@ -728,7 +734,8 @@ impl CardService for CardServiceImpl {
         request: Request<CreateCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let subject = subject_from_request(&request)?;
@@ -753,10 +760,12 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch board", e))?
             .ok_or_else(|| Status::not_found("board not found"))?;
 
-        let project_id: Uuid = board_row.get("project_id");
+        let project_id: Id = board_row.get("project_id");
 
         // Verify column belongs to this board.
-        let col_id = Uuid::parse_str(&req.column_id)
+        let col_id = req
+            .column_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
         let col_row = sqlx::query("SELECT id FROM columns WHERE id = $1 AND board_id = $2")
@@ -778,7 +787,7 @@ impl CardService for CardServiceImpl {
         // Allocate card ref (advisory lock inside).
         let card_ref = allocate_card_ref(&mut tx, project_id).await?;
 
-        let card_id = Uuid::new_v4();
+        let card_id = Id::new();
 
         // Compute position.
         let position: i32 = if req.position == 0 {
@@ -810,10 +819,10 @@ impl CardService for CardServiceImpl {
         let due_date: Option<DateTime<Utc>> = req
             .due
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
-        let milestone_id: Option<Uuid> = if req.milestone_id.is_empty() {
+        let milestone_id: Option<Id> = if req.milestone_id.is_empty() {
             None
         } else {
-            Uuid::parse_str(&req.milestone_id).ok()
+            req.milestone_id.parse::<Id>().ok()
         };
 
         sqlx::query(
@@ -877,8 +886,9 @@ impl CardService for CardServiceImpl {
         request: Request<UpdateCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let patch = req.card.unwrap_or_default();
@@ -898,7 +908,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let priority_str: Option<&str> = if patch.priority != 0 {
@@ -917,10 +927,10 @@ impl CardService for CardServiceImpl {
             .due
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
 
-        let milestone_id: Option<Uuid> = if patch.milestone_id.is_empty() {
+        let milestone_id: Option<Id> = if patch.milestone_id.is_empty() {
             None
         } else {
-            Uuid::parse_str(&patch.milestone_id).ok()
+            patch.milestone_id.parse::<Id>().ok()
         };
 
         let row = sqlx::query(
@@ -995,11 +1005,14 @@ impl CardService for CardServiceImpl {
 
     async fn move_card(&self, request: Request<MoveCardRequest>) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
-        let to_col_id = Uuid::parse_str(&req.to_column_id)
+        let to_col_id = req
+            .to_column_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid to_column_id"))?;
 
         // Idempotency check.
@@ -1022,11 +1035,11 @@ impl CardService for CardServiceImpl {
         .map_err(|e| internal("failed to fetch card", e))?
         .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = card_row.get("board_id");
-        let from_col_id: Uuid = card_row.get("column_id");
+        let board_id: Id = card_row.get("board_id");
+        let from_col_id: Id = card_row.get("column_id");
         let from_pos: i32 = card_row.get("position");
         let prev_revision: i64 = card_row.get("revision");
-        let card_project_id: Uuid = card_row.get("project_id");
+        let card_project_id: Id = card_row.get("project_id");
 
         // Fetch target column's board_id.
         let target_col_row = sqlx::query("SELECT board_id FROM columns WHERE id = $1")
@@ -1036,7 +1049,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch target column", e))?
             .ok_or_else(|| Status::not_found("target column not found"))?;
 
-        let target_board_id: Uuid = target_col_row.get("board_id");
+        let target_board_id: Id = target_col_row.get("board_id");
 
         // Fetch target board's project_id to verify no cross-project move.
         let target_board_row = sqlx::query("SELECT project_id FROM boards WHERE id = $1")
@@ -1046,7 +1059,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch target board", e))?
             .ok_or_else(|| Status::not_found("target board not found"))?;
 
-        let target_project_id: Uuid = target_board_row.get("project_id");
+        let target_project_id: Id = target_board_row.get("project_id");
 
         if card_project_id != target_project_id {
             return Err(Status::invalid_argument(
@@ -1164,8 +1177,9 @@ impl CardService for CardServiceImpl {
         request: Request<DeleteCardRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         // Fetch board_id + revision before deleting.
         let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
@@ -1175,7 +1189,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1221,7 +1235,8 @@ impl CardService for CardServiceImpl {
         request: Request<CardDependencyRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -1230,9 +1245,13 @@ impl CardService for CardServiceImpl {
             return Err(Status::invalid_argument("idempotency_key is required"));
         }
 
-        let card_id = Uuid::parse_str(&req.card_id)
+        let card_id = req
+            .card_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
-        let depends_on_id = Uuid::parse_str(&req.depends_on_card_id)
+        let depends_on_id = req
+            .depends_on_card_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
 
         if card_id == depends_on_id {
@@ -1268,7 +1287,7 @@ impl CardService for CardServiceImpl {
 
         let mut prev_revision = 0i64;
         for row in &rows {
-            let id: Uuid = row.get("id");
+            let id: Id = row.get("id");
             if id == card_id {
                 prev_revision = row.get("revision");
             }
@@ -1325,7 +1344,8 @@ impl CardService for CardServiceImpl {
         request: Request<CardDependencyRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -1334,9 +1354,13 @@ impl CardService for CardServiceImpl {
             return Err(Status::invalid_argument("idempotency_key is required"));
         }
 
-        let card_id = Uuid::parse_str(&req.card_id)
+        let card_id = req
+            .card_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
-        let depends_on_id = Uuid::parse_str(&req.depends_on_card_id)
+        let depends_on_id = req
+            .depends_on_card_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
 
         if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
@@ -1436,7 +1460,8 @@ impl CardService for CardServiceImpl {
         request: Request<BulkUpdateCardLabelsRequest>,
     ) -> Result<Response<BulkUpdateCardLabelsResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let board_id = Uuid::parse_str(&object_id)
+        let board_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let req = request.into_inner();
@@ -1447,16 +1472,16 @@ impl CardService for CardServiceImpl {
             }));
         }
 
-        let card_ids: Vec<Uuid> = req
+        let card_ids: Vec<Id> = req
             .card_ids
             .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
+            .filter_map(|s| s.parse::<Id>().ok())
             .collect();
 
-        let label_ids: Vec<Uuid> = req
+        let label_ids: Vec<Id> = req
             .label_ids
             .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
+            .filter_map(|s| s.parse::<Id>().ok())
             .collect();
 
         // Idempotency.
@@ -1480,7 +1505,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        let mut updated_card_ids: Vec<Uuid> = vec![];
+        let mut updated_card_ids: Vec<Id> = vec![];
 
         for &cid in &card_ids {
             // Verify this card belongs to the board.
@@ -1570,8 +1595,9 @@ impl CardService for CardServiceImpl {
         request: Request<AssignCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         if req.subject.is_empty() {
@@ -1585,7 +1611,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1641,8 +1667,9 @@ impl CardService for CardServiceImpl {
         request: Request<UnassignCardRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
 
@@ -1653,7 +1680,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1708,8 +1735,9 @@ impl CardService for CardServiceImpl {
         request: Request<AddChecklistItemRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         if req.text.is_empty() {
@@ -1723,7 +1751,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1732,7 +1760,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        let item_id = Uuid::new_v4();
+        let item_id = Id::new();
 
         if req.position == 0 {
             // Append.
@@ -1810,11 +1838,14 @@ impl CardService for CardServiceImpl {
         request: Request<UpdateChecklistItemRequest>,
     ) -> Result<Response<Card>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
-        let item_id = Uuid::parse_str(&req.item_id)
+        let item_id = req
+            .item_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid item_id"))?;
         let patch = req.item.unwrap_or_default();
 
@@ -1825,7 +1856,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1891,11 +1922,14 @@ impl CardService for CardServiceImpl {
         request: Request<RemoveChecklistItemRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
-        let item_id = Uuid::parse_str(&req.item_id)
+        let item_id = req
+            .item_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid item_id"))?;
 
         let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
@@ -1905,7 +1939,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -1961,8 +1995,9 @@ impl CardService for CardServiceImpl {
         request: Request<AddCommentRequest>,
     ) -> Result<Response<Comment>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
@@ -1983,7 +2018,7 @@ impl CardService for CardServiceImpl {
                 let payload: Option<serde_json::Value> = r.get("response_payload");
                 if let Some(v) = payload
                     && let Some(comment_id_str) = v.get("comment_id").and_then(|x| x.as_str())
-                    && let Ok(comment_id) = Uuid::parse_str(comment_id_str)
+                    && let Ok(comment_id) = comment_id_str.parse::<Id>()
                 {
                     let comment_row = sqlx::query(
                         "SELECT id, card_id, author_sub, body, created_at, updated_at \
@@ -2007,7 +2042,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -2016,7 +2051,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        let comment_id = Uuid::new_v4();
+        let comment_id = Id::new();
 
         let comment_row = sqlx::query(
             "INSERT INTO comments (id, card_id, author_sub, body) \
@@ -2084,12 +2119,15 @@ impl CardService for CardServiceImpl {
         request: Request<EditCommentRequest>,
     ) -> Result<Response<Comment>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let comment_id = Uuid::parse_str(&req.comment_id)
+        let comment_id = req
+            .comment_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid comment_id"))?;
 
         if req.body.is_empty() {
@@ -2103,7 +2141,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -2166,12 +2204,15 @@ impl CardService for CardServiceImpl {
         request: Request<DeleteCommentRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
-        let comment_id = Uuid::parse_str(&req.comment_id)
+        let comment_id = req
+            .comment_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid comment_id"))?;
 
         let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
@@ -2181,7 +2222,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to fetch card", e))?
             .ok_or_else(|| Status::not_found("card not found"))?;
 
-        let board_id: Uuid = cur.get("board_id");
+        let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
         let mut tx = self
@@ -2251,8 +2292,9 @@ impl CardService for CardServiceImpl {
         request: Request<ListCommentsRequest>,
     ) -> Result<Response<ListCommentsResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let card_id =
-            Uuid::parse_str(&object_id).map_err(|_| Status::invalid_argument("invalid card_id"))?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let req = request.into_inner();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
@@ -2262,11 +2304,12 @@ impl CardService for CardServiceImpl {
             limit
         };
 
-        let cursor_id: Option<Uuid> = if req.cursor.is_empty() {
+        let cursor_id: Option<Id> = if req.cursor.is_empty() {
             None
         } else {
             Some(
-                Uuid::parse_str(&req.cursor)
+                req.cursor
+                    .parse::<Id>()
                     .map_err(|_| Status::invalid_argument("invalid cursor"))?,
             )
         };
@@ -2316,7 +2359,7 @@ impl CardService for CardServiceImpl {
         let next_cursor = if has_more {
             rows.last()
                 .map(|r| {
-                    let id: Uuid = r.get("id");
+                    let id: Id = r.get("id");
                     id.to_string()
                 })
                 .unwrap_or_default()
@@ -2373,13 +2416,12 @@ mod tests {
 
     // ── Seed helpers ─────────────────────────────────────────────────────────
 
-    async fn seed_project(pool: &PgPool, subject: &str, prefix: &str) -> Uuid {
-        let pid = Uuid::new_v4();
-        let slug = format!("tp-{}", &pid.to_string()[..8]);
+    async fn seed_project(pool: &PgPool, subject: &str, prefix: &str) -> Id {
+        let pid = Id::new();
+        let slug = format!("tp-{}", &pid.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO projects (id, name, slug, description, owner_id, prefix) \
-             VALUES ($1, $2, $3, '', $4, $5) \
-             ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, '', $4, $5)",
         )
         .bind(pid)
         .bind(format!("Test Project {pid}"))
@@ -2392,9 +2434,9 @@ mod tests {
         pid
     }
 
-    async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
-        let bid = Uuid::new_v4();
-        let slug = format!("b-{}", &bid.to_string()[..8]);
+    async fn seed_board(pool: &PgPool, project_id: Id) -> Id {
+        let bid = Id::new();
+        let slug = format!("b-{}", &bid.to_string()[18..26]);
         sqlx::query("INSERT INTO boards (id, project_id, name, slug) VALUES ($1, $2, $3, $4)")
             .bind(bid)
             .bind(project_id)
@@ -2406,8 +2448,8 @@ mod tests {
         bid
     }
 
-    async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
-        let cid = Uuid::new_v4();
+    async fn seed_column(pool: &PgPool, board_id: Id) -> Id {
+        let cid = Id::new();
         sqlx::query("INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, $3, 0)")
             .bind(cid)
             .bind(board_id)
@@ -2418,8 +2460,8 @@ mod tests {
         cid
     }
 
-    async fn seed_label(pool: &PgPool, project_id: Uuid, name: &str) -> Uuid {
-        let lid = Uuid::new_v4();
+    async fn seed_label(pool: &PgPool, project_id: Id, name: &str) -> Id {
+        let lid = Id::new();
         sqlx::query(
             "INSERT INTO labels (id, project_id, name, style) VALUES ($1, $2, $3, 'amber') \
              ON CONFLICT (project_id, name) DO NOTHING",
@@ -2440,7 +2482,7 @@ mod tests {
         row.get("id")
     }
 
-    async fn cleanup_project(pool: &PgPool, project_id: Uuid) {
+    async fn cleanup_project(pool: &PgPool, project_id: Id) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
             .execute(pool)
@@ -2455,12 +2497,12 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "REF").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
 
-        let ikey = |n: u8| format!("ikey-{}-{}", Uuid::new_v4(), n);
+        let ikey = |n: u8| format!("ikey-{}-{}", Id::new(), n);
 
         let c1 = svc
             .create_card(authed_request_with_object(
@@ -2523,7 +2565,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid_a = seed_project(&pool, &subject, "ALPHA").await;
         let pid_b = seed_project(&pool, &subject, "BETA").await;
         let bid_a = seed_board(&pool, pid_a).await;
@@ -2537,7 +2579,7 @@ mod tests {
                     board_id: bid_a.to_string(),
                     column_id: col_a.to_string(),
                     title: "Alpha card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2553,7 +2595,7 @@ mod tests {
                     board_id: bid_b.to_string(),
                     column_id: col_b.to_string(),
                     title: "Beta card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2579,11 +2621,11 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "MV").await;
         let bid = seed_board(&pool, pid).await;
         let col_a = seed_column(&pool, bid).await;
-        let col_b_id = Uuid::new_v4();
+        let col_b_id = Id::new();
         sqlx::query(
             "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'In Progress', 1)",
         )
@@ -2599,7 +2641,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: col_a.to_string(),
                     title: "Moving card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2615,7 +2657,7 @@ mod tests {
                     card_id: card.id.clone(),
                     to_column_id: col_b_id.to_string(),
                     to_position: 1,
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &card.id,
@@ -2640,7 +2682,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid_a = seed_project(&pool, &subject, "PA").await;
         let pid_b = seed_project(&pool, &subject, "PB").await;
         let bid_a = seed_board(&pool, pid_a).await;
@@ -2654,7 +2696,7 @@ mod tests {
                     board_id: bid_a.to_string(),
                     column_id: col_a.to_string(),
                     title: "Cross-project card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2670,7 +2712,7 @@ mod tests {
                     card_id: card.id.clone(),
                     to_column_id: col_b.to_string(),
                     to_position: 1,
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &card.id,
@@ -2694,11 +2736,11 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "IMP").await;
         let bid = seed_board(&pool, pid).await;
         let col_a = seed_column(&pool, bid).await;
-        let col_b_id = Uuid::new_v4();
+        let col_b_id = Id::new();
         sqlx::query(
             "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'Done', 1)",
         )
@@ -2714,7 +2756,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: col_a.to_string(),
                     title: "Idempotent move".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2724,7 +2766,7 @@ mod tests {
             .expect("create failed")
             .into_inner();
 
-        let move_key = Uuid::new_v4().to_string();
+        let move_key = Id::new().to_string();
         let first = svc
             .move_card(authed_request_with_object(
                 MoveCardRequest {
@@ -2769,7 +2811,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UPD").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -2780,7 +2822,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Original".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2790,7 +2832,7 @@ mod tests {
             .expect("create failed")
             .into_inner();
 
-        let card_uuid = Uuid::parse_str(&card.id).unwrap();
+        let card_id = card.id.parse::<Id>().unwrap();
 
         let updated = svc
             .update_card(authed_request_with_object(
@@ -2801,7 +2843,7 @@ mod tests {
                         ..Default::default()
                     }),
                     update_mask: None,
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &card.id,
@@ -2825,7 +2867,7 @@ mod tests {
         assert!(event_count >= 1, "at least one CardUpdated event_log row");
 
         cleanup_project(&pool, pid).await;
-        let _ = card_uuid;
+        let _ = card_id;
     }
 
     #[tokio::test]
@@ -2834,7 +2876,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEL").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -2846,7 +2888,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "To Delete".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2856,7 +2898,7 @@ mod tests {
             .expect("create failed")
             .into_inner();
 
-        let card_uuid = Uuid::parse_str(&card.id).unwrap();
+        let card_id = card.id.parse::<Id>().unwrap();
 
         // Add assignee, label, checklist item, comment.
         svc.assign_card(authed_request_with_object(
@@ -2871,7 +2913,7 @@ mod tests {
         .expect("assign failed");
 
         sqlx::query("INSERT INTO card_labels (card_id, label_id) VALUES ($1, $2)")
-            .bind(card_uuid)
+            .bind(card_id)
             .bind(label_id)
             .execute(&pool)
             .await
@@ -2893,7 +2935,7 @@ mod tests {
             AddCommentRequest {
                 card_id: card.id.clone(),
                 body: "hello".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
+                idempotency_key: Id::new().to_string(),
             },
             &subject,
             &card.id,
@@ -2917,7 +2959,7 @@ mod tests {
             let pool = pool.clone();
             async move {
                 sqlx::query(&format!("SELECT COUNT(*) FROM {table} WHERE card_id = $1"))
-                    .bind(card_uuid)
+                    .bind(card_id)
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -2939,7 +2981,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "BUL").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -2951,7 +2993,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "C1".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2967,7 +3009,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "C2".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -2982,7 +3024,7 @@ mod tests {
                 BulkUpdateCardLabelsRequest {
                     card_ids: vec![card1.id.clone(), card2.id.clone()],
                     label_ids: vec![label_id.to_string()],
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid.to_string(),
@@ -3019,7 +3061,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "ASN").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3030,7 +3072,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Assign me".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3063,7 +3105,7 @@ mod tests {
         .await
         .expect("assign 2 failed");
 
-        let c = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap())
+        let c = fetch_full_card(&pool, card.id.parse::<Id>().unwrap())
             .await
             .unwrap();
         assert_eq!(c.assignees.len(), 1, "duplicate assign must be idempotent");
@@ -3077,7 +3119,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHK").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3088,7 +3130,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3113,7 +3155,7 @@ mod tests {
             .expect("add checklist failed");
         }
 
-        let updated = fetch_full_card(&pool, Uuid::parse_str(&card.id).unwrap())
+        let updated = fetch_full_card(&pool, card.id.parse::<Id>().unwrap())
             .await
             .unwrap();
         assert_eq!(updated.checklist.len(), 3);
@@ -3136,7 +3178,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CMT").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3147,7 +3189,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Comment card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3162,7 +3204,7 @@ mod tests {
                 AddCommentRequest {
                     card_id: card.id.clone(),
                     body: "original body".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &card.id,
@@ -3213,8 +3255,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let author = format!("user:author-{}", Uuid::new_v4());
-        let other = format!("user:other-{}", Uuid::new_v4());
+        let author = format!("user:author-{}", Id::new());
+        let other = format!("user:other-{}", Id::new());
 
         let pid = seed_project(&pool, &author, "DCM").await;
         let bid = seed_board(&pool, pid).await;
@@ -3226,7 +3268,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Auth card".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &author,
@@ -3241,7 +3283,7 @@ mod tests {
                 AddCommentRequest {
                     card_id: card.id.clone(),
                     body: "author comment".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &author,
                 &card.id,
@@ -3281,7 +3323,7 @@ mod tests {
 
         // Verify comment is gone.
         let count: i64 = sqlx::query("SELECT COUNT(*) FROM comments WHERE id = $1")
-            .bind(Uuid::parse_str(&comment.id).unwrap())
+            .bind(comment.id.parse::<Id>().unwrap())
             .fetch_one(&pool)
             .await
             .unwrap()
@@ -3299,7 +3341,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "GET").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3310,7 +3352,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Get me".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3344,7 +3386,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "BATCH").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3355,7 +3397,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Batch".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3369,7 +3411,7 @@ mod tests {
             .batch_get_cards(authed_request_with_object(
                 BatchGetCardsRequest {
                     board_id: bid.to_string(),
-                    card_ids: vec![card.id.clone(), Uuid::new_v4().to_string()],
+                    card_ids: vec![card.id.clone(), Id::new().to_string()],
                 },
                 &subject,
                 &bid.to_string(),
@@ -3390,7 +3432,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "LIST").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3401,7 +3443,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: format!("Card {i}"),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3438,7 +3480,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UNA").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3449,7 +3491,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Assigned".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3497,7 +3539,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHKU").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3508,7 +3550,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3572,7 +3614,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHKR").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3583,7 +3625,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3646,7 +3688,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "COMM").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3657,7 +3699,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Comments".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3671,7 +3713,7 @@ mod tests {
             AddCommentRequest {
                 card_id: card.id.clone(),
                 body: "first".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
+                idempotency_key: Id::new().to_string(),
             },
             &subject,
             &card.id,
@@ -3705,7 +3747,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "URG").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3717,7 +3759,7 @@ mod tests {
                     column_id: cid.to_string(),
                     title: "Urgent".to_string(),
                     urgency: 4, // critical
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3751,7 +3793,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEF").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3762,7 +3804,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Default urgency".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3783,7 +3825,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UUP").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3794,7 +3836,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Update urgency".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3813,7 +3855,7 @@ mod tests {
                         ..Default::default()
                     }),
                     update_mask: None,
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &card.id,
@@ -3834,7 +3876,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "PRI").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3846,7 +3888,7 @@ mod tests {
                     column_id: cid.to_string(),
                     title: "Priority enum".to_string(),
                     priority: 3, // high
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3867,7 +3909,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEP").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3878,7 +3920,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3894,7 +3936,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3909,7 +3951,7 @@ mod tests {
                 CardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid.to_string(),
@@ -3942,7 +3984,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "REM").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -3953,7 +3995,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3969,7 +4011,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -3983,7 +4025,7 @@ mod tests {
             CardDependencyRequest {
                 card_id: card_a.id.clone(),
                 depends_on_card_id: card_b.id.clone(),
-                idempotency_key: Uuid::new_v4().to_string(),
+                idempotency_key: Id::new().to_string(),
             },
             &subject,
             &bid.to_string(),
@@ -3996,7 +4038,7 @@ mod tests {
                 CardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid.to_string(),
@@ -4029,7 +4071,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "SDP").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -4040,7 +4082,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Self".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4055,7 +4097,7 @@ mod tests {
                 CardDependencyRequest {
                     card_id: card.id.clone(),
                     depends_on_card_id: card.id.clone(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid.to_string(),
@@ -4074,7 +4116,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CRB").await;
         let bid_a = seed_board(&pool, pid).await;
         let cid_a = seed_column(&pool, bid_a).await;
@@ -4087,7 +4129,7 @@ mod tests {
                     board_id: bid_a.to_string(),
                     column_id: cid_a.to_string(),
                     title: "A".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4103,7 +4145,7 @@ mod tests {
                     board_id: bid_b.to_string(),
                     column_id: cid_b.to_string(),
                     title: "B".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4118,7 +4160,7 @@ mod tests {
                 CardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid_a.to_string(),
@@ -4137,7 +4179,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DID").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -4148,7 +4190,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4164,7 +4206,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4174,7 +4216,7 @@ mod tests {
             .expect("create b failed")
             .into_inner();
 
-        let key = Uuid::new_v4().to_string();
+        let key = Id::new().to_string();
         svc.add_card_dependency(authed_request_with_object(
             CardDependencyRequest {
                 card_id: card_a.id.clone(),
@@ -4212,7 +4254,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto));
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEV").await;
         let bid = seed_board(&pool, pid).await;
         let cid = seed_column(&pool, bid).await;
@@ -4223,7 +4265,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4239,7 +4281,7 @@ mod tests {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                     ..Default::default()
                 },
                 &subject,
@@ -4254,7 +4296,7 @@ mod tests {
                 CardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
-                    idempotency_key: Uuid::new_v4().to_string(),
+                    idempotency_key: Id::new().to_string(),
                 },
                 &subject,
                 &bid.to_string(),

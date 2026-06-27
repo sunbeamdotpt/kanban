@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::id::Id;
 use anyhow::{Result, anyhow};
 use async_nats::jetstream::consumer::push;
 use parking_lot::RwLock;
@@ -30,7 +31,6 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::mq::NatsClient;
 
@@ -154,7 +154,7 @@ impl BoardSubscriberRegistry {
         }
 
         // Slow path: open a new push consumer and insert a new channel.
-        let stream_id = Uuid::new_v4().simple().to_string();
+        let stream_id = Id::new().to_string();
         let consumer_name = live_tail_consumer_name(board_id, &self.pod_id, &stream_id);
         let subject = board_subject(board_id);
         let deliver_inbox = self.nats.client().new_inbox();
@@ -365,7 +365,7 @@ mod tests {
         let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
-        let board_id = format!("test-board-{}", Uuid::new_v4().simple());
+        let board_id = format!("test-board-{}", Id::new());
         let registry = Arc::new(BoardSubscriberRegistry::new(
             Arc::clone(&nats),
             "pod-test-1",
@@ -394,7 +394,7 @@ mod tests {
         let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
-        let board_id = format!("test-board-{}", Uuid::new_v4().simple());
+        let board_id = format!("test-board-{}", Id::new());
         let registry = Arc::new(BoardSubscriberRegistry::new(
             Arc::clone(&nats),
             "pod-test-2",
@@ -444,7 +444,7 @@ mod tests {
         let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
-        let board_id = format!("test-board-{}", Uuid::new_v4().simple());
+        let board_id = format!("test-board-{}", Id::new());
         let registry = Arc::new(BoardSubscriberRegistry::new(
             Arc::clone(&nats),
             "pod-test-3",
@@ -504,8 +504,8 @@ mod tests {
         let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
-        let board_a = format!("test-board-{}", Uuid::new_v4().simple());
-        let board_b = format!("test-board-{}", Uuid::new_v4().simple());
+        let board_a = format!("test-board-{}", Id::new());
+        let board_b = format!("test-board-{}", Id::new());
         let registry = Arc::new(BoardSubscriberRegistry::new(
             Arc::clone(&nats),
             "pod-test-4",
@@ -546,7 +546,7 @@ mod tests {
         let nats = setup_nats().await;
         ensure_stream(&nats).await;
 
-        let board_id = format!("test-board-{}", Uuid::new_v4().simple());
+        let board_id = format!("test-board-{}", Id::new());
         let registry = Arc::new(BoardSubscriberRegistry::new(
             Arc::clone(&nats),
             "pod-test-5",

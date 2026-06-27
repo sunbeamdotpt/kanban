@@ -119,7 +119,7 @@ The outbox also embeds `POD_NAME` in every emitted event envelope.
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `POD_NAME` | `--pod-name` | random UUID | Stable pod identity used when naming NATS consumers and emitted event envelopes. In Kubernetes, set this from `metadata.name` via the downward API. |
+| `POD_NAME` | `--pod-name` | random ULID | Stable pod identity used when naming NATS consumers and emitted event envelopes. In Kubernetes, set this from `metadata.name` via the downward API. |
 
 ## Example Kubernetes objects
 

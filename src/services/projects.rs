@@ -17,6 +17,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::id::Id;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
 use sqlx::PgPool;
@@ -24,7 +25,6 @@ use sqlx::Row;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
-use uuid::Uuid;
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 use sunbeam_g2v::middleware::auth::keto::KetoClient;
@@ -86,7 +86,7 @@ fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
 
 /// Convert a Postgres row into a `Project` proto.
 fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
-    let id: Uuid = row.get("id");
+    let id: Id = row.get("id");
     let name: String = row.get("name");
     let slug: String = row.get("slug");
     let description: Option<String> = row.get("description");
@@ -108,7 +108,7 @@ fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
 
 /// Convert a Postgres row into a `ProjectMember` proto.
 fn member_from_row(row: &sqlx::postgres::PgRow) -> ProjectMember {
-    let project_id: Uuid = row.get("project_id");
+    let project_id: Id = row.get("project_id");
     let user_id: String = row.get("user_id");
     let role: String = row.get("role");
     let created_at: DateTime<Utc> = row.get("created_at");
@@ -123,7 +123,7 @@ fn member_from_row(row: &sqlx::postgres::PgRow) -> ProjectMember {
     }
 }
 
-async fn fetch_member_count(pool: &PgPool, project_id: Uuid) -> i32 {
+async fn fetch_member_count(pool: &PgPool, project_id: Id) -> i32 {
     sqlx::query("SELECT COUNT(*) AS cnt FROM project_members WHERE project_id = $1")
         .bind(project_id)
         .fetch_one(pool)
@@ -155,7 +155,7 @@ impl ProjectService for ProjectServiceImpl {
 
         // Idempotency check — look up by key; if found, re-fetch the project from DB.
         if !req.idempotency_key.is_empty() {
-            let cached_id: Option<Option<Uuid>> =
+            let cached_id: Option<Option<Id>> =
                 sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
                     .bind(&req.idempotency_key)
                     .fetch_optional(&self.pool)
@@ -197,7 +197,7 @@ impl ProjectService for ProjectServiceImpl {
             req.prefix.to_uppercase()
         };
 
-        let project_id = Uuid::new_v4();
+        let project_id = Id::new();
 
         // INSERT project.
         let row = sqlx::query(
@@ -277,7 +277,8 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<GetProjectRequest>,
     ) -> Result<Response<Project>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let row = sqlx::query(
@@ -318,22 +319,22 @@ impl ProjectService for ProjectServiceImpl {
             return Ok(Response::new(ListProjectsResponse { projects: vec![] }));
         }
 
-        let ids: Vec<Uuid> = visible_ids
+        let ids: Vec<Id> = visible_ids
             .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
+            .filter_map(|s| s.parse::<Id>().ok())
             .collect();
 
         let rows = sqlx::query(
             "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE id = ANY($1)",
         )
-        .bind(&ids as &[Uuid])
+        .bind(&ids as &[Id])
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list projects", e))?;
 
         let mut projects = Vec::with_capacity(rows.len());
         for row in &rows {
-            let pid: Uuid = row.get("id");
+            let pid: Id = row.get("id");
             let member_count = fetch_member_count(&self.pool, pid).await;
             projects.push(project_from_row(row, member_count));
         }
@@ -348,7 +349,8 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<UpdateProjectRequest>,
     ) -> Result<Response<Project>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let req = request.into_inner();
@@ -386,7 +388,8 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<DeleteProjectRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let result = sqlx::query("DELETE FROM projects WHERE id = $1")
@@ -415,7 +418,8 @@ impl ProjectService for ProjectServiceImpl {
 
     async fn add_member(&self, request: Request<AddMemberRequest>) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let req = request.into_inner();
@@ -477,7 +481,8 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<RemoveMemberRequest>,
     ) -> Result<Response<()>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let req = request.into_inner();
@@ -537,7 +542,8 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<ListMembersRequest>,
     ) -> Result<Response<ListMembersResponse>, Status> {
         let object_id = checked_object_id(&request)?;
-        let project_id = Uuid::parse_str(&object_id)
+        let project_id = object_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
@@ -640,7 +646,7 @@ mod tests {
     }
 
     /// Delete a project row directly during test cleanup.
-    async fn cleanup_project(pool: &PgPool, project_id: Uuid) {
+    async fn cleanup_project(pool: &PgPool, project_id: Id) {
         let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(project_id)
             .execute(pool)
@@ -655,7 +661,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -680,7 +686,7 @@ mod tests {
         assert!(created.created_at.is_some());
         assert!(created.updated_at.is_some());
 
-        let project_id = Uuid::parse_str(&created.id).expect("invalid uuid from create");
+        let project_id = created.id.parse::<Id>().expect("invalid id from create");
 
         let fetched = svc
             .get_project(authed_request_with_object(
@@ -710,12 +716,12 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject_a = format!("user:test-a-{}", Uuid::new_v4());
-        let subject_b = format!("user:test-b-{}", Uuid::new_v4());
+        let subject_a = format!("user:test-a-{}", Id::new());
+        let subject_b = format!("user:test-b-{}", Id::new());
 
         // Unique prefix suffix so repeated test runs (or retries) don't collide
         // on the global shared Postgres instance.
-        let suffix = Uuid::new_v4().simple().to_string()[..6].to_uppercase();
+        let suffix = Id::new().to_string()[20..26].to_uppercase();
         let mut project_ids_a = Vec::new();
 
         // User A creates 3 projects.
@@ -735,7 +741,7 @@ mod tests {
                 .await
                 .expect("create failed")
                 .into_inner();
-            project_ids_a.push(Uuid::parse_str(&p.id).unwrap());
+            project_ids_a.push(p.id.parse::<Id>().unwrap());
         }
 
         // User B creates 1 project.
@@ -754,7 +760,7 @@ mod tests {
             .await
             .expect("create failed")
             .into_inner();
-        let project_id_b = Uuid::parse_str(&pb.id).unwrap();
+        let project_id_b = pb.id.parse::<Id>().unwrap();
 
         // User A sees exactly 3 projects.
         let list_a = svc
@@ -809,7 +815,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -862,7 +868,7 @@ mod tests {
         assert_eq!(updated.prefix, "ORIG", "prefix should be unchanged");
 
         // Cleanup
-        let pid = Uuid::parse_str(&project_id).unwrap();
+        let pid = project_id.parse::<Id>().unwrap();
         cleanup_project(&pool, pid).await;
         cleanup_keto_for_subject(&keto, &subject).await;
     }
@@ -873,7 +879,7 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -892,10 +898,10 @@ mod tests {
             .into_inner();
 
         let project_id = created.id.clone();
-        let pid = Uuid::parse_str(&project_id).unwrap();
+        let pid = project_id.parse::<Id>().unwrap();
 
         // Verify it exists before delete.
-        let before: Option<Uuid> = sqlx::query("SELECT id FROM projects WHERE id = $1")
+        let before: Option<Id> = sqlx::query("SELECT id FROM projects WHERE id = $1")
             .bind(pid)
             .fetch_optional(&pool)
             .await
@@ -914,7 +920,7 @@ mod tests {
         .expect("delete_project failed");
 
         // Verify row is gone.
-        let after: Option<Uuid> = sqlx::query("SELECT id FROM projects WHERE id = $1")
+        let after: Option<Id> = sqlx::query("SELECT id FROM projects WHERE id = $1")
             .bind(pid)
             .fetch_optional(&pool)
             .await
@@ -932,8 +938,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-owner-{}", Uuid::new_v4());
-        let member = format!("user:test-member-{}", Uuid::new_v4());
+        let owner = format!("user:test-owner-{}", Id::new());
+        let member = format!("user:test-member-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -952,7 +958,7 @@ mod tests {
             .into_inner();
 
         let project_id = created.id.clone();
-        let pid = Uuid::parse_str(&project_id).unwrap();
+        let pid = project_id.parse::<Id>().unwrap();
 
         svc.add_member(authed_request_with_object(
             AddMemberRequest {
@@ -997,8 +1003,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-owner-{}", Uuid::new_v4());
-        let member = format!("user:test-member-{}", Uuid::new_v4());
+        let owner = format!("user:test-owner-{}", Id::new());
+        let member = format!("user:test-member-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -1017,7 +1023,7 @@ mod tests {
             .into_inner();
 
         let project_id = created.id.clone();
-        let pid = Uuid::parse_str(&project_id).unwrap();
+        let pid = project_id.parse::<Id>().unwrap();
 
         // Add then remove.
         svc.add_member(authed_request_with_object(
@@ -1078,8 +1084,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let owner = format!("user:test-owner-{}", Uuid::new_v4());
-        let viewer = format!("user:test-viewer-{}", Uuid::new_v4());
+        let owner = format!("user:test-owner-{}", Id::new());
+        let viewer = format!("user:test-viewer-{}", Id::new());
 
         let created = svc
             .create_project(authed_request(
@@ -1098,7 +1104,7 @@ mod tests {
             .into_inner();
 
         let project_id = created.id.clone();
-        let pid = Uuid::parse_str(&project_id).unwrap();
+        let pid = project_id.parse::<Id>().unwrap();
 
         svc.add_member(authed_request_with_object(
             AddMemberRequest {
@@ -1159,8 +1165,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
-        let idem_key = format!("idem-test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
+        let idem_key = format!("idem-test-{}", Id::new());
 
         let make_req = || {
             authed_request(
@@ -1196,7 +1202,7 @@ mod tests {
         assert_eq!(first.name, second.name);
 
         // Cleanup
-        let pid = Uuid::parse_str(&first.id).unwrap();
+        let pid = first.id.parse::<Id>().unwrap();
         cleanup_project(&pool, pid).await;
         let _ = sqlx::query("DELETE FROM idempotency_keys WHERE key = $1")
             .bind(&idem_key)
@@ -1214,8 +1220,8 @@ mod tests {
         let keto = setup_keto().await;
         let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
 
-        let subject = format!("user:test-{}", Uuid::new_v4());
-        let project_id = Uuid::new_v4().to_string();
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = Id::new().to_string();
 
         let mut req = Request::new(SubscribeProjectRequest {
             project_id: project_id.clone(),

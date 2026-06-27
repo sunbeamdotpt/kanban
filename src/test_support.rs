@@ -7,30 +7,30 @@
 //!
 //! # Seeder contract
 //!
-//! Every `seed_*` function generates fresh UUIDs, so tests running in parallel
+//! Every `seed_*` function generates fresh ULIDs, so tests running in parallel
 //! (for example under nextest) never collide on unique constraints.
 //!
 //! # Teardown
 //!
 //! Tests clean up after themselves. The seeders do not wrap inserts in a
-//! transaction that gets rolled back; instead we rely on random UUIDs to keep
+//! transaction that gets rolled back; instead we rely on random ULIDs to keep
 //! tests isolated on a shared Postgres instance.
 
+use crate::id::Id;
 use sqlx::{PgPool, Row};
-use uuid::Uuid;
 
 /// Create a minimal project and return its id.
-pub(crate) async fn seed_project(pool: &PgPool) -> Uuid {
-    let project_id = Uuid::new_v4();
-    let suffix = project_id.simple().to_string();
+pub(crate) async fn seed_project(pool: &PgPool) -> Id {
+    let project_id = Id::new();
+    let suffix = project_id.to_string();
 
     sqlx::query(
         "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at)
          VALUES ($1, $2, $3, 'user:test', now(), now())",
     )
     .bind(project_id)
-    .bind(format!("test-proj-{}", &suffix[0..8]))
-    .bind(suffix[0..12].to_lowercase())
+    .bind(format!("test-proj-{}", &suffix[18..26]))
+    .bind(suffix[14..26].to_lowercase())
     .execute(pool)
     .await
     .expect("seed_project: INSERT failed");
@@ -39,9 +39,9 @@ pub(crate) async fn seed_project(pool: &PgPool) -> Uuid {
 }
 
 /// Create a minimal board under `project_id` and return its id.
-pub(crate) async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
-    let board_id = Uuid::new_v4();
-    let suffix = board_id.simple().to_string();
+pub(crate) async fn seed_board(pool: &PgPool, project_id: Id) -> Id {
+    let board_id = Id::new();
+    let suffix = board_id.to_string();
 
     sqlx::query(
         "INSERT INTO boards (id, project_id, name, slug, created_at, updated_at)
@@ -49,8 +49,8 @@ pub(crate) async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
     )
     .bind(board_id)
     .bind(project_id)
-    .bind(format!("test-board-{}", &suffix[0..8]))
-    .bind(suffix[0..12].to_lowercase())
+    .bind(format!("test-board-{}", &suffix[18..26]))
+    .bind(suffix[14..26].to_lowercase())
     .execute(pool)
     .await
     .expect("seed_board: INSERT failed");
@@ -59,8 +59,8 @@ pub(crate) async fn seed_board(pool: &PgPool, project_id: Uuid) -> Uuid {
 }
 
 /// Create a minimal column under `board_id` and return its id.
-pub(crate) async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
-    let column_id = Uuid::new_v4();
+pub(crate) async fn seed_column(pool: &PgPool, board_id: Id) -> Id {
+    let column_id = Id::new();
 
     sqlx::query(
         "INSERT INTO columns (id, board_id, title, position, created_at, updated_at)
@@ -77,14 +77,9 @@ pub(crate) async fn seed_column(pool: &PgPool, board_id: Uuid) -> Uuid {
 
 /// Create a minimal card under `board_id`, `column_id`, and `project_id` and
 /// return its id.
-pub(crate) async fn seed_card(
-    pool: &PgPool,
-    board_id: Uuid,
-    column_id: Uuid,
-    project_id: Uuid,
-) -> Uuid {
-    let card_id = Uuid::new_v4();
-    let card_suffix = card_id.simple().to_string();
+pub(crate) async fn seed_card(pool: &PgPool, board_id: Id, column_id: Id, project_id: Id) -> Id {
+    let card_id = Id::new();
+    let card_suffix = card_id.to_string();
 
     sqlx::query(
         "INSERT INTO cards \
@@ -96,7 +91,7 @@ pub(crate) async fn seed_card(
     .bind(board_id)
     .bind(column_id)
     .bind(project_id)
-    .bind(format!("T{}", &card_suffix[0..6].to_uppercase()))
+    .bind(format!("T{}", &card_suffix[20..26].to_uppercase()))
     .execute(pool)
     .await
     .expect("seed_card: INSERT failed");
@@ -106,9 +101,9 @@ pub(crate) async fn seed_card(
 
 /// Create a complete project → board → column → card chain.
 ///
-/// Returns `(project_id, board_id, column_id, card_id)` with fresh UUIDs so
+/// Returns `(project_id, board_id, column_id, card_id)` with fresh ULIDs so
 /// parallel tests stay independent.
-pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Id, Id, Id, Id) {
     let project_id = seed_project(pool).await;
     let board_id = seed_board(pool, project_id).await;
     let column_id = seed_column(pool, board_id).await;
@@ -119,12 +114,14 @@ pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
 /// Insert a raw `event_log` row for testing the outbox dispatcher.
 ///
 /// Returns the inserted row's id.
-pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Uuid, event_type: &str) -> Uuid {
+pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Id, event_type: &str) -> Id {
+    let row_id = Id::new();
     let row = sqlx::query(
         "INSERT INTO event_log (id, board_id, event_type, payload, created_at)
-         VALUES (gen_random_uuid(), $1, $2, '{}'::jsonb, now())
+         VALUES ($1, $2, $3, '{}'::jsonb, now())
          RETURNING id",
     )
+    .bind(row_id)
     .bind(board_id)
     .bind(event_type)
     .fetch_one(pool)
@@ -139,16 +136,18 @@ pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Uuid, event_type: &s
 /// Returns the inserted row's id.
 pub(crate) async fn seed_event_log_dispatched(
     pool: &PgPool,
-    board_id: Uuid,
+    board_id: Id,
     event_type: &str,
     nats_seq: i64,
-) -> Uuid {
+) -> Id {
+    let row_id = Id::new();
     let row = sqlx::query(
         "INSERT INTO event_log \
          (id, board_id, event_type, payload, nats_seq, dispatched_at, created_at)
-         VALUES (gen_random_uuid(), $1, $2, '{}'::jsonb, $3, now(), now())
+         VALUES ($1, $2, $3, '{}'::jsonb, $4, now(), now())
          RETURNING id",
     )
+    .bind(row_id)
     .bind(board_id)
     .bind(event_type)
     .bind(nats_seq)
@@ -172,6 +171,18 @@ pub async fn setup_pool() -> PgPool {
 #[cfg(test)]
 pub async fn setup_keto() -> std::sync::Arc<sunbeam_g2v::middleware::auth::keto::KetoClient> {
     containers::setup().await.keto.clone()
+}
+
+/// Start the shared testcontainers stack (if not already started) and return an
+/// OpenSearch client.
+#[cfg(test)]
+pub async fn setup_opensearch() -> std::sync::Arc<crate::integrations::opensearch::OpenSearchClient>
+{
+    use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
+    containers::setup().await;
+    let url =
+        std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
+    std::sync::Arc::new(OpenSearchClient::new(OpenSearchConfig { url }))
 }
 
 // ── Testcontainers-backed dependency harness ───────────────────────────────

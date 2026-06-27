@@ -5,9 +5,9 @@
 //! every handler must confirm the requested board's visibility is exactly
 //! `public` before returning anything.
 
+use crate::id::Id;
 use sqlx::Row;
 use tonic::{Request, Response, Status};
-use uuid::Uuid;
 
 use crate::pb::public_board_service_server::PublicBoardService;
 use crate::pb::{GetPublicBoardRequest, ListBoardsResponse, ListPublicBoardsRequest};
@@ -30,7 +30,9 @@ impl PublicBoardService for PublicBoardServiceImpl {
         request: Request<GetPublicBoardRequest>,
     ) -> Result<Response<crate::pb::Board>, Status> {
         let req = request.into_inner();
-        let board_id = Uuid::parse_str(&req.board_id)
+        let board_id = req
+            .board_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let row = sqlx::query(
@@ -61,7 +63,9 @@ impl PublicBoardService for PublicBoardServiceImpl {
         request: Request<ListPublicBoardsRequest>,
     ) -> Result<Response<ListBoardsResponse>, Status> {
         let req = request.into_inner();
-        let project_id = Uuid::parse_str(&req.project_id)
+        let project_id = req
+            .project_id
+            .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
@@ -75,7 +79,7 @@ impl PublicBoardService for PublicBoardServiceImpl {
 
         let mut boards = Vec::with_capacity(rows.len());
         for row in &rows {
-            let bid: Uuid = row.get("id");
+            let bid: Id = row.get("id");
             let columns_count = fetch_columns_count(&self.pool, bid).await;
             let cards_count = fetch_cards_count(&self.pool, bid).await;
             boards.push(board_from_row(row, columns_count, cards_count));
@@ -88,8 +92,8 @@ impl PublicBoardService for PublicBoardServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::Id;
     use tonic::Request;
-    use uuid::Uuid;
 
     use crate::pb::public_board_service_server::PublicBoardService;
     use crate::services::visibility::DEFAULT_VISIBILITY;
@@ -106,9 +110,9 @@ mod tests {
         Request::new(body)
     }
 
-    async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let pid = Uuid::new_v4();
-        let slug = format!("tp-{}", &pid.to_string()[..8]);
+    async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Id {
+        let pid = Id::new();
+        let slug = format!("tp-{}", &pid.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
         )
@@ -122,14 +126,9 @@ mod tests {
         pid
     }
 
-    async fn insert_board(
-        pool: &sqlx::PgPool,
-        project_id: Uuid,
-        name: &str,
-        visibility: &str,
-    ) -> Uuid {
-        let board_id = Uuid::new_v4();
-        let slug = format!("bd-{}", &board_id.to_string()[..8]);
+    async fn insert_board(pool: &sqlx::PgPool, project_id: Id, name: &str, visibility: &str) -> Id {
+        let board_id = Id::new();
+        let slug = format!("bd-{}", &board_id.to_string()[18..26]);
         sqlx::query(
             "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
              VALUES ($1, $2, $3, $4, '', '', $5)",
@@ -149,7 +148,7 @@ mod tests {
     async fn get_public_board_returns_public_board_without_auth() {
         let infra = containers::setup().await;
         let svc = make_service(&infra);
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let board_id = insert_board(&infra.pool, project_id, "Public Board", "public").await;
 
@@ -169,7 +168,7 @@ mod tests {
     async fn get_public_board_hides_internal_and_private_boards() {
         let infra = containers::setup().await;
         let svc = make_service(&infra);
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let internal_id = insert_board(&infra.pool, project_id, "Internal Board", "internal").await;
         let private_id =
@@ -197,7 +196,7 @@ mod tests {
     async fn list_public_boards_returns_only_public_boards() {
         let infra = containers::setup().await;
         let svc = make_service(&infra);
-        let subject = format!("user:test-{}", Uuid::new_v4());
+        let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
 
         let public_id = insert_board(&infra.pool, project_id, "Public Board", "public").await;
