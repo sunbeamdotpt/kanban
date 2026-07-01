@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+version: v2
+modules:
+  - path: proto
+    name: buf.build/sunbeamdotpt/kanban
+    excludes:
+      # Vendored Ory Keto protos; kept for the Rust tonic-prost build but not
+      # part of the published Sunbeam Kanban module.
+      - proto/ory
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

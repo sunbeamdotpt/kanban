@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: buf
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+      - '.github/workflows/buf.yml'
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+      - '.github/workflows/buf.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run buf lint
+        uses: bufbuild/buf-action@v1
+        with:
+          version: latest
+          lint: true
+          breaking: false
