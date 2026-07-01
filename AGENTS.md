@@ -80,19 +80,25 @@ cargo test
 cargo run --bin keto-coverage
 ```
 
-**Recommended:** run `./test.sh` for a self-contained test stack. It detects the available container runtime, starts Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch, runs migrations, creates the MinIO bucket, exports the standard env vars, and runs `cargo test`:
+**Integration tests** use testcontainers to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically, run migrations, create the MinIO bucket, and export the standard env vars. Run them directly with Cargo:
 
 ```sh
-./test.sh                    # full suite
-./test.sh services::boards   # run a subset
-./test.sh --coverage         # cargo llvm-cov + summary
+cargo test                    # full suite
+cargo test services::boards   # run a subset
+cargo llvm-cov test           # coverage (requires cargo-llvm-cov)
 ```
 
-**macOS with lima-docker:** if your Docker context points to a Lima VM, `test.sh` (and `cargo test` directly) will not auto-detect the socket. Export `DOCKER_HOST` first:
+The harness auto-detects common Docker-compatible sockets (socktainer, lima-docker, Docker Desktop, and `/var/run/docker.sock`). If auto-detection fails, set `DOCKER_HOST` explicitly:
 
 ```sh
 export DOCKER_HOST="unix://${HOME}/.lima/docker/sock/docker.sock"
-./test.sh
+cargo test
+```
+
+Override container images via environment variables when needed:
+
+```sh
+KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 ```
 
 **Important:** `cargo check` must **not** require a live `DATABASE_URL`. All SQL is written with the dynamic `sqlx` API (e.g., `sqlx::query(...)`) — never `sqlx::query!` or `query_as!` macros.

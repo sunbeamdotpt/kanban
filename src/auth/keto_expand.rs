@@ -142,7 +142,7 @@ mod tests {
     ///
     /// Must be declared in the Keto namespace config for the dev instance.
     /// `KanbanProject` is present in both the production OPL config and the
-    /// legacy in-memory config used by `test.sh`.
+    /// legacy in-memory config used by the testcontainers harness.
     const NS: &str = "KanbanProject";
     const RELATION: &str = "view";
 

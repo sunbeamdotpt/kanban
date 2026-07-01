@@ -19,21 +19,25 @@ Rust tests are inline inside `#[cfg(test)]` modules at the bottom of each source
 
 ### Run the suite
 
-The easiest way to run tests is the provided wrapper:
+Integration tests use `testcontainers` to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically, run migrations, and export the standard env vars. Run them directly with Cargo:
 
 ```sh
-./test.sh                    # full suite
-./test.sh services::boards   # filter by module path
-./test.sh --coverage         # cargo llvm-cov + summary
+cargo test                    # full suite
+cargo test services::boards   # filter by module path
+cargo llvm-cov test           # coverage (requires cargo-llvm-cov)
 ```
 
-`test.sh` uses `testcontainers` to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically. It detects the local container socket (Docker, Podman, OrbStack, or Apple Container's `container`) and points `DOCKER_HOST` at it.
-
-On macOS with a Lima-based Docker context (e.g. `lima-docker`), auto-detection does not work. Set `DOCKER_HOST` manually:
+The harness auto-detects common Docker-compatible sockets (socktainer, lima-docker, Docker Desktop, and `/var/run/docker.sock`). If auto-detection fails, set `DOCKER_HOST` manually:
 
 ```sh
 export DOCKER_HOST="unix://${HOME}/.lima/docker/sock/docker.sock"
-./test.sh
+cargo test
+```
+
+Override container images via environment variables when needed:
+
+```sh
+KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 ```
 
 ### Reusing an existing stack
@@ -67,7 +71,7 @@ Use the shared harness:
 #[tokio::test]
 async fn create_then_get_returns_same_board() {
     let infra = crate::test_support::containers::setup().await;
-    let svc = BoardServiceImpl { db: infra.db.clone() };
+    let svc = BoardServiceImpl { pool: infra.pool.clone() };
     // ... exercise handler and assert
 }
 ```
