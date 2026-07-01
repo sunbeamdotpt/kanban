@@ -25,11 +25,13 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_retry::KetoRetryExt;
 use crate::pb::templates_service_server::TemplatesService;
 use crate::pb::{
-    BoardTemplate, CardTemplate, CreateCardTemplateRequest, CreateTemplateRequest,
-    DeleteCardTemplateRequest, DeleteTemplateRequest, GetCardTemplateRequest, GetTemplateRequest,
+    BoardTemplate, CardTemplate, CreateCardTemplateRequest, CreateCardTemplateResponse,
+    CreateTemplateRequest, CreateTemplateResponse, DeleteCardTemplateRequest,
+    DeleteCardTemplateResponse, DeleteTemplateRequest, DeleteTemplateResponse,
+    GetCardTemplateRequest, GetCardTemplateResponse, GetTemplateRequest, GetTemplateResponse,
     ListCardTemplatesRequest, ListCardTemplatesResponse, ListTemplatesRequest,
     ListTemplatesResponse, TemplateChecklistItem, TemplateColumn, UpdateCardTemplateRequest,
-    UpdateTemplateRequest,
+    UpdateCardTemplateResponse, UpdateTemplateRequest, UpdateTemplateResponse,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -273,7 +275,7 @@ impl TemplatesService for TemplatesServiceImpl {
     async fn get_template(
         &self,
         request: Request<GetTemplateRequest>,
-    ) -> Result<Response<BoardTemplate>, Status> {
+    ) -> Result<Response<GetTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -296,13 +298,15 @@ impl TemplatesService for TemplatesServiceImpl {
             }
         }
 
-        Ok(Response::new(board_template_from_row(&row)))
+        Ok(Response::new(GetTemplateResponse {
+            template: Some(board_template_from_row(&row)),
+        }))
     }
 
     async fn create_template(
         &self,
         request: Request<CreateTemplateRequest>,
-    ) -> Result<Response<BoardTemplate>, Status> {
+    ) -> Result<Response<CreateTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
 
@@ -340,13 +344,15 @@ impl TemplatesService for TemplatesServiceImpl {
         .await
         .map_err(|e| internal("failed to create board template", e))?;
 
-        Ok(Response::new(board_template_from_row(&row)))
+        Ok(Response::new(CreateTemplateResponse {
+            template: Some(board_template_from_row(&row)),
+        }))
     }
 
     async fn update_template(
         &self,
         request: Request<UpdateTemplateRequest>,
-    ) -> Result<Response<BoardTemplate>, Status> {
+    ) -> Result<Response<UpdateTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -406,13 +412,15 @@ impl TemplatesService for TemplatesServiceImpl {
         .await
         .map_err(|e| internal("failed to update board template", e))?;
 
-        Ok(Response::new(board_template_from_row(&row)))
+        Ok(Response::new(UpdateTemplateResponse {
+            template: Some(board_template_from_row(&row)),
+        }))
     }
 
     async fn delete_template(
         &self,
         request: Request<DeleteTemplateRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -447,7 +455,7 @@ impl TemplatesService for TemplatesServiceImpl {
             return Err(Status::not_found("template not found"));
         }
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteTemplateResponse {}))
     }
 
     // ── Card templates ───────────────────────────────────────────────────────
@@ -498,7 +506,7 @@ impl TemplatesService for TemplatesServiceImpl {
     async fn get_card_template(
         &self,
         request: Request<GetCardTemplateRequest>,
-    ) -> Result<Response<CardTemplate>, Status> {
+    ) -> Result<Response<GetCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -522,13 +530,15 @@ impl TemplatesService for TemplatesServiceImpl {
             }
         }
 
-        Ok(Response::new(card_template_from_row(&row)))
+        Ok(Response::new(GetCardTemplateResponse {
+            template: Some(card_template_from_row(&row)),
+        }))
     }
 
     async fn create_card_template(
         &self,
         request: Request<CreateCardTemplateRequest>,
-    ) -> Result<Response<CardTemplate>, Status> {
+    ) -> Result<Response<CreateCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
 
@@ -572,13 +582,15 @@ impl TemplatesService for TemplatesServiceImpl {
         .await
         .map_err(|e| internal("failed to create card template", e))?;
 
-        Ok(Response::new(card_template_from_row(&row)))
+        Ok(Response::new(CreateCardTemplateResponse {
+            template: Some(card_template_from_row(&row)),
+        }))
     }
 
     async fn update_card_template(
         &self,
         request: Request<UpdateCardTemplateRequest>,
-    ) -> Result<Response<CardTemplate>, Status> {
+    ) -> Result<Response<UpdateCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -660,13 +672,15 @@ impl TemplatesService for TemplatesServiceImpl {
         .await
         .map_err(|e| internal("failed to update card template", e))?;
 
-        Ok(Response::new(card_template_from_row(&row)))
+        Ok(Response::new(UpdateCardTemplateResponse {
+            template: Some(card_template_from_row(&row)),
+        }))
     }
 
     async fn delete_card_template(
         &self,
         request: Request<DeleteCardTemplateRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
@@ -701,7 +715,7 @@ impl TemplatesService for TemplatesServiceImpl {
             return Err(Status::not_found("template not found"));
         }
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteCardTemplateResponse {}))
     }
 }
 
@@ -826,7 +840,9 @@ mod tests {
             ))
             .await
             .expect("create_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert!(!created.id.is_empty());
         assert_eq!(created.name, "Sprint Retro");
@@ -844,7 +860,9 @@ mod tests {
             ))
             .await
             .expect("get_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.columns.len(), 2);
@@ -880,7 +898,9 @@ mod tests {
             ))
             .await
             .expect("create_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         let list_all = svc
             .list_templates(authed_request(
@@ -955,7 +975,9 @@ mod tests {
             ))
             .await
             .expect("create_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         let updated = svc
             .update_template(authed_request(
@@ -976,7 +998,9 @@ mod tests {
             ))
             .await
             .expect("update_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert_eq!(updated.name, "Updated");
         assert_eq!(updated.description, "Original desc");
@@ -1010,7 +1034,9 @@ mod tests {
             ))
             .await
             .expect("create_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         svc.delete_template(authed_request(
             DeleteTemplateRequest {
@@ -1064,7 +1090,9 @@ mod tests {
             ))
             .await
             .expect("create_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert!(!created.id.is_empty());
         assert_eq!(created.name, "Bug Card");
@@ -1081,7 +1109,9 @@ mod tests {
             ))
             .await
             .expect("get_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert_eq!(fetched.id, created.id);
 
@@ -1115,7 +1145,9 @@ mod tests {
             ))
             .await
             .expect("create_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         let list = svc
             .list_card_templates(authed_request(
@@ -1165,7 +1197,9 @@ mod tests {
             ))
             .await
             .expect("create_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         let updated = svc
             .update_card_template(authed_request(
@@ -1185,7 +1219,9 @@ mod tests {
             ))
             .await
             .expect("update_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         assert_eq!(updated.title, "New title");
         assert_eq!(updated.label_names, vec!["new"]);
@@ -1222,7 +1258,9 @@ mod tests {
             ))
             .await
             .expect("create_card_template failed")
-            .into_inner();
+            .into_inner()
+            .template
+            .expect("template missing");
 
         svc.delete_card_template(authed_request(
             DeleteCardTemplateRequest {

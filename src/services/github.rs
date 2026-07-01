@@ -5,9 +5,9 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::github_link_service_server::GithubLinkService;
 use crate::pb::{
-    GitHubLinkDetail, LinkGitHubIssueRequest, ListGitHubLinksByCardRequest,
-    ListGitHubLinksByCardResponse, ResyncGitHubLinkRequest, SearchGithubIssuesRequest,
-    SearchGithubIssuesResponse, UnlinkGitHubIssueRequest,
+    LinkIssueRequest, LinkIssueResponse, ListLinksByCardRequest, ListLinksByCardResponse,
+    ResyncLinkRequest, ResyncLinkResponse, SearchGithubIssuesRequest, SearchGithubIssuesResponse,
+    UnlinkIssueRequest, UnlinkIssueResponse,
 };
 
 pub struct GitHubServiceImpl;
@@ -16,22 +16,22 @@ pub struct GitHubServiceImpl;
 impl GithubLinkService for GitHubServiceImpl {
     async fn link_issue(
         &self,
-        _request: Request<LinkGitHubIssueRequest>,
-    ) -> Result<Response<GitHubLinkDetail>, Status> {
+        _request: Request<LinkIssueRequest>,
+    ) -> Result<Response<LinkIssueResponse>, Status> {
         Err(Status::unimplemented("Stage 3 stub"))
     }
 
     async fn unlink_issue(
         &self,
-        _request: Request<UnlinkGitHubIssueRequest>,
-    ) -> Result<Response<()>, Status> {
+        _request: Request<UnlinkIssueRequest>,
+    ) -> Result<Response<UnlinkIssueResponse>, Status> {
         Err(Status::unimplemented("Stage 3 stub"))
     }
 
     async fn list_links_by_card(
         &self,
-        _request: Request<ListGitHubLinksByCardRequest>,
-    ) -> Result<Response<ListGitHubLinksByCardResponse>, Status> {
+        _request: Request<ListLinksByCardRequest>,
+    ) -> Result<Response<ListLinksByCardResponse>, Status> {
         Err(Status::unimplemented("Stage 3 stub"))
     }
 
@@ -44,8 +44,8 @@ impl GithubLinkService for GitHubServiceImpl {
 
     async fn resync_link(
         &self,
-        _request: Request<ResyncGitHubLinkRequest>,
-    ) -> Result<Response<GitHubLinkDetail>, Status> {
+        _request: Request<ResyncLinkRequest>,
+    ) -> Result<Response<ResyncLinkResponse>, Status> {
         Err(Status::unimplemented("Stage 3 stub"))
     }
 }
@@ -65,7 +65,7 @@ mod tests {
     async fn link_issue_returns_unimplemented() {
         let svc = GitHubServiceImpl;
         let status = unimplemented_status(
-            svc.link_issue(Request::new(LinkGitHubIssueRequest::default()))
+            svc.link_issue(Request::new(LinkIssueRequest::default()))
                 .await,
         );
         assert!(status.contains("Stage 3 stub"));
@@ -75,7 +75,7 @@ mod tests {
     async fn unlink_issue_returns_unimplemented() {
         let svc = GitHubServiceImpl;
         let status = unimplemented_status(
-            svc.unlink_issue(Request::new(UnlinkGitHubIssueRequest::default()))
+            svc.unlink_issue(Request::new(UnlinkIssueRequest::default()))
                 .await,
         );
         assert!(status.contains("Stage 3 stub"));
@@ -85,7 +85,7 @@ mod tests {
     async fn list_links_by_card_returns_unimplemented() {
         let svc = GitHubServiceImpl;
         let status = unimplemented_status(
-            svc.list_links_by_card(Request::new(ListGitHubLinksByCardRequest::default()))
+            svc.list_links_by_card(Request::new(ListLinksByCardRequest::default()))
                 .await,
         );
         assert!(status.contains("Stage 3 stub"));
@@ -105,7 +105,7 @@ mod tests {
     async fn resync_link_returns_unimplemented() {
         let svc = GitHubServiceImpl;
         let status = unimplemented_status(
-            svc.resync_link(Request::new(ResyncGitHubLinkRequest::default()))
+            svc.resync_link(Request::new(ResyncLinkRequest::default()))
                 .await,
         );
         assert!(status.contains("Stage 3 stub"));

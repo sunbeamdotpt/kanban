@@ -32,10 +32,10 @@ use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::integrations::s3::{S3Client, S3Error, sanitize_filename};
 use crate::pb::attachment_service_server::AttachmentService;
 use crate::pb::{
-    Attachment, ConfirmUploadRequest, DeleteAttachmentRequest, ListAttachmentsByCardRequest,
-    ListAttachmentsByCardResponse, RequestPresignedDownloadRequest,
-    RequestPresignedDownloadResponse, RequestPresignedUploadRequest,
-    RequestPresignedUploadResponse,
+    Attachment, ConfirmUploadRequest, ConfirmUploadResponse, DeleteAttachmentRequest,
+    DeleteAttachmentResponse, ListAttachmentsByCardRequest, ListAttachmentsByCardResponse,
+    RequestPresignedDownloadRequest, RequestPresignedDownloadResponse,
+    RequestPresignedUploadRequest, RequestPresignedUploadResponse,
 };
 
 // ── Service struct ───────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ impl AttachmentService for AttachmentServiceImpl {
     async fn confirm_upload(
         &self,
         request: Request<ConfirmUploadRequest>,
-    ) -> Result<Response<Attachment>, Status> {
+    ) -> Result<Response<ConfirmUploadResponse>, Status> {
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
@@ -256,7 +256,9 @@ impl AttachmentService for AttachmentServiceImpl {
         .await
         .map_err(|e| internal("failed to confirm attachment", e))?;
 
-        Ok(Response::new(attachment_from_row(&updated)))
+        Ok(Response::new(ConfirmUploadResponse {
+            attachment: Some(attachment_from_row(&updated)),
+        }))
     }
 
     // ── RequestPresignedDownload ──────────────────────────────────────────────
@@ -308,7 +310,7 @@ impl AttachmentService for AttachmentServiceImpl {
     async fn delete_attachment(
         &self,
         request: Request<DeleteAttachmentRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteAttachmentResponse>, Status> {
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
@@ -356,7 +358,7 @@ impl AttachmentService for AttachmentServiceImpl {
             .await
             .map_err(|e| internal("failed to delete attachment row", e))?;
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteAttachmentResponse {}))
     }
 
     // ── ListAttachmentsByCard ─────────────────────────────────────────────────
@@ -551,7 +553,9 @@ mod tests {
             ))
             .await
             .expect("confirm_upload failed")
-            .into_inner();
+            .into_inner()
+            .attachment
+            .expect("attachment missing");
 
         assert_eq!(confirmed.id, attachment_id);
         assert_eq!(

@@ -24,12 +24,17 @@ use sunbeam_g2v::middleware::auth::keto::KetoClient;
 use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::pb::card_service_server::CardService;
 use crate::pb::{
-    AddChecklistItemRequest, AddCommentRequest, AssignCardRequest, Assignee, BatchGetCardsRequest,
-    BatchGetCardsResponse, BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card,
-    CardDependencyRequest, ChecklistItem, Comment, CreateCardRequest, DeleteCardRequest,
-    DeleteCommentRequest, EditCommentRequest, GetCardRequest, Label, ListCardsByBoardRequest,
-    ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse, MoveCardRequest,
-    RemoveChecklistItemRequest, UnassignCardRequest, UpdateCardRequest, UpdateChecklistItemRequest,
+    AddCardDependencyRequest, AddCardDependencyResponse, AddChecklistItemRequest,
+    AddChecklistItemResponse, AddCommentRequest, AddCommentResponse, AssignCardRequest,
+    AssignCardResponse, Assignee, BatchGetCardsRequest, BatchGetCardsResponse,
+    BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card, ChecklistItem, Comment,
+    CreateCardRequest, CreateCardResponse, DeleteCardRequest, DeleteCardResponse,
+    DeleteCommentRequest, DeleteCommentResponse, EditCommentRequest, EditCommentResponse,
+    GetCardRequest, GetCardResponse, Label, ListCardsByBoardRequest, ListCardsByBoardResponse,
+    ListCommentsRequest, ListCommentsResponse, MoveCardRequest, MoveCardResponse,
+    RemoveCardDependencyRequest, RemoveCardDependencyResponse, RemoveChecklistItemRequest,
+    RemoveChecklistItemResponse, UnassignCardRequest, UnassignCardResponse, UpdateCardRequest,
+    UpdateCardResponse, UpdateChecklistItemRequest, UpdateChecklistItemResponse,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -494,14 +499,17 @@ impl CardService for CardServiceImpl {
     // CheckedObjectId = card_id (KanbanCard + view, per matrix).
     // Hydrates labels, assignees, checklist, github_links, counts.
 
-    async fn get_card(&self, request: Request<GetCardRequest>) -> Result<Response<Card>, Status> {
+    async fn get_card(
+        &self,
+        request: Request<GetCardRequest>,
+    ) -> Result<Response<GetCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(GetCardResponse { card: Some(card) }))
     }
 
     // ── BatchGetCards ─────────────────────────────────────────────────────────
@@ -732,7 +740,7 @@ impl CardService for CardServiceImpl {
     async fn create_card(
         &self,
         request: Request<CreateCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<CreateCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -749,7 +757,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
             return fetch_full_card(&self.pool, existing_id)
                 .await
-                .map(Response::new);
+                .map(|card| Response::new(CreateCardResponse { card: Some(card) }));
         }
 
         // Verify board exists and get project_id.
@@ -873,7 +881,7 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(CreateCardResponse { card: Some(card) }))
     }
 
     // ── UpdateCard ────────────────────────────────────────────────────────────
@@ -884,7 +892,7 @@ impl CardService for CardServiceImpl {
     async fn update_card(
         &self,
         request: Request<UpdateCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<UpdateCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -897,7 +905,7 @@ impl CardService for CardServiceImpl {
         if let Some(_existing) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
             return fetch_full_card(&self.pool, card_id)
                 .await
-                .map(Response::new);
+                .map(|card| Response::new(UpdateCardResponse { card: Some(card) }));
         }
 
         // Fetch current card for board_id + revision.
@@ -993,7 +1001,7 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(UpdateCardResponse { card: Some(card) }))
     }
 
     // ── MoveCard ──────────────────────────────────────────────────────────────
@@ -1003,7 +1011,10 @@ impl CardService for CardServiceImpl {
     // Same-board cross-column: shift source gap, shift target at insert point.
     // event_log: CardMoved.
 
-    async fn move_card(&self, request: Request<MoveCardRequest>) -> Result<Response<Card>, Status> {
+    async fn move_card(
+        &self,
+        request: Request<MoveCardRequest>,
+    ) -> Result<Response<MoveCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1022,7 +1033,7 @@ impl CardService for CardServiceImpl {
         {
             return fetch_full_card(&self.pool, card_id)
                 .await
-                .map(Response::new);
+                .map(|card| Response::new(MoveCardResponse { card: Some(card) }));
         }
 
         // Fetch card's current state.
@@ -1163,7 +1174,7 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(MoveCardResponse { card: Some(card) }))
     }
 
     // ── DeleteCard ────────────────────────────────────────────────────────────
@@ -1175,7 +1186,7 @@ impl CardService for CardServiceImpl {
     async fn delete_card(
         &self,
         request: Request<DeleteCardRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1220,7 +1231,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteCardResponse {}))
     }
 
     // ── AddCardDependency ─────────────────────────────────────────────────────
@@ -1232,8 +1243,8 @@ impl CardService for CardServiceImpl {
 
     async fn add_card_dependency(
         &self,
-        request: Request<CardDependencyRequest>,
-    ) -> Result<Response<Card>, Status> {
+        request: Request<AddCardDependencyRequest>,
+    ) -> Result<Response<AddCardDependencyResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -1261,7 +1272,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
             return fetch_full_card(&self.pool, existing_id)
                 .await
-                .map(Response::new);
+                .map(|card| Response::new(AddCardDependencyResponse { card: Some(card) }));
         }
 
         let mut tx = self
@@ -1330,7 +1341,9 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(AddCardDependencyResponse {
+            card: Some(card),
+        }))
     }
 
     // ── RemoveCardDependency ──────────────────────────────────────────────────
@@ -1341,8 +1354,8 @@ impl CardService for CardServiceImpl {
 
     async fn remove_card_dependency(
         &self,
-        request: Request<CardDependencyRequest>,
-    ) -> Result<Response<Card>, Status> {
+        request: Request<RemoveCardDependencyRequest>,
+    ) -> Result<Response<RemoveCardDependencyResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -1366,7 +1379,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
             return fetch_full_card(&self.pool, existing_id)
                 .await
-                .map(Response::new);
+                .map(|card| Response::new(RemoveCardDependencyResponse { card: Some(card) }));
         }
 
         let mut tx = self
@@ -1445,7 +1458,9 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id).await?;
-        Ok(Response::new(card))
+        Ok(Response::new(RemoveCardDependencyResponse {
+            card: Some(card),
+        }))
     }
 
     // ── BulkUpdateCardLabels ──────────────────────────────────────────────────
@@ -1593,7 +1608,7 @@ impl CardService for CardServiceImpl {
     async fn assign_card(
         &self,
         request: Request<AssignCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<AssignCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1654,7 +1669,7 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id)
             .await
-            .map(Response::new)
+            .map(|card| Response::new(AssignCardResponse { card: Some(card) }))
     }
 
     // ── UnassignCard ──────────────────────────────────────────────────────────
@@ -1665,7 +1680,7 @@ impl CardService for CardServiceImpl {
     async fn unassign_card(
         &self,
         request: Request<UnassignCardRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<UnassignCardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1721,7 +1736,7 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id)
             .await
-            .map(Response::new)
+            .map(|card| Response::new(UnassignCardResponse { card: Some(card) }))
     }
 
     // ── AddChecklistItem ──────────────────────────────────────────────────────
@@ -1733,7 +1748,7 @@ impl CardService for CardServiceImpl {
     async fn add_checklist_item(
         &self,
         request: Request<AddChecklistItemRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<AddChecklistItemResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1824,7 +1839,7 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id)
             .await
-            .map(Response::new)
+            .map(|card| Response::new(AddChecklistItemResponse { card: Some(card) }))
     }
 
     // ── UpdateChecklistItem ───────────────────────────────────────────────────
@@ -1836,7 +1851,7 @@ impl CardService for CardServiceImpl {
     async fn update_checklist_item(
         &self,
         request: Request<UpdateChecklistItemRequest>,
-    ) -> Result<Response<Card>, Status> {
+    ) -> Result<Response<UpdateChecklistItemResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1909,7 +1924,7 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id)
             .await
-            .map(Response::new)
+            .map(|card| Response::new(UpdateChecklistItemResponse { card: Some(card) }))
     }
 
     // ── RemoveChecklistItem ───────────────────────────────────────────────────
@@ -1920,7 +1935,7 @@ impl CardService for CardServiceImpl {
     async fn remove_checklist_item(
         &self,
         request: Request<RemoveChecklistItemRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<RemoveChecklistItemResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -1982,7 +1997,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(()))
+        Ok(Response::new(RemoveChecklistItemResponse {}))
     }
 
     // ── AddComment ────────────────────────────────────────────────────────────
@@ -1993,7 +2008,7 @@ impl CardService for CardServiceImpl {
     async fn add_comment(
         &self,
         request: Request<AddCommentRequest>,
-    ) -> Result<Response<Comment>, Status> {
+    ) -> Result<Response<AddCommentResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -2029,7 +2044,9 @@ impl CardService for CardServiceImpl {
                     .await
                     .map_err(|e| internal("failed to fetch cached comment", e))?;
                     if let Some(r) = comment_row {
-                        return Ok(Response::new(comment_from_row(&r)));
+                        return Ok(Response::new(AddCommentResponse {
+                            comment: Some(comment_from_row(&r)),
+                        }));
                     }
                 }
             }
@@ -2105,7 +2122,9 @@ impl CardService for CardServiceImpl {
             }
         }
 
-        Ok(Response::new(comment_from_row(&comment_row)))
+        Ok(Response::new(AddCommentResponse {
+            comment: Some(comment_from_row(&comment_row)),
+        }))
     }
 
     // ── EditComment ───────────────────────────────────────────────────────────
@@ -2117,7 +2136,7 @@ impl CardService for CardServiceImpl {
     async fn edit_comment(
         &self,
         request: Request<EditCommentRequest>,
-    ) -> Result<Response<Comment>, Status> {
+    ) -> Result<Response<EditCommentResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -2187,7 +2206,9 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(comment_from_row(&comment_row)))
+        Ok(Response::new(EditCommentResponse {
+            comment: Some(comment_from_row(&comment_row)),
+        }))
     }
 
     // ── DeleteComment ─────────────────────────────────────────────────────────
@@ -2202,7 +2223,7 @@ impl CardService for CardServiceImpl {
     async fn delete_comment(
         &self,
         request: Request<DeleteCommentRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteCommentResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let card_id = object_id
             .parse::<Id>()
@@ -2279,7 +2300,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteCommentResponse {}))
     }
 
     // ── ListComments ──────────────────────────────────────────────────────────
@@ -2518,7 +2539,9 @@ mod tests {
             ))
             .await
             .expect("create 1 failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let c2 = svc
             .create_card(authed_request_with_object(
@@ -2534,7 +2557,9 @@ mod tests {
             ))
             .await
             .expect("create 2 failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let c3 = svc
             .create_card(authed_request_with_object(
@@ -2550,7 +2575,9 @@ mod tests {
             ))
             .await
             .expect("create 3 failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(c1.r#ref, "REF-001", "first card ref");
         assert_eq!(c2.r#ref, "REF-002", "second card ref");
@@ -2587,7 +2614,9 @@ mod tests {
             ))
             .await
             .expect("create alpha failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let cb = svc
             .create_card(authed_request_with_object(
@@ -2603,7 +2632,9 @@ mod tests {
             ))
             .await
             .expect("create beta failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(ca.r#ref, "ALPHA-001");
         assert_eq!(
@@ -2649,7 +2680,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let moved = svc
             .move_card(authed_request_with_object(
@@ -2664,7 +2697,9 @@ mod tests {
             ))
             .await
             .expect("move failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(
             moved.column_id,
@@ -2704,7 +2739,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let result = svc
             .move_card(authed_request_with_object(
@@ -2764,7 +2801,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let move_key = Id::new().to_string();
         let first = svc
@@ -2780,7 +2819,9 @@ mod tests {
             ))
             .await
             .expect("first move failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let second = svc
             .move_card(authed_request_with_object(
@@ -2795,7 +2836,9 @@ mod tests {
             ))
             .await
             .expect("second move (replay) failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(
             first.revision, second.revision,
@@ -2830,7 +2873,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_id = card.id.parse::<Id>().unwrap();
 
@@ -2850,7 +2895,9 @@ mod tests {
             ))
             .await
             .expect("update failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(updated.title, "Updated Title");
         assert!(updated.revision > card.revision, "revision must bump");
@@ -2896,7 +2943,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_id = card.id.parse::<Id>().unwrap();
 
@@ -3001,7 +3050,9 @@ mod tests {
             ))
             .await
             .expect("c1 create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card2 = svc
             .create_card(authed_request_with_object(
@@ -3017,7 +3068,9 @@ mod tests {
             ))
             .await
             .expect("c2 create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let resp = svc
             .bulk_update_card_labels(authed_request_with_object(
@@ -3080,7 +3133,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         // Assign twice — should not duplicate.
         svc.assign_card(authed_request_with_object(
@@ -3138,7 +3193,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         for text in &["Step A", "Step B", "Step C"] {
             svc.add_checklist_item(authed_request_with_object(
@@ -3197,7 +3254,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let comment = svc
             .add_comment(authed_request_with_object(
@@ -3211,7 +3270,9 @@ mod tests {
             ))
             .await
             .expect("add comment failed")
-            .into_inner();
+            .into_inner()
+            .comment
+            .expect("comment missing");
 
         assert_eq!(comment.body, "original body");
 
@@ -3227,7 +3288,9 @@ mod tests {
             ))
             .await
             .expect("edit comment failed")
-            .into_inner();
+            .into_inner()
+            .comment
+            .expect("comment missing");
 
         assert_eq!(edited.body, "edited body");
         assert_eq!(edited.id, comment.id);
@@ -3276,7 +3339,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let comment = svc
             .add_comment(authed_request_with_object(
@@ -3290,7 +3355,9 @@ mod tests {
             ))
             .await
             .expect("add comment failed")
-            .into_inner();
+            .into_inner()
+            .comment
+            .expect("comment missing");
 
         // `other` tries to delete — they are not author AND Keto (already checked by middleware)
         // granted them `edit` (that's what the matrix says). Since `edit` is confirmed in
@@ -3360,7 +3427,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let fetched = svc
             .get_card(authed_request_with_object(
@@ -3372,7 +3441,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(fetched.id, card.id);
         assert_eq!(fetched.title, "Get me");
@@ -3405,7 +3476,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let resp = svc
             .batch_get_cards(authed_request_with_object(
@@ -3499,7 +3572,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         svc.assign_card(authed_request_with_object(
             AssignCardRequest {
@@ -3523,7 +3598,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert!(
             updated.assignees.iter().all(|a| a.subject != "user:alice"),
@@ -3558,7 +3635,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let item = svc
             .add_checklist_item(authed_request_with_object(
@@ -3572,7 +3651,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let item_id = item.checklist.first().unwrap().id.clone();
 
@@ -3595,7 +3676,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let updated_item = updated
             .checklist
@@ -3633,7 +3716,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let item = svc
             .add_checklist_item(authed_request_with_object(
@@ -3647,7 +3732,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let item_id = item.checklist.first().unwrap().id.clone();
 
@@ -3672,7 +3759,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert!(
             fetched.checklist.iter().all(|i| i.id != item_id),
@@ -3707,7 +3796,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         svc.add_comment(authed_request_with_object(
             AddCommentRequest {
@@ -3767,7 +3858,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(card.urgency, 4, "created urgency should be critical");
 
@@ -3781,7 +3874,9 @@ mod tests {
             ))
             .await
             .expect("get failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
         assert_eq!(fetched.urgency, 4, "fetched urgency should be critical");
 
         cleanup_project(&pool, pid).await;
@@ -3812,7 +3907,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(card.urgency, 2, "default urgency should be medium");
 
@@ -3844,7 +3941,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let updated = svc
             .update_card(authed_request_with_object(
@@ -3862,7 +3961,9 @@ mod tests {
             ))
             .await
             .expect("update failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(updated.urgency, 3, "updated urgency should be high");
         assert!(updated.revision > card.revision, "revision should bump");
@@ -3896,7 +3997,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(card.priority, 3, "priority should round-trip");
 
@@ -3928,7 +4031,9 @@ mod tests {
             ))
             .await
             .expect("create a failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_b = svc
             .create_card(authed_request_with_object(
@@ -3944,11 +4049,13 @@ mod tests {
             ))
             .await
             .expect("create b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let dep = svc
             .add_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
@@ -3958,7 +4065,9 @@ mod tests {
             ))
             .await
             .expect("add dependency failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(dep.depends_on_card_ids, vec![card_b.id.clone()]);
 
@@ -3972,7 +4081,9 @@ mod tests {
             ))
             .await
             .expect("get b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
         assert_eq!(b.dependent_card_ids, vec![card_a.id.clone()]);
 
         cleanup_project(&pool, pid).await;
@@ -4003,7 +4114,9 @@ mod tests {
             ))
             .await
             .expect("create a failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_b = svc
             .create_card(authed_request_with_object(
@@ -4019,10 +4132,12 @@ mod tests {
             ))
             .await
             .expect("create b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         svc.add_card_dependency(authed_request_with_object(
-            CardDependencyRequest {
+            AddCardDependencyRequest {
                 card_id: card_a.id.clone(),
                 depends_on_card_id: card_b.id.clone(),
                 idempotency_key: Id::new().to_string(),
@@ -4035,7 +4150,7 @@ mod tests {
 
         let removed = svc
             .remove_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                RemoveCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
@@ -4045,7 +4160,9 @@ mod tests {
             ))
             .await
             .expect("remove dependency failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert!(removed.depends_on_card_ids.is_empty());
 
@@ -4059,7 +4176,9 @@ mod tests {
             ))
             .await
             .expect("get b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
         assert!(b.dependent_card_ids.is_empty());
 
         cleanup_project(&pool, pid).await;
@@ -4090,11 +4209,13 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let err = svc
             .add_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                AddCardDependencyRequest {
                     card_id: card.id.clone(),
                     depends_on_card_id: card.id.clone(),
                     idempotency_key: Id::new().to_string(),
@@ -4137,7 +4258,9 @@ mod tests {
             ))
             .await
             .expect("create a failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_b = svc
             .create_card(authed_request_with_object(
@@ -4153,11 +4276,13 @@ mod tests {
             ))
             .await
             .expect("create b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let err = svc
             .add_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
@@ -4198,7 +4323,9 @@ mod tests {
             ))
             .await
             .expect("create a failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_b = svc
             .create_card(authed_request_with_object(
@@ -4214,11 +4341,13 @@ mod tests {
             ))
             .await
             .expect("create b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let key = Id::new().to_string();
         svc.add_card_dependency(authed_request_with_object(
-            CardDependencyRequest {
+            AddCardDependencyRequest {
                 card_id: card_a.id.clone(),
                 depends_on_card_id: card_b.id.clone(),
                 idempotency_key: key.clone(),
@@ -4231,7 +4360,7 @@ mod tests {
 
         let replay = svc
             .add_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: key.clone(),
@@ -4241,7 +4370,9 @@ mod tests {
             ))
             .await
             .expect("add replay failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         assert_eq!(replay.depends_on_card_ids, vec![card_b.id.clone()]);
 
@@ -4273,7 +4404,9 @@ mod tests {
             ))
             .await
             .expect("create a failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let card_b = svc
             .create_card(authed_request_with_object(
@@ -4289,11 +4422,13 @@ mod tests {
             ))
             .await
             .expect("create b failed")
-            .into_inner();
+            .into_inner()
+            .card
+            .expect("card missing");
 
         let add_rev = svc
             .add_card_dependency(authed_request_with_object(
-                CardDependencyRequest {
+                AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
@@ -4304,6 +4439,8 @@ mod tests {
             .await
             .expect("add failed")
             .into_inner()
+            .card
+            .expect("card missing")
             .revision;
 
         assert!(add_rev > card_a.revision, "add should bump revision");

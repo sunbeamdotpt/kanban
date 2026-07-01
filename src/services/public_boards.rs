@@ -10,7 +10,10 @@ use sqlx::Row;
 use tonic::{Request, Response, Status};
 
 use crate::pb::public_board_service_server::PublicBoardService;
-use crate::pb::{GetPublicBoardRequest, ListBoardsResponse, ListPublicBoardsRequest};
+use crate::pb::{
+    GetPublicBoardRequest, GetPublicBoardResponse, ListPublicBoardsRequest,
+    ListPublicBoardsResponse,
+};
 use crate::services::boards::{board_from_row, fetch_cards_count, fetch_columns_count};
 use crate::services::visibility::is_public;
 
@@ -28,7 +31,7 @@ impl PublicBoardService for PublicBoardServiceImpl {
     async fn get_public_board(
         &self,
         request: Request<GetPublicBoardRequest>,
-    ) -> Result<Response<crate::pb::Board>, Status> {
+    ) -> Result<Response<GetPublicBoardResponse>, Status> {
         let req = request.into_inner();
         let board_id = req
             .board_id
@@ -55,13 +58,13 @@ impl PublicBoardService for PublicBoardServiceImpl {
         let cards_count = fetch_cards_count(&self.pool, board_id).await;
         let board = board_from_row(&row, columns_count, cards_count);
 
-        Ok(Response::new(board))
+        Ok(Response::new(GetPublicBoardResponse { board: Some(board) }))
     }
 
     async fn list_public_boards(
         &self,
         request: Request<ListPublicBoardsRequest>,
-    ) -> Result<Response<ListBoardsResponse>, Status> {
+    ) -> Result<Response<ListPublicBoardsResponse>, Status> {
         let req = request.into_inner();
         let project_id = req
             .project_id
@@ -85,7 +88,7 @@ impl PublicBoardService for PublicBoardServiceImpl {
             boards.push(board_from_row(row, columns_count, cards_count));
         }
 
-        Ok(Response::new(ListBoardsResponse { boards }))
+        Ok(Response::new(ListPublicBoardsResponse { boards }))
     }
 }
 
@@ -160,8 +163,9 @@ mod tests {
             .expect("get_public_board failed")
             .into_inner();
 
-        assert_eq!(resp.id, board_id.to_string());
-        assert_eq!(resp.visibility, 3); // PUBLIC
+        let board = resp.board.expect("board missing");
+        assert_eq!(board.id, board_id.to_string());
+        assert_eq!(board.visibility, 3); // PUBLIC
     }
 
     #[tokio::test]

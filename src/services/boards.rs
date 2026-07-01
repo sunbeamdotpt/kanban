@@ -35,10 +35,12 @@ use crate::auth::keto_dispatch::CheckedObjectId;
 use crate::auth::keto_retry::KetoRetryExt;
 use crate::pb::board_service_server::BoardService;
 use crate::pb::{
-    AddColumnRequest, Board, BoardDetail, BoardEventEnvelope, Column, CreateBoardRequest, Cutover,
-    DeleteBoardRequest, GetBoardRequest, Heartbeat, ListBoardsRequest, ListBoardsResponse,
-    MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest, SubscribeBoardRequest,
-    UpdateBoardRequest, UpdateColumnRequest, board_event_envelope::Payload,
+    AddColumnRequest, AddColumnResponse, Board, BoardDetail, BoardEventEnvelope, Column,
+    CreateBoardRequest, CreateBoardResponse, Cutover, DeleteBoardRequest, DeleteBoardResponse,
+    GetBoardRequest, GetBoardResponse, Heartbeat, ListBoardsRequest, ListBoardsResponse,
+    MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest, RemoveColumnResponse,
+    SubscribeBoardRequest, SubscribeBoardResponse, UpdateBoardRequest, UpdateBoardResponse,
+    UpdateColumnRequest, UpdateColumnResponse, board_event_envelope::Payload,
 };
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
@@ -194,7 +196,7 @@ fn slug_from_name(name: &str) -> String {
 // ── Type alias ───────────────────────────────────────────────────────────────
 
 type SubscribeBoardStream =
-    Pin<Box<dyn Stream<Item = Result<BoardEventEnvelope, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<SubscribeBoardResponse, Status>> + Send + 'static>>;
 
 // ── Stream helpers ────────────────────────────────────────────────────────────
 
@@ -311,7 +313,9 @@ pub async fn build_subscribe_board_stream(
         // ── Step 1: emit Cutover immediately (empty replay, seq=0) ────────────
         // TODO(4c.5): snapshot replay — emit synthetic CardCreated/ColumnAdded
         // events before this Cutover, each with nats_seq=0.
-        yield Ok(cutover_envelope(0));
+        yield Ok(SubscribeBoardResponse {
+            envelope: Some(cutover_envelope(0)),
+        });
 
         // ── Step 2: subscribe to live events ─────────────────────────────────
         let mut handle = match Arc::clone(&registry).subscribe(&board_id).await {
@@ -372,7 +376,7 @@ pub async fn build_subscribe_board_stream(
                     match msg {
                         Ok(envelope) => {
                             match tracker.observe_live(&envelope.event_id, envelope.nats_seq) {
-                                Outcome::Emit => yield Ok(envelope),
+                                Outcome::Emit => yield Ok(SubscribeBoardResponse { envelope: Some(envelope) }),
                                 Outcome::Drop | Outcome::OutOfOrder => { /* skip */ }
                             }
                         }
@@ -386,7 +390,9 @@ pub async fn build_subscribe_board_stream(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    yield Ok(heartbeat_envelope());
+                    yield Ok(SubscribeBoardResponse {
+                        envelope: Some(heartbeat_envelope()),
+                    });
                 }
             }
         }
@@ -465,7 +471,7 @@ impl BoardService for BoardServiceImpl {
     async fn get_board(
         &self,
         request: Request<GetBoardRequest>,
-    ) -> Result<Response<BoardDetail>, Status> {
+    ) -> Result<Response<GetBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let board_id = req
@@ -502,9 +508,11 @@ impl BoardService for BoardServiceImpl {
         let cards_count = fetch_cards_count(&self.pool, board_id).await;
         let board = board_from_row(&row, columns.len() as i32, cards_count);
 
-        Ok(Response::new(BoardDetail {
-            board: Some(board),
-            columns,
+        Ok(Response::new(GetBoardResponse {
+            detail: Some(BoardDetail {
+                board: Some(board),
+                columns,
+            }),
         }))
     }
 
@@ -517,7 +525,7 @@ impl BoardService for BoardServiceImpl {
     async fn create_board(
         &self,
         request: Request<CreateBoardRequest>,
-    ) -> Result<Response<Board>, Status> {
+    ) -> Result<Response<CreateBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -548,11 +556,9 @@ impl BoardService for BoardServiceImpl {
                 if let Some(row) = row {
                     let columns_count = fetch_columns_count(&self.pool, board_id).await;
                     let cards_count = fetch_cards_count(&self.pool, board_id).await;
-                    return Ok(Response::new(board_from_row(
-                        &row,
-                        columns_count,
-                        cards_count,
-                    )));
+                    return Ok(Response::new(CreateBoardResponse {
+                        board: Some(board_from_row(&row, columns_count, cards_count)),
+                    }));
                 }
             }
         }
@@ -628,7 +634,9 @@ impl BoardService for BoardServiceImpl {
                 warn!(error = %e, "failed to store idempotency key");
             }
 
-        Ok(Response::new(board_from_row(&row, 0, 0)))
+        Ok(Response::new(CreateBoardResponse {
+            board: Some(board_from_row(&row, 0, 0)),
+        }))
     }
 
     // ── UpdateBoard ───────────────────────────────────────────────────────────
@@ -639,7 +647,7 @@ impl BoardService for BoardServiceImpl {
     async fn update_board(
         &self,
         request: Request<UpdateBoardRequest>,
-    ) -> Result<Response<Board>, Status> {
+    ) -> Result<Response<UpdateBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
@@ -702,11 +710,9 @@ impl BoardService for BoardServiceImpl {
 
         let columns_count = fetch_columns_count(&self.pool, board_id).await;
         let cards_count = fetch_cards_count(&self.pool, board_id).await;
-        Ok(Response::new(board_from_row(
-            &row,
-            columns_count,
-            cards_count,
-        )))
+        Ok(Response::new(UpdateBoardResponse {
+            board: Some(board_from_row(&row, columns_count, cards_count)),
+        }))
     }
 
     // ── DeleteBoard ───────────────────────────────────────────────────────────
@@ -718,7 +724,7 @@ impl BoardService for BoardServiceImpl {
     async fn delete_board(
         &self,
         request: Request<DeleteBoardRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -740,7 +746,7 @@ impl BoardService for BoardServiceImpl {
             "delete_board: Keto parent tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteBoardResponse {}))
     }
 
     // ── AddColumn ─────────────────────────────────────────────────────────────
@@ -752,7 +758,7 @@ impl BoardService for BoardServiceImpl {
     async fn add_column(
         &self,
         request: Request<AddColumnRequest>,
-    ) -> Result<Response<Column>, Status> {
+    ) -> Result<Response<AddColumnResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -785,7 +791,9 @@ impl BoardService for BoardServiceImpl {
                 .map_err(|e| internal("failed to fetch cached column", e))?;
 
                 if let Some(row) = row {
-                    return Ok(Response::new(column_from_row(&row)));
+                    return Ok(Response::new(AddColumnResponse {
+                        column: Some(column_from_row(&row)),
+                    }));
                 }
             }
         }
@@ -866,7 +874,9 @@ impl BoardService for BoardServiceImpl {
                 warn!(error = %e, "failed to store idempotency key");
             }
 
-        Ok(Response::new(column_from_row(&row)))
+        Ok(Response::new(AddColumnResponse {
+            column: Some(column_from_row(&row)),
+        }))
     }
 
     // ── UpdateColumn ──────────────────────────────────────────────────────────
@@ -877,7 +887,7 @@ impl BoardService for BoardServiceImpl {
     async fn update_column(
         &self,
         request: Request<UpdateColumnRequest>,
-    ) -> Result<Response<Column>, Status> {
+    ) -> Result<Response<UpdateColumnResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -913,7 +923,9 @@ impl BoardService for BoardServiceImpl {
 
         // Stage 4: emit BoardEventEnvelope::ColumnUpdated over NATS subject kanban.board.<board_id>.events
 
-        Ok(Response::new(column_from_row(&row)))
+        Ok(Response::new(UpdateColumnResponse {
+            column: Some(column_from_row(&row)),
+        }))
     }
 
     // ── RemoveColumn ──────────────────────────────────────────────────────────
@@ -932,7 +944,7 @@ impl BoardService for BoardServiceImpl {
     async fn remove_column(
         &self,
         request: Request<RemoveColumnRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<RemoveColumnResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -994,7 +1006,7 @@ impl BoardService for BoardServiceImpl {
 
         // Stage 4: emit BoardEventEnvelope::ColumnDeleted over NATS subject kanban.board.<board_id>.events
 
-        Ok(Response::new(()))
+        Ok(Response::new(RemoveColumnResponse {}))
     }
 
     // ── MoveColumn ────────────────────────────────────────────────────────────
@@ -1220,7 +1232,7 @@ mod tests {
             .expect("stream ended without first envelope")
             .expect("first envelope was an error");
 
-        match first.payload {
+        match first.envelope.expect("envelope missing").payload {
             Some(Payload::Cutover(c)) => {
                 assert_eq!(
                     c.last_replay_nats_seq, 0,
@@ -1314,7 +1326,10 @@ mod tests {
             .expect("stream ended")
             .expect("stream error");
 
-        assert_eq!(received.event_id, live_event_id);
+        assert_eq!(
+            received.envelope.expect("envelope missing").event_id,
+            live_event_id
+        );
 
         let _ = crate::auth::keto_compat::delete_relation_tuples(
             &keto,
@@ -1386,7 +1401,7 @@ mod tests {
             .expect("stream ended")
             .expect("stream error");
 
-        match heartbeat_env.payload {
+        match heartbeat_env.envelope.expect("envelope missing").payload {
             Some(Payload::Heartbeat(h)) => {
                 assert!(
                     h.server_time_ms > 0,
@@ -1693,7 +1708,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         assert!(!created.id.is_empty());
         assert_eq!(created.name, "Sprint Board");
@@ -1719,7 +1736,9 @@ mod tests {
             ))
             .await
             .expect("get_board failed")
-            .into_inner();
+            .into_inner()
+            .detail
+            .expect("detail missing");
 
         let board = detail.board.expect("BoardDetail must contain board");
         assert_eq!(board.id, board_id);
@@ -1757,7 +1776,9 @@ mod tests {
                 ))
                 .await
                 .expect("create_board failed")
-                .into_inner();
+                .into_inner()
+                .board
+                .expect("board missing");
             board_ids_a.push(board.id);
         }
 
@@ -1776,7 +1797,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         // Grant explicit view on each board — test Keto does not evaluate
         // derived permissions from the parent project tuple.
@@ -1846,7 +1869,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let board_id = created.id.clone();
 
@@ -1874,7 +1899,9 @@ mod tests {
             ))
             .await
             .expect("update_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         assert_eq!(updated.name, "Updated Name");
         assert_eq!(
@@ -1910,7 +1937,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let board_id = board.id.parse::<Id>().unwrap();
 
@@ -1930,7 +1959,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         let col_id = col.id.parse::<Id>().unwrap();
 
@@ -1993,7 +2024,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let bid = board.id.clone();
 
@@ -2012,7 +2045,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         let c2 = svc
             .add_column(authed_request_with_object(
@@ -2029,7 +2064,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         let c3 = svc
             .add_column(authed_request_with_object(
@@ -2046,7 +2083,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         // Positions should be 0, 1, 2 in order.
         assert_eq!(c1.position, 0, "first column position");
@@ -2080,7 +2119,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let bid = board.id.clone();
 
@@ -2131,7 +2172,9 @@ mod tests {
             ))
             .await
             .expect("add Middle failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         assert_eq!(
             middle.position, 1,
@@ -2175,7 +2218,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let bid = board.id.clone();
 
@@ -2194,7 +2239,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         let updated = svc
             .update_column(authed_request_with_object(
@@ -2218,7 +2265,9 @@ mod tests {
             ))
             .await
             .expect("update_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         assert_eq!(updated.title, "New Title");
         assert_eq!(updated.wip_limit, 10);
@@ -2254,7 +2303,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let bid = board.id.clone();
         let board_id = bid.parse::<Id>().unwrap();
@@ -2274,7 +2325,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         let column_id = col.id.parse::<Id>().unwrap();
 
@@ -2360,7 +2413,9 @@ mod tests {
             ))
             .await
             .expect("create_board A failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let board_b = svc
             .create_board(authed_request_with_object(
@@ -2377,7 +2432,9 @@ mod tests {
             ))
             .await
             .expect("create_board B failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         // Add a column to board B.
         let col_b = svc
@@ -2395,7 +2452,9 @@ mod tests {
             ))
             .await
             .expect("add_column failed")
-            .into_inner();
+            .into_inner()
+            .column
+            .expect("column missing");
 
         // Try to remove col_b using board_a's object id — should fail with not_found.
         let result = svc
@@ -2448,7 +2507,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let bid = board.id.clone();
 
@@ -2470,7 +2531,9 @@ mod tests {
                 ))
                 .await
                 .expect("add_column failed")
-                .into_inner();
+                .into_inner()
+                .column
+                .expect("column missing");
             col_ids.push(c.id.clone());
         }
 
@@ -2542,7 +2605,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let detail = svc
             .get_board(authed_request_with_object(
@@ -2554,7 +2619,9 @@ mod tests {
             ))
             .await
             .expect("non-member should view public board")
-            .into_inner();
+            .into_inner()
+            .detail
+            .expect("detail missing");
 
         assert_eq!(detail.board.unwrap().id, board.id);
         cleanup_project(&pool, project_id).await;
@@ -2585,7 +2652,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         let result = svc
             .get_board(authed_request_with_object(
@@ -2664,7 +2733,9 @@ mod tests {
             ))
             .await
             .expect("create private board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         // Grant stranger explicit view on the private board so it appears.
         keto.grant_with_retry(KETO_NS_BOARD, &private_board.id, "view", &stranger)
@@ -2751,7 +2822,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         // Grant manage so the visibility change is authorized.
         keto.grant_with_retry(KETO_NS_BOARD, &board.id, "manage", &owner)
@@ -2783,7 +2856,9 @@ mod tests {
             ))
             .await
             .expect("update visibility failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         assert_eq!(
             updated.visibility,
@@ -2817,7 +2892,9 @@ mod tests {
             ))
             .await
             .expect("update visibility failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
 
         assert_eq!(
             updated_private.visibility,
@@ -2870,7 +2947,7 @@ mod tests {
             .expect("stream ended without first envelope")
             .expect("first envelope was an error");
 
-        match first.payload {
+        match first.envelope.expect("envelope missing").payload {
             Some(Payload::Cutover(c)) => {
                 assert_eq!(
                     c.last_replay_nats_seq, 0,

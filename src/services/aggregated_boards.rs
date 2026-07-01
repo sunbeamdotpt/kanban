@@ -28,13 +28,15 @@ use crate::auth::keto_expand::{ExpandQuery, expand_objects};
 use crate::auth::keto_retry::KetoRetryExt;
 use crate::pb::aggregated_board_service_server::AggregatedBoardService;
 use crate::pb::{
-    AddSourceBoardRequest, AggregatedBoard, AggregatedBoardChunk, AggregatedCardBatch,
-    AggregatedColumn, BoardEventEnvelope, Card, CreateAggregatedBoardRequest, Cutover,
-    DeleteAggregatedBoardRequest, GetAggregatedBoardRequest, Heartbeat,
-    ListAggregatedBoardsRequest, ListAggregatedBoardsResponse, MoveSourceBoardRequest,
-    RemoveSourceBoardRequest, SourceBoardRef, SubscribeAggregatedBoardRequest,
-    UpdateAggregatedBoardRequest, aggregated_board_chunk::Payload as ChunkPayload,
-    board_event_envelope::Payload as EventPayload,
+    AddSourceBoardRequest, AddSourceBoardResponse, AggregatedBoard, AggregatedBoardChunk,
+    AggregatedCardBatch, AggregatedColumn, BoardEventEnvelope, Card, CreateAggregatedBoardRequest,
+    CreateAggregatedBoardResponse, Cutover, DeleteAggregatedBoardRequest,
+    DeleteAggregatedBoardResponse, GetAggregatedBoardRequest, GetAggregatedBoardResponse,
+    Heartbeat, ListAggregatedBoardsRequest, ListAggregatedBoardsResponse, MoveSourceBoardRequest,
+    MoveSourceBoardResponse, RemoveSourceBoardRequest, RemoveSourceBoardResponse, SourceBoardRef,
+    SubscribeAggregatedBoardRequest, SubscribeAggregatedBoardResponse,
+    UpdateAggregatedBoardRequest, UpdateAggregatedBoardResponse,
+    aggregated_board_chunk::Payload as ChunkPayload, board_event_envelope::Payload as EventPayload,
 };
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
@@ -303,10 +305,10 @@ async fn fetch_cards_for_boards(
 // ── Streaming helpers ─────────────────────────────────────────────────────────
 
 type AggregatedBoardStream =
-    Pin<Box<dyn Stream<Item = Result<AggregatedBoardChunk, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<GetAggregatedBoardResponse, Status>> + Send + 'static>>;
 
 type SubscribeAggregatedBoardStream =
-    Pin<Box<dyn Stream<Item = Result<BoardEventEnvelope, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<SubscribeAggregatedBoardResponse, Status>> + Send + 'static>>;
 
 fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
     BoardEventEnvelope {
@@ -381,7 +383,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     async fn create_aggregated_board(
         &self,
         request: Request<CreateAggregatedBoardRequest>,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<Response<CreateAggregatedBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
 
@@ -483,14 +485,16 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 warn!(error = %e, "failed to store idempotency key");
             }
 
-        Ok(Response::new(aggregated_board_from_row(&row)))
+        Ok(Response::new(CreateAggregatedBoardResponse {
+            aggregated_board: Some(aggregated_board_from_row(&row)),
+        }))
     }
 
     // ── GetAggregatedBoard ──────────────────────────────────────────────────────
     async fn get_aggregated_board(
         &self,
         request: Request<GetAggregatedBoardRequest>,
-    ) -> Result<Response<AggregatedBoardStream>, Status> {
+    ) -> Result<Response<Self::GetAggregatedBoardStream>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
         let aggregated_board_id = req
@@ -605,7 +609,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let stream = stream! {
             for chunk in chunks {
-                yield Ok(chunk);
+                yield Ok(GetAggregatedBoardResponse { chunk: Some(chunk) });
             }
         };
 
@@ -616,7 +620,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     async fn update_aggregated_board(
         &self,
         request: Request<UpdateAggregatedBoardRequest>,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<Response<UpdateAggregatedBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
@@ -692,14 +696,16 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        Ok(Response::new(aggregated_board_from_row(&row)))
+        Ok(Response::new(UpdateAggregatedBoardResponse {
+            aggregated_board: Some(aggregated_board_from_row(&row)),
+        }))
     }
 
     // ── DeleteAggregatedBoard ───────────────────────────────────────────────────
     async fn delete_aggregated_board(
         &self,
         request: Request<DeleteAggregatedBoardRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteAggregatedBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -720,7 +726,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             "delete_aggregated_board: Keto tuple cleanup is best-effort; reconciler will catch any drift"
         );
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteAggregatedBoardResponse {}))
     }
 
     // ── ListAggregatedBoards ────────────────────────────────────────────────────
@@ -772,7 +778,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     async fn add_source_board(
         &self,
         request: Request<AddSourceBoardRequest>,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<Response<AddSourceBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -850,14 +856,17 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        self.get_aggregate_metadata(aggregated_board_id).await
+        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        Ok(Response::new(AddSourceBoardResponse {
+            aggregated_board: Some(aggregated_board),
+        }))
     }
 
     // ── RemoveSourceBoard ───────────────────────────────────────────────────────
     async fn remove_source_board(
         &self,
         request: Request<RemoveSourceBoardRequest>,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<Response<RemoveSourceBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -904,14 +913,17 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        self.get_aggregate_metadata(aggregated_board_id).await
+        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        Ok(Response::new(RemoveSourceBoardResponse {
+            aggregated_board: Some(aggregated_board),
+        }))
     }
 
     // ── MoveSourceBoard ─────────────────────────────────────────────────────────
     async fn move_source_board(
         &self,
         request: Request<MoveSourceBoardRequest>,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<Response<MoveSourceBoardResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -945,7 +957,10 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        self.get_aggregate_metadata(aggregated_board_id).await
+        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        Ok(Response::new(MoveSourceBoardResponse {
+            aggregated_board: Some(aggregated_board),
+        }))
     }
 
     // ── SubscribeAggregatedBoard ────────────────────────────────────────────────
@@ -1009,7 +1024,7 @@ impl AggregatedBoardServiceImpl {
     async fn get_aggregate_metadata(
         &self,
         aggregated_board_id: Id,
-    ) -> Result<Response<AggregatedBoard>, Status> {
+    ) -> Result<AggregatedBoard, Status> {
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
              FROM aggregated_boards WHERE id = $1",
@@ -1020,7 +1035,7 @@ impl AggregatedBoardServiceImpl {
         .map_err(|e| internal("failed to fetch aggregated board", e))?
         .ok_or_else(|| Status::not_found("aggregated board not found"))?;
 
-        Ok(Response::new(aggregated_board_from_row(&row)))
+        Ok(aggregated_board_from_row(&row))
     }
 }
 
@@ -1056,7 +1071,9 @@ pub async fn build_subscribe_aggregated_board_stream(
 
     let s = stream! {
         // Emit cutover immediately (empty replay).
-        yield Ok(cutover_envelope(0));
+        yield Ok(SubscribeAggregatedBoardResponse {
+            envelope: Some(cutover_envelope(0)),
+        });
 
         // Subscribe to the aggregate's own event stream.
         let mut aggregate_handle = match Arc::clone(&registry).subscribe(&aggregated_board_id).await {
@@ -1150,7 +1167,7 @@ pub async fn build_subscribe_aggregated_board_stream(
                     match msg {
                         Some(envelope) => {
                             match tracker.observe_live(&envelope.event_id, envelope.nats_seq) {
-                                Outcome::Emit => yield Ok(envelope),
+                                Outcome::Emit => yield Ok(SubscribeAggregatedBoardResponse { envelope: Some(envelope) }),
                                 Outcome::Drop | Outcome::OutOfOrder => {}
                             }
                         }
@@ -1161,7 +1178,9 @@ pub async fn build_subscribe_aggregated_board_stream(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    yield Ok(heartbeat_envelope());
+                    yield Ok(SubscribeAggregatedBoardResponse {
+                        envelope: Some(heartbeat_envelope()),
+                    });
                 }
             }
         }
@@ -1306,7 +1325,9 @@ mod tests {
             ))
             .await
             .expect("create_board failed")
-            .into_inner();
+            .into_inner()
+            .board
+            .expect("board missing");
         let board_id = board.id.parse::<Id>().expect("board id is ulid");
 
         // BoardService only writes the parent tuple; test Keto does not evaluate
@@ -1347,7 +1368,11 @@ mod tests {
     ) -> Vec<AggregatedBoardChunk> {
         let mut chunks = Vec::new();
         while let Some(item) = stream.next().await {
-            chunks.push(item.expect("stream item failed"));
+            chunks.push(
+                item.expect("stream item failed")
+                    .chunk
+                    .expect("chunk missing"),
+            );
         }
         chunks
     }
@@ -1380,7 +1405,9 @@ mod tests {
             ))
             .await
             .expect("create_aggregated_board failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         assert!(!created.id.is_empty());
         assert_eq!(created.name, "Cross-Project View");
@@ -1448,7 +1475,9 @@ mod tests {
             ))
             .await
             .expect("create A failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         let _ = agg_svc
             .create_aggregated_board(authed_request(
@@ -1464,7 +1493,9 @@ mod tests {
             ))
             .await
             .expect("create B failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         let list = agg_svc
             .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &subject))
@@ -1509,7 +1540,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         agg_svc
@@ -1613,7 +1646,9 @@ mod tests {
             ))
             .await
             .expect("get board failed")
-            .into_inner();
+            .into_inner()
+            .detail
+            .expect("detail missing");
         let column_id = board_detail
             .columns
             .first()
@@ -1650,7 +1685,9 @@ mod tests {
             ))
             .await
             .expect("create aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
@@ -1709,7 +1746,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         // ListAggregatedBoards performs its own Keto expansion; a subject with
@@ -1754,7 +1793,9 @@ mod tests {
             ))
             .await
             .expect("create aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
@@ -1804,7 +1845,9 @@ mod tests {
             ))
             .await
             .expect("create aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let result = agg_svc
@@ -1853,7 +1896,9 @@ mod tests {
             ))
             .await
             .expect("create public aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         let internal_agg = agg_svc
             .create_aggregated_board(authed_request(
@@ -1869,7 +1914,9 @@ mod tests {
             ))
             .await
             .expect("create internal aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         let private_agg = agg_svc
             .create_aggregated_board(authed_request(
@@ -1885,7 +1932,9 @@ mod tests {
             ))
             .await
             .expect("create private aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         // Grant one stranger explicit view on the private aggregate.
         infra
@@ -1969,7 +2018,9 @@ mod tests {
             ))
             .await
             .expect("create aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         // Grant edit (middleware) and manage (handler-level visibility check).
@@ -2006,7 +2057,9 @@ mod tests {
             ))
             .await
             .expect("update visibility failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         assert_eq!(
             updated.visibility,
@@ -2057,6 +2110,8 @@ mod tests {
             .await
             .expect("get public board failed")
             .into_inner()
+            .detail
+            .expect("detail missing")
             .columns
             .first()
             .unwrap()
@@ -2073,6 +2128,8 @@ mod tests {
             .await
             .expect("get private board failed")
             .into_inner()
+            .detail
+            .expect("detail missing")
             .columns
             .first()
             .unwrap()
@@ -2127,7 +2184,9 @@ mod tests {
             ))
             .await
             .expect("create aggregate failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
@@ -2192,7 +2251,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         agg_svc
             .delete_aggregated_board(authed_request_with_object(
@@ -2255,7 +2316,9 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         // Grant edit so the update request passes middleware.
         infra
@@ -2286,7 +2349,9 @@ mod tests {
             ))
             .await
             .expect("update failed")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         assert_eq!(updated.name, "Renamed");
         assert_eq!(updated.description, "New desc");
@@ -2318,7 +2383,9 @@ mod tests {
             ))
             .await
             .expect("create aggregated board")
-            .into_inner();
+            .into_inner()
+            .aggregated_board
+            .expect("aggregated_board missing");
 
         // Grant view so the subscribe request passes the middleware check.
         infra
@@ -2349,7 +2416,10 @@ mod tests {
             .expect("cutover envelope errored");
 
         assert!(
-            matches!(first.payload, Some(EventPayload::Cutover(_))),
+            matches!(
+                first.envelope.expect("envelope missing").payload,
+                Some(EventPayload::Cutover(_))
+            ),
             "first payload should be a cutover"
         );
 
@@ -2399,7 +2469,10 @@ mod tests {
             .expect("stream ended before first item")
             .expect("first item errored");
         assert!(
-            matches!(first.payload, Some(EventPayload::Cutover(_))),
+            matches!(
+                first.envelope.expect("envelope missing").payload,
+                Some(EventPayload::Cutover(_))
+            ),
             "first item should be cutover"
         );
 
@@ -2409,7 +2482,10 @@ mod tests {
             .expect("stream ended before heartbeat")
             .expect("heartbeat item errored");
         assert!(
-            matches!(second.payload, Some(EventPayload::Heartbeat(_))),
+            matches!(
+                second.envelope.expect("envelope missing").payload,
+                Some(EventPayload::Heartbeat(_))
+            ),
             "second item should be a heartbeat"
         );
 

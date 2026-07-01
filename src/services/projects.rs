@@ -34,10 +34,11 @@ use crate::auth::keto_expand::{ExpandQuery, expand_objects};
 use crate::auth::keto_retry::KetoRetryExt;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
-    AddMemberRequest, BoardEventEnvelope, CreateProjectRequest, DeleteProjectRequest,
-    GetProjectRequest, ListMembersRequest, ListMembersResponse, ListProjectsRequest,
-    ListProjectsResponse, Project, ProjectMember, RemoveMemberRequest, SubscribeProjectRequest,
-    UpdateProjectRequest,
+    AddMemberRequest, AddMemberResponse, CreateProjectRequest, CreateProjectResponse,
+    DeleteProjectRequest, DeleteProjectResponse, GetProjectRequest, GetProjectResponse,
+    ListMembersRequest, ListMembersResponse, ListProjectsRequest, ListProjectsResponse, Project,
+    ProjectMember, RemoveMemberRequest, RemoveMemberResponse, SubscribeProjectRequest,
+    SubscribeProjectResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use crate::realtime::registry::BoardSubscriberRegistry;
 
@@ -138,7 +139,7 @@ async fn fetch_member_count(pool: &PgPool, project_id: Id) -> i32 {
 // ── Type alias ───────────────────────────────────────────────────────────────
 
 type SubscribeProjectStream =
-    Pin<Box<dyn Stream<Item = Result<BoardEventEnvelope, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<SubscribeProjectResponse, Status>> + Send + 'static>>;
 
 // ── impl ProjectService ──────────────────────────────────────────────────────
 
@@ -149,7 +150,7 @@ impl ProjectService for ProjectServiceImpl {
     async fn create_project(
         &self,
         request: Request<CreateProjectRequest>,
-    ) -> Result<Response<Project>, Status> {
+    ) -> Result<Response<CreateProjectResponse>, Status> {
         let subject = subject_from_request(&request)?;
         let req = request.into_inner();
 
@@ -174,7 +175,9 @@ impl ProjectService for ProjectServiceImpl {
 
                 if let Some(row) = row {
                     let member_count = fetch_member_count(&self.pool, project_id).await;
-                    return Ok(Response::new(project_from_row(&row, member_count)));
+                    return Ok(Response::new(CreateProjectResponse {
+                        project: Some(project_from_row(&row, member_count)),
+                    }));
                 }
                 // Project was deleted after idempotency key was set — fall through.
             }
@@ -267,7 +270,9 @@ impl ProjectService for ProjectServiceImpl {
                 warn!(error = %e, "failed to store idempotency key");
             }
 
-        Ok(Response::new(project))
+        Ok(Response::new(CreateProjectResponse {
+            project: Some(project),
+        }))
     }
 
     // ── GetProject ───────────────────────────────────────────────────────────
@@ -275,7 +280,7 @@ impl ProjectService for ProjectServiceImpl {
     async fn get_project(
         &self,
         request: Request<GetProjectRequest>,
-    ) -> Result<Response<Project>, Status> {
+    ) -> Result<Response<GetProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -291,7 +296,9 @@ impl ProjectService for ProjectServiceImpl {
         .ok_or_else(|| Status::not_found("project not found"))?;
 
         let member_count = fetch_member_count(&self.pool, project_id).await;
-        Ok(Response::new(project_from_row(&row, member_count)))
+        Ok(Response::new(GetProjectResponse {
+            project: Some(project_from_row(&row, member_count)),
+        }))
     }
 
     // ── ListProjects ─────────────────────────────────────────────────────────
@@ -347,7 +354,7 @@ impl ProjectService for ProjectServiceImpl {
     async fn update_project(
         &self,
         request: Request<UpdateProjectRequest>,
-    ) -> Result<Response<Project>, Status> {
+    ) -> Result<Response<UpdateProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -378,7 +385,9 @@ impl ProjectService for ProjectServiceImpl {
         .ok_or_else(|| Status::not_found("project not found"))?;
 
         let member_count = fetch_member_count(&self.pool, project_id).await;
-        Ok(Response::new(project_from_row(&row, member_count)))
+        Ok(Response::new(UpdateProjectResponse {
+            project: Some(project_from_row(&row, member_count)),
+        }))
     }
 
     // ── DeleteProject ────────────────────────────────────────────────────────
@@ -386,7 +395,7 @@ impl ProjectService for ProjectServiceImpl {
     async fn delete_project(
         &self,
         request: Request<DeleteProjectRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<DeleteProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -411,12 +420,15 @@ impl ProjectService for ProjectServiceImpl {
             "delete_project: Keto tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
-        Ok(Response::new(()))
+        Ok(Response::new(DeleteProjectResponse {}))
     }
 
     // ── AddMember ────────────────────────────────────────────────────────────
 
-    async fn add_member(&self, request: Request<AddMemberRequest>) -> Result<Response<()>, Status> {
+    async fn add_member(
+        &self,
+        request: Request<AddMemberRequest>,
+    ) -> Result<Response<AddMemberResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -471,7 +483,7 @@ impl ProjectService for ProjectServiceImpl {
             // Do not return error — reconciler will fix SQL drift.
         }
 
-        Ok(Response::new(()))
+        Ok(Response::new(AddMemberResponse {}))
     }
 
     // ── RemoveMember ─────────────────────────────────────────────────────────
@@ -479,7 +491,7 @@ impl ProjectService for ProjectServiceImpl {
     async fn remove_member(
         &self,
         request: Request<RemoveMemberRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<RemoveMemberResponse>, Status> {
         let object_id = checked_object_id(&request)?;
         let project_id = object_id
             .parse::<Id>()
@@ -532,7 +544,7 @@ impl ProjectService for ProjectServiceImpl {
             return Err(Status::not_found("member not found"));
         }
 
-        Ok(Response::new(()))
+        Ok(Response::new(RemoveMemberResponse {}))
     }
 
     // ── ListMembers ───────────────────────────────────────────────────────────
@@ -677,7 +689,9 @@ mod tests {
             ))
             .await
             .expect("create_project failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         assert!(!created.id.is_empty(), "created project must have an id");
         assert_eq!(created.name, "Test Project Alpha");
@@ -698,7 +712,9 @@ mod tests {
             ))
             .await
             .expect("get_project failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.name, created.name);
@@ -740,7 +756,9 @@ mod tests {
                 ))
                 .await
                 .expect("create failed")
-                .into_inner();
+                .into_inner()
+                .project
+                .expect("project missing");
             project_ids_a.push(p.id.parse::<Id>().unwrap());
         }
 
@@ -759,7 +777,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
         let project_id_b = pb.id.parse::<Id>().unwrap();
 
         // User A sees exactly 3 projects.
@@ -831,7 +851,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let project_id = created.id.clone();
 
@@ -858,7 +880,9 @@ mod tests {
             ))
             .await
             .expect("update_project failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         assert_eq!(updated.name, "Updated Name", "name should be updated");
         assert_eq!(
@@ -895,7 +919,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
@@ -955,7 +981,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
@@ -1020,7 +1048,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
@@ -1101,7 +1131,9 @@ mod tests {
             ))
             .await
             .expect("create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
@@ -1186,13 +1218,17 @@ mod tests {
             .create_project(make_req())
             .await
             .expect("first create failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         let second = svc
             .create_project(make_req())
             .await
             .expect("second create (replay) failed")
-            .into_inner();
+            .into_inner()
+            .project
+            .expect("project missing");
 
         // Both responses must carry the same project id.
         assert_eq!(
