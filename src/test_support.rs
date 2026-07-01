@@ -205,34 +205,64 @@ pub(crate) mod containers {
     use testcontainers::core::{ContainerPort, IntoContainerPort};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-    use tokio::sync::Mutex;
+    use tokio::sync::OnceCell;
     use tokio::time::sleep;
 
     use crate::integrations::s3::{S3Client, S3Config};
 
     /// Default container images for the harness. Override them with environment variables if needed.
-    const POSTGRES_IMAGE: &str = match option_env!("KANBAN_TEST_POSTGRES_IMAGE") {
-        Some(s) => s,
-        None => "mirror.gcr.io/library/postgres:16-alpine",
-    };
-    const NATS_IMAGE: &str = match option_env!("KANBAN_TEST_NATS_IMAGE") {
-        Some(s) => s,
-        None => "nats:2.10-alpine",
-    };
-    const KETO_IMAGE: &str = match option_env!("KANBAN_TEST_KETO_IMAGE") {
-        Some(s) => s,
-        None => "oryd/keto:v26.2.0",
-    };
-    const MINIO_IMAGE: &str = match option_env!("KANBAN_TEST_MINIO_IMAGE") {
-        Some(s) => s,
-        None => "minio/minio:RELEASE.2025-02-28T09-55-16Z",
-    };
-    const OPENSEARCH_IMAGE: &str = match option_env!("KANBAN_TEST_OPENSEARCH_IMAGE") {
-        Some(s) => s,
-        None => "opensearchproject/opensearch:2.19.1",
-    };
+    fn postgres_image() -> String {
+        std::env::var("KANBAN_TEST_POSTGRES_IMAGE")
+            .unwrap_or_else(|_| "mirror.gcr.io/library/postgres:16-alpine".to_string())
+    }
+    fn nats_image() -> String {
+        std::env::var("KANBAN_TEST_NATS_IMAGE").unwrap_or_else(|_| "nats:2.10-alpine".to_string())
+    }
+    fn keto_image() -> String {
+        std::env::var("KANBAN_TEST_KETO_IMAGE").unwrap_or_else(|_| "oryd/keto:v26.2.0".to_string())
+    }
+    fn minio_image() -> String {
+        std::env::var("KANBAN_TEST_MINIO_IMAGE")
+            .unwrap_or_else(|_| "minio/minio:RELEASE.2025-02-28T09-55-16Z".to_string())
+    }
+    fn opensearch_image() -> String {
+        std::env::var("KANBAN_TEST_OPENSEARCH_IMAGE")
+            .unwrap_or_else(|_| "opensearchproject/opensearch:2.19.1".to_string())
+    }
 
     const MINIO_BUCKET: &str = "sunbeam-kanban";
+
+    /// Detect a usable Docker-compatible socket and set DOCKER_HOST so that
+    /// testcontainers works out of the box on macOS with lima-docker, Docker
+    /// Desktop, socktainer, or a native Linux daemon.
+    ///
+    /// A socket file may exist even when its daemon is not running, so this
+    /// function actually tries to connect rather than only checking existence.
+    fn ensure_docker_host() {
+        if std::env::var("DOCKER_HOST").is_ok() {
+            return;
+        }
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates = [
+            format!("{home}/.lima/docker/sock/docker.sock"),
+            format!("{home}/.lima/sunbeam-docker/sock/docker.sock"),
+            format!("{home}/.socktainer/container.sock"),
+            format!("{home}/.docker/run/docker.sock"),
+            "/var/run/docker.sock".to_string(),
+        ];
+
+        for path in &candidates {
+            if std::path::Path::new(path).exists()
+                && std::os::unix::net::UnixStream::connect(path).is_ok()
+            {
+                unsafe {
+                    std::env::set_var("DOCKER_HOST", format!("unix://{path}"));
+                }
+                return;
+            }
+        }
+    }
 
     /// Clients for a single test's dependencies.
     ///
@@ -259,51 +289,37 @@ pub(crate) mod containers {
         _opensearch: Option<ContainerAsync<GenericImage>>,
     }
 
-    /// Clonable snapshot of the shared service URLs.
-    struct SharedUrls {
-        database_url: String,
-        nats_url: String,
-        keto_read_url: String,
-        keto_write_url: String,
-    }
-
     impl SharedInfra {
-        fn urls(&self) -> SharedUrls {
-            SharedUrls {
-                database_url: self.database_url.clone(),
-                nats_url: self.nats_url.clone(),
-                keto_read_url: self.keto_read_url.clone(),
-                keto_write_url: self.keto_write_url.clone(),
-            }
+        fn urls(&self) -> (String, String, String, String) {
+            (
+                self.database_url.clone(),
+                self.nats_url.clone(),
+                self.keto_read_url.clone(),
+                self.keto_write_url.clone(),
+            )
         }
     }
 
-    static SHARED: Mutex<Option<SharedInfra>> = Mutex::const_new(None);
+    static SHARED: OnceCell<SharedInfra> = OnceCell::const_new();
 
     /// Set up the shared test infrastructure and return a fresh `TestInfra`
     /// for the calling test.
     pub async fn setup() -> TestInfra {
-        let urls = {
-            let mut guard = SHARED.lock().await;
-            if guard.is_none() {
-                let infra = if let Some(infra) = from_env().await {
+        ensure_docker_host();
+
+        let infra = SHARED
+            .get_or_init(|| async {
+                if let Some(infra) = from_env().await {
                     infra
                 } else {
                     start_containers().await
-                };
-                *guard = Some(infra);
-            }
-            let infra = guard.as_ref().expect("shared infra initialized above");
-            infra.urls()
-        };
+                }
+            })
+            .await;
 
-        build_test_infra(
-            &urls.database_url,
-            &urls.nats_url,
-            &urls.keto_read_url,
-            &urls.keto_write_url,
-        )
-        .await
+        let (database_url, nats_url, keto_read_url, keto_write_url) = infra.urls();
+
+        build_test_infra(&database_url, &nats_url, &keto_read_url, &keto_write_url).await
     }
 
     /// Use externally-provided services when the standard env vars are set.
@@ -429,10 +445,11 @@ pub(crate) mod containers {
     }
 
     async fn start_postgres(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let parts: Vec<&str> = POSTGRES_IMAGE.rsplitn(2, ':').collect();
+        let image = postgres_image();
+        let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (POSTGRES_IMAGE.to_string(), "latest".to_string()),
+            _ => (image, "latest".to_string()),
         };
 
         let container = GenericImage::new(name, tag)
@@ -472,10 +489,11 @@ pub(crate) mod containers {
     }
 
     async fn start_nats(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let parts: Vec<&str> = NATS_IMAGE.rsplitn(2, ':').collect();
+        let image = nats_image();
+        let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (NATS_IMAGE.to_string(), "latest".to_string()),
+            _ => (image, "latest".to_string()),
         };
 
         let container = GenericImage::new(name, tag)
@@ -503,11 +521,12 @@ pub(crate) mod containers {
 
     async fn start_keto(timeout: Duration) -> ContainerAsync<GenericImage> {
         let config = keto_config();
+        let image = keto_image();
 
-        let parts: Vec<&str> = KETO_IMAGE.rsplitn(2, ':').collect();
+        let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (KETO_IMAGE.to_string(), "latest".to_string()),
+            _ => (image, "latest".to_string()),
         };
 
         let container = GenericImage::new(name, tag)
@@ -515,6 +534,7 @@ pub(crate) mod containers {
             .with_exposed_port(ContainerPort::Tcp(4467))
             .with_exposed_port(ContainerPort::Tcp(4468))
             .with_copy_to("/home/ory/keto.yml", config.into_bytes())
+            .with_env_var("KETO_WATCH", "false")
             .with_cmd(vec!["serve", "-c", "/home/ory/keto.yml"])
             .with_startup_timeout(timeout)
             .start()
@@ -544,10 +564,11 @@ pub(crate) mod containers {
     }
 
     async fn start_minio(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let parts: Vec<&str> = MINIO_IMAGE.rsplitn(2, ':').collect();
+        let image = minio_image();
+        let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (MINIO_IMAGE.to_string(), "latest".to_string()),
+            _ => (image, "latest".to_string()),
         };
 
         let container = GenericImage::new(name, tag)
@@ -576,10 +597,11 @@ pub(crate) mod containers {
     }
 
     async fn start_opensearch(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let parts: Vec<&str> = OPENSEARCH_IMAGE.rsplitn(2, ':').collect();
+        let image = opensearch_image();
+        let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
-            _ => (OPENSEARCH_IMAGE.to_string(), "latest".to_string()),
+            _ => (image, "latest".to_string()),
         };
 
         let container = GenericImage::new(name, tag)

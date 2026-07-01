@@ -16,7 +16,6 @@ LICENSE
 AGENTS.md
 
 # CI / local testing scripts and integration tooling
-test.sh
 .integration/
 
 # Coverage / profiling artifacts
