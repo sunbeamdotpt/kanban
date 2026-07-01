@@ -15,7 +15,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 import "sunbeam/kanban/v1/github.proto";
@@ -148,6 +147,10 @@ message GetCardRequest {
   string card_id = 1;
 }
 
+message GetCardResponse {
+  Card card = 1;
+}
+
 message BatchGetCardsRequest {
   string board_id = 1;
   repeated string card_ids = 2;
@@ -188,6 +191,10 @@ message CreateCardRequest {
   CardUrgency urgency = 10;
 }
 
+message CreateCardResponse {
+  Card card = 1;
+}
+
 message UpdateCardRequest {
   string card_id = 1;
   // Sparse patch — only fields named in update_mask are applied.
@@ -195,6 +202,10 @@ message UpdateCardRequest {
   google.protobuf.FieldMask update_mask = 3;
   // ULID — required. Server stores for 24h idempotency.
   string idempotency_key = 4;
+}
+
+message UpdateCardResponse {
+  Card card = 1;
 }
 
 // MoveCardRequest — same-project moves only. Cross-project moves return
@@ -210,16 +221,38 @@ message MoveCardRequest {
   string idempotency_key = 4;
 }
 
+message MoveCardResponse {
+  Card card = 1;
+}
+
 message DeleteCardRequest {
   string card_id = 1;
 }
 
-// CardDependencyRequest links two cards: `card_id` depends on `depends_on_card_id`.
+message DeleteCardResponse {}
+
+// AddCardDependencyRequest links two cards: `card_id` depends on `depends_on_card_id`.
 // Both cards must belong to the same board. idempotency_key is required.
-message CardDependencyRequest {
+message AddCardDependencyRequest {
   string card_id = 1;
   string depends_on_card_id = 2;
   string idempotency_key = 3;
+}
+
+message AddCardDependencyResponse {
+  Card card = 1;
+}
+
+// RemoveCardDependencyRequest removes a directed dependency edge.
+// Both cards must belong to the same board. idempotency_key is required.
+message RemoveCardDependencyRequest {
+  string card_id = 1;
+  string depends_on_card_id = 2;
+  string idempotency_key = 3;
+}
+
+message RemoveCardDependencyResponse {
+  Card card = 1;
 }
 
 // BulkUpdateCardLabelsRequest replaces the full label set on each named card.
@@ -243,9 +276,17 @@ message AssignCardRequest {
   string subject = 2;
 }
 
+message AssignCardResponse {
+  Card card = 1;
+}
+
 message UnassignCardRequest {
   string card_id = 1;
   string subject = 2;
+}
+
+message UnassignCardResponse {
+  Card card = 1;
 }
 
 message AddChecklistItemRequest {
@@ -256,6 +297,10 @@ message AddChecklistItemRequest {
   string idempotency_key = 4;
 }
 
+message AddChecklistItemResponse {
+  Card card = 1;
+}
+
 message UpdateChecklistItemRequest {
   string card_id = 1;
   string item_id = 2;
@@ -263,10 +308,16 @@ message UpdateChecklistItemRequest {
   google.protobuf.FieldMask update_mask = 4;
 }
 
+message UpdateChecklistItemResponse {
+  Card card = 1;
+}
+
 message RemoveChecklistItemRequest {
   string card_id = 1;
   string item_id = 2;
 }
+
+message RemoveChecklistItemResponse {}
 
 message AddCommentRequest {
   string card_id = 1;
@@ -275,16 +326,26 @@ message AddCommentRequest {
   string idempotency_key = 3;
 }
 
+message AddCommentResponse {
+  Comment comment = 1;
+}
+
 message EditCommentRequest {
   string card_id = 1;
   string comment_id = 2;
   string body = 3;
 }
 
+message EditCommentResponse {
+  Comment comment = 1;
+}
+
 message DeleteCommentRequest {
   string card_id = 1;
   string comment_id = 2;
 }
+
+message DeleteCommentResponse {}
 
 message ListCommentsRequest {
   string card_id = 1;
@@ -311,7 +372,7 @@ message ListCommentsResponse {
 // authoritative relation per RPC.
 service CardService {
   // GetCard requires "view" on the card's parent KanbanBoard.
-  rpc GetCard(GetCardRequest) returns (Card);
+  rpc GetCard(GetCardRequest) returns (GetCardResponse);
 
   // BatchGetCards hydrates multiple cards for a board in one call.
   // Use after GetBoard (BoardService) to populate initial board state.
@@ -324,58 +385,58 @@ service CardService {
 
   // CreateCard requires "edit" on the parent KanbanBoard. idempotency_key
   // is required. Allocates a card ref via project_ref_counter (MF-3).
-  rpc CreateCard(CreateCardRequest) returns (Card);
+  rpc CreateCard(CreateCardRequest) returns (CreateCardResponse);
 
   // UpdateCard applies a sparse patch to the card. Requires "edit" on the
   // board. idempotency_key is required.
-  rpc UpdateCard(UpdateCardRequest) returns (Card);
+  rpc UpdateCard(UpdateCardRequest) returns (UpdateCardResponse);
 
   // MoveCard repositions a card within or between columns on the same board.
   // Cross-project moves return Unimplemented (MF-3). idempotency_key is
   // strongly recommended; echoed in the CardMoved stream event for optimistic-UI
   // deduplication (Tension 7 / Pre-mortem 3).
-  rpc MoveCard(MoveCardRequest) returns (Card);
+  rpc MoveCard(MoveCardRequest) returns (MoveCardResponse);
 
   // DeleteCard requires "edit" on the board. Emits CardDeleted stream event.
-  rpc DeleteCard(DeleteCardRequest) returns (google.protobuf.Empty);
+  rpc DeleteCard(DeleteCardRequest) returns (DeleteCardResponse);
 
   // AddCardDependency creates a directed edge: card_id depends on depends_on_card_id.
   // Both cards must belong to the same board. Requires "edit" on the board.
-  rpc AddCardDependency(CardDependencyRequest) returns (Card);
+  rpc AddCardDependency(AddCardDependencyRequest) returns (AddCardDependencyResponse);
 
   // RemoveCardDependency removes a directed dependency edge.
   // Both cards must belong to the same board. Requires "edit" on the board.
-  rpc RemoveCardDependency(CardDependencyRequest) returns (Card);
+  rpc RemoveCardDependency(RemoveCardDependencyRequest) returns (RemoveCardDependencyResponse);
 
   // BulkUpdateCardLabels replaces the label set on multiple cards.
   // Requires "edit" on the board for each card.
   rpc BulkUpdateCardLabels(BulkUpdateCardLabelsRequest) returns (BulkUpdateCardLabelsResponse);
 
   // AssignCard adds an assignee to a card. Requires "edit" on the board.
-  rpc AssignCard(AssignCardRequest) returns (Card);
+  rpc AssignCard(AssignCardRequest) returns (AssignCardResponse);
 
   // UnassignCard removes an assignee from a card. Requires "edit".
-  rpc UnassignCard(UnassignCardRequest) returns (Card);
+  rpc UnassignCard(UnassignCardRequest) returns (UnassignCardResponse);
 
   // AddChecklistItem appends or inserts a checklist item. Requires "edit".
-  rpc AddChecklistItem(AddChecklistItemRequest) returns (Card);
+  rpc AddChecklistItem(AddChecklistItemRequest) returns (AddChecklistItemResponse);
 
   // UpdateChecklistItem edits text or done status. Requires "edit".
-  rpc UpdateChecklistItem(UpdateChecklistItemRequest) returns (Card);
+  rpc UpdateChecklistItem(UpdateChecklistItemRequest) returns (UpdateChecklistItemResponse);
 
   // RemoveChecklistItem deletes a checklist item. Requires "edit".
-  rpc RemoveChecklistItem(RemoveChecklistItemRequest) returns (google.protobuf.Empty);
+  rpc RemoveChecklistItem(RemoveChecklistItemRequest) returns (RemoveChecklistItemResponse);
 
   // AddComment posts a new comment on a card.
   // Requires at minimum "view" relation (viewers may comment).
-  rpc AddComment(AddCommentRequest) returns (Comment);
+  rpc AddComment(AddCommentRequest) returns (AddCommentResponse);
 
   // EditComment updates a comment body. Only the original author or an
   // admin may edit.
-  rpc EditComment(EditCommentRequest) returns (Comment);
+  rpc EditComment(EditCommentRequest) returns (EditCommentResponse);
 
   // DeleteComment removes a comment. Only the author or an admin may delete.
-  rpc DeleteComment(DeleteCommentRequest) returns (google.protobuf.Empty);
+  rpc DeleteComment(DeleteCommentRequest) returns (DeleteCommentResponse);
 
   // ListComments returns paginated comments for a card. Requires "view".
   rpc ListComments(ListCommentsRequest) returns (ListCommentsResponse);

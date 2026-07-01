@@ -13,7 +13,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 import "sunbeam/kanban/v1/events.proto";
@@ -70,8 +69,16 @@ message CreateProjectRequest {
   string idempotency_key = 6;
 }
 
+message CreateProjectResponse {
+  Project project = 1;
+}
+
 message GetProjectRequest {
   string project_id = 1;
+}
+
+message GetProjectResponse {
+  Project project = 1;
 }
 
 // ListProjectsRequest has no fields: the server derives the subject from the
@@ -90,9 +97,15 @@ message UpdateProjectRequest {
   google.protobuf.FieldMask update_mask = 3;
 }
 
+message UpdateProjectResponse {
+  Project project = 1;
+}
+
 message DeleteProjectRequest {
   string project_id = 1;
 }
+
+message DeleteProjectResponse {}
 
 message ListMembersRequest {
   string project_id = 1;
@@ -111,10 +124,14 @@ message AddMemberRequest {
   string relation = 3;
 }
 
+message AddMemberResponse {}
+
 message RemoveMemberRequest {
   string project_id = 1;
   string subject = 2;
 }
+
+message RemoveMemberResponse {}
 
 // SubscribeProjectRequest — streams project-level events (membership changes,
 // board list changes). since_seq is a JetStream sequence number resume token;
@@ -123,6 +140,10 @@ message SubscribeProjectRequest {
   string project_id = 1;
   // Optional JetStream sequence number to resume from.
   uint64 since_seq = 2;
+}
+
+message SubscribeProjectResponse {
+  BoardEventEnvelope envelope = 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -140,27 +161,27 @@ service ProjectService {
   // keto_expand_objects(KanbanProject, view, subject) — one Keto round-trip.
   rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
 
-  rpc GetProject(GetProjectRequest) returns (Project);
+  rpc GetProject(GetProjectRequest) returns (GetProjectResponse);
 
   // CreateProject requires no prior Keto object (the caller becomes owner).
-  rpc CreateProject(CreateProjectRequest) returns (Project);
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
 
   // UpdateProject requires "administer" on the project.
-  rpc UpdateProject(UpdateProjectRequest) returns (Project);
+  rpc UpdateProject(UpdateProjectRequest) returns (UpdateProjectResponse);
 
   // DeleteProject requires "owner" relation on the project.
-  rpc DeleteProject(DeleteProjectRequest) returns (google.protobuf.Empty);
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
 
   rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
 
   // AddMember requires "administer" relation. Writes Keto tuple atomically
   // with the project_member_view mirror row.
-  rpc AddMember(AddMemberRequest) returns (google.protobuf.Empty);
+  rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 
   // RemoveMember requires "administer" relation. Removes Keto tuple.
-  rpc RemoveMember(RemoveMemberRequest) returns (google.protobuf.Empty);
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 
   // SubscribeProject streams project-level events. Cadence: JWT checked
   // per-yield; Keto rechecked every 30s or on Heartbeat (whichever sooner).
-  rpc SubscribeProject(SubscribeProjectRequest) returns (stream BoardEventEnvelope);
+  rpc SubscribeProject(SubscribeProjectRequest) returns (stream SubscribeProjectResponse);
 }

@@ -12,7 +12,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 import "sunbeam/kanban/v1/events.proto";
@@ -47,9 +46,9 @@ message Column {
 // Visibility levels for boards and aggregated boards.
 enum BoardVisibility {
   BOARD_VISIBILITY_UNSPECIFIED = 0;
-  PRIVATE = 1;
-  INTERNAL = 2;
-  PUBLIC = 3;
+  BOARD_VISIBILITY_PRIVATE = 1;
+  BOARD_VISIBILITY_INTERNAL = 2;
+  BOARD_VISIBILITY_PUBLIC = 3;
 }
 
 // Board groups columns and cards within a project.
@@ -88,8 +87,16 @@ message CreateBoardRequest {
   BoardVisibility visibility = 6;
 }
 
+message CreateBoardResponse {
+  Board board = 1;
+}
+
 message GetBoardRequest {
   string board_id = 1;
+}
+
+message GetBoardResponse {
+  BoardDetail detail = 1;
 }
 
 message ListBoardsRequest {
@@ -106,9 +113,15 @@ message UpdateBoardRequest {
   google.protobuf.FieldMask update_mask = 3;
 }
 
+message UpdateBoardResponse {
+  Board board = 1;
+}
+
 message DeleteBoardRequest {
   string board_id = 1;
 }
+
+message DeleteBoardResponse {}
 
 message AddColumnRequest {
   string board_id = 1;
@@ -120,6 +133,10 @@ message AddColumnRequest {
   string idempotency_key = 6;
 }
 
+message AddColumnResponse {
+  Column column = 1;
+}
+
 message UpdateColumnRequest {
   string board_id = 1;
   string column_id = 2;
@@ -127,10 +144,16 @@ message UpdateColumnRequest {
   google.protobuf.FieldMask update_mask = 4;
 }
 
+message UpdateColumnResponse {
+  Column column = 1;
+}
+
 message RemoveColumnRequest {
   string board_id = 1;
   string column_id = 2;
 }
+
+message RemoveColumnResponse {}
 
 // MoveColumnRequest reorders a column within the board.
 // The server recalculates gap-filled positions for all columns.
@@ -156,6 +179,10 @@ message SubscribeBoardRequest {
   uint64 since_seq = 2;
 }
 
+message SubscribeBoardResponse {
+  BoardEventEnvelope envelope = 1;
+}
+
 // ----------------------------------------------------------------------------
 // Service
 // ----------------------------------------------------------------------------
@@ -171,25 +198,25 @@ service BoardService {
 
   // GetBoard returns the board with its full column list but without card
   // bodies — use BatchGetCards (CardService) to hydrate cards.
-  rpc GetBoard(GetBoardRequest) returns (BoardDetail);
+  rpc GetBoard(GetBoardRequest) returns (GetBoardResponse);
 
   // CreateBoard requires "edit" on the parent project.
-  rpc CreateBoard(CreateBoardRequest) returns (Board);
+  rpc CreateBoard(CreateBoardRequest) returns (CreateBoardResponse);
 
   // UpdateBoard requires "edit" on the board (KanbanBoard namespace).
-  rpc UpdateBoard(UpdateBoardRequest) returns (Board);
+  rpc UpdateBoard(UpdateBoardRequest) returns (UpdateBoardResponse);
 
   // DeleteBoard requires "administer" on the board.
-  rpc DeleteBoard(DeleteBoardRequest) returns (google.protobuf.Empty);
+  rpc DeleteBoard(DeleteBoardRequest) returns (DeleteBoardResponse);
 
   // AddColumn requires "edit" on the board.
-  rpc AddColumn(AddColumnRequest) returns (Column);
+  rpc AddColumn(AddColumnRequest) returns (AddColumnResponse);
 
   // UpdateColumn requires "edit" on the board.
-  rpc UpdateColumn(UpdateColumnRequest) returns (Column);
+  rpc UpdateColumn(UpdateColumnRequest) returns (UpdateColumnResponse);
 
   // RemoveColumn requires "administer" on the board.
-  rpc RemoveColumn(RemoveColumnRequest) returns (google.protobuf.Empty);
+  rpc RemoveColumn(RemoveColumnRequest) returns (RemoveColumnResponse);
 
   // MoveColumn reorders a column within its board. Requires "edit".
   rpc MoveColumn(MoveColumnRequest) returns (MoveColumnResponse);
@@ -198,5 +225,5 @@ service BoardService {
   // call. JWT checked per-yield; Keto rechecked every 30s or on Heartbeat
   // (whichever sooner). Per the MF-6 resume protocol, since_seq=0 means
   // live-tail; non-zero triggers JetStream replay from that sequence.
-  rpc SubscribeBoard(SubscribeBoardRequest) returns (stream BoardEventEnvelope);
+  rpc SubscribeBoard(SubscribeBoardRequest) returns (stream SubscribeBoardResponse);
 }

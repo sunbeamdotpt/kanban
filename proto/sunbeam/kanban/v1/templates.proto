@@ -8,7 +8,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -52,11 +51,19 @@ message GetTemplateRequest {
   string template_id = 1;
 }
 
+message GetTemplateResponse {
+  BoardTemplate template = 1;
+}
+
 message CreateTemplateRequest {
   string project_id = 1;
   string name = 2;
   string description = 3;
   repeated TemplateColumn columns = 4;
+}
+
+message CreateTemplateResponse {
+  BoardTemplate template = 1;
 }
 
 message UpdateTemplateRequest {
@@ -68,9 +75,15 @@ message UpdateTemplateRequest {
   repeated TemplateColumn columns = 5;
 }
 
+message UpdateTemplateResponse {
+  BoardTemplate template = 1;
+}
+
 message DeleteTemplateRequest {
   string template_id = 1;
 }
+
+message DeleteTemplateResponse {}
 
 // A default checklist item stored inside a card template.
 message TemplateChecklistItem {
@@ -109,6 +122,10 @@ message GetCardTemplateRequest {
   string template_id = 1;
 }
 
+message GetCardTemplateResponse {
+  CardTemplate template = 1;
+}
+
 message CreateCardTemplateRequest {
   string project_id = 1;
   string name = 2;
@@ -117,6 +134,10 @@ message CreateCardTemplateRequest {
   string default_description = 5;
   repeated string label_names = 6;
   repeated TemplateChecklistItem checklist_items = 7;
+}
+
+message CreateCardTemplateResponse {
+  CardTemplate template = 1;
 }
 
 message UpdateCardTemplateRequest {
@@ -132,22 +153,28 @@ message UpdateCardTemplateRequest {
   repeated TemplateChecklistItem checklist_items = 8;
 }
 
+message UpdateCardTemplateResponse {
+  CardTemplate template = 1;
+}
+
 message DeleteCardTemplateRequest {
   string template_id = 1;
 }
 
+message DeleteCardTemplateResponse {}
+
 service TemplatesService {
   // Board templates.
   rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
-  rpc GetTemplate(GetTemplateRequest) returns (BoardTemplate);
-  rpc CreateTemplate(CreateTemplateRequest) returns (BoardTemplate);
-  rpc UpdateTemplate(UpdateTemplateRequest) returns (BoardTemplate);
-  rpc DeleteTemplate(DeleteTemplateRequest) returns (google.protobuf.Empty);
+  rpc GetTemplate(GetTemplateRequest) returns (GetTemplateResponse);
+  rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse);
+  rpc UpdateTemplate(UpdateTemplateRequest) returns (UpdateTemplateResponse);
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
 
   // Card templates.
   rpc ListCardTemplates(ListCardTemplatesRequest) returns (ListCardTemplatesResponse);
-  rpc GetCardTemplate(GetCardTemplateRequest) returns (CardTemplate);
-  rpc CreateCardTemplate(CreateCardTemplateRequest) returns (CardTemplate);
-  rpc UpdateCardTemplate(UpdateCardTemplateRequest) returns (CardTemplate);
-  rpc DeleteCardTemplate(DeleteCardTemplateRequest) returns (google.protobuf.Empty);
+  rpc GetCardTemplate(GetCardTemplateRequest) returns (GetCardTemplateResponse);
+  rpc CreateCardTemplate(CreateCardTemplateRequest) returns (CreateCardTemplateResponse);
+  rpc UpdateCardTemplate(UpdateCardTemplateRequest) returns (UpdateCardTemplateResponse);
+  rpc DeleteCardTemplate(DeleteCardTemplateRequest) returns (DeleteCardTemplateResponse);
 }

@@ -20,8 +20,16 @@ message GetPublicBoardRequest {
   string board_id = 1;
 }
 
+message GetPublicBoardResponse {
+  Board board = 1;
+}
+
 message ListPublicBoardsRequest {
   string project_id = 1;
+}
+
+message ListPublicBoardsResponse {
+  repeated Board boards = 1;
 }
 
 // PublicBoardService exposes read-only access to public boards.
@@ -30,8 +38,8 @@ message ListPublicBoardsRequest {
 // expecting them to be honoured; the routes skip the auth middleware stack.
 service PublicBoardService {
   // GetPublicBoard returns a board only if its visibility is PUBLIC.
-  rpc GetPublicBoard(GetPublicBoardRequest) returns (Board);
+  rpc GetPublicBoard(GetPublicBoardRequest) returns (GetPublicBoardResponse);
 
   // ListPublicBoards returns all public boards in the given project.
-  rpc ListPublicBoards(ListPublicBoardsRequest) returns (ListBoardsResponse);
+  rpc ListPublicBoards(ListPublicBoardsRequest) returns (ListPublicBoardsResponse);
 }

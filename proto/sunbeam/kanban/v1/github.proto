@@ -14,7 +14,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 option java_package = "pt.sunbeam.kanban.v1";
@@ -73,22 +72,28 @@ message GitHubIssueResult {
 // Request / response messages
 // ----------------------------------------------------------------------------
 
-message LinkGitHubIssueRequest {
+message LinkIssueRequest {
   string card_id = 1;
   string repo_owner = 2;
   string repo_name = 3;
   int32 number = 4;
 }
 
-message UnlinkGitHubIssueRequest {
+message LinkIssueResponse {
+  GitHubLinkDetail link = 1;
+}
+
+message UnlinkIssueRequest {
   string link_id = 1;
 }
 
-message ListGitHubLinksByCardRequest {
+message UnlinkIssueResponse {}
+
+message ListLinksByCardRequest {
   string card_id = 1;
 }
 
-message ListGitHubLinksByCardResponse {
+message ListLinksByCardResponse {
   repeated GitHubLinkDetail links = 1;
 }
 
@@ -107,8 +112,12 @@ message SearchGithubIssuesResponse {
   repeated GitHubIssueResult results = 1;
 }
 
-message ResyncGitHubLinkRequest {
+message ResyncLinkRequest {
   string link_id = 1;
+}
+
+message ResyncLinkResponse {
+  GitHubLinkDetail link = 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -127,13 +136,13 @@ service GithubLinkService {
   // LinkIssue creates a GitHubLink between a card and a GitHub issue/PR.
   // Performs an initial sync of title/state from GitHub on creation.
   // Emits GitHubLinkAddedEvent on the board stream.
-  rpc LinkIssue(LinkGitHubIssueRequest) returns (GitHubLinkDetail);
+  rpc LinkIssue(LinkIssueRequest) returns (LinkIssueResponse);
 
   // UnlinkIssue removes the link. Does not close or modify the GitHub issue.
-  rpc UnlinkIssue(UnlinkGitHubIssueRequest) returns (google.protobuf.Empty);
+  rpc UnlinkIssue(UnlinkIssueRequest) returns (UnlinkIssueResponse);
 
   // ListLinksByCard returns all links for a card.
-  rpc ListLinksByCard(ListGitHubLinksByCardRequest) returns (ListGitHubLinksByCardResponse);
+  rpc ListLinksByCard(ListLinksByCardRequest) returns (ListLinksByCardResponse);
 
   // SearchGithubIssues proxies a search query to the GitHub API.
   // Results are not persisted; this is a live search for the link picker UI.
@@ -141,5 +150,5 @@ service GithubLinkService {
 
   // ResyncLink re-fetches title/state from GitHub and updates the record.
   // Emits GitHubLinkRefreshedEvent on the board stream.
-  rpc ResyncLink(ResyncGitHubLinkRequest) returns (GitHubLinkDetail);
+  rpc ResyncLink(ResyncLinkRequest) returns (ResyncLinkResponse);
 }

@@ -14,7 +14,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 import "sunbeam/kanban/v1/boards.proto";
@@ -92,8 +91,16 @@ message CreateAggregatedBoardRequest {
   BoardVisibility visibility = 6;
 }
 
+message CreateAggregatedBoardResponse {
+  AggregatedBoard aggregated_board = 1;
+}
+
 message GetAggregatedBoardRequest {
   string aggregated_board_id = 1;
+}
+
+message GetAggregatedBoardResponse {
+  AggregatedBoardChunk chunk = 1;
 }
 
 message UpdateAggregatedBoardRequest {
@@ -102,9 +109,15 @@ message UpdateAggregatedBoardRequest {
   google.protobuf.FieldMask update_mask = 3;
 }
 
+message UpdateAggregatedBoardResponse {
+  AggregatedBoard aggregated_board = 1;
+}
+
 message DeleteAggregatedBoardRequest {
   string aggregated_board_id = 1;
 }
+
+message DeleteAggregatedBoardResponse {}
 
 message ListAggregatedBoardsRequest {}
 
@@ -119,9 +132,17 @@ message AddSourceBoardRequest {
   int32 position = 3;
 }
 
+message AddSourceBoardResponse {
+  AggregatedBoard aggregated_board = 1;
+}
+
 message RemoveSourceBoardRequest {
   string aggregated_board_id = 1;
   string board_id = 2;
+}
+
+message RemoveSourceBoardResponse {
+  AggregatedBoard aggregated_board = 1;
 }
 
 message MoveSourceBoardRequest {
@@ -130,12 +151,20 @@ message MoveSourceBoardRequest {
   int32 to_position = 3;
 }
 
+message MoveSourceBoardResponse {
+  AggregatedBoard aggregated_board = 1;
+}
+
 // SubscribeAggregatedBoardRequest streams events from all source boards plus
 // aggregate-level metadata changes. since_seq is a JetStream resume token;
 // omit for live-tail only.
 message SubscribeAggregatedBoardRequest {
   string aggregated_board_id = 1;
   uint64 since_seq = 2;
+}
+
+message SubscribeAggregatedBoardResponse {
+  BoardEventEnvelope envelope = 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -150,18 +179,18 @@ message SubscribeAggregatedBoardRequest {
 // card/column.
 service AggregatedBoardService {
   // CreateAggregatedBoard requires a valid bearer token; no prior Keto object.
-  rpc CreateAggregatedBoard(CreateAggregatedBoardRequest) returns (AggregatedBoard);
+  rpc CreateAggregatedBoard(CreateAggregatedBoardRequest) returns (CreateAggregatedBoardResponse);
 
   // GetAggregatedBoard streams metadata, source boards, columns, and card
   // batches. Requires "view" on the aggregated board.
-  rpc GetAggregatedBoard(GetAggregatedBoardRequest) returns (stream AggregatedBoardChunk);
+  rpc GetAggregatedBoard(GetAggregatedBoardRequest) returns (stream GetAggregatedBoardResponse);
 
   // UpdateAggregatedBoard applies a sparse patch to metadata.
   // Requires "edit" on the aggregated board.
-  rpc UpdateAggregatedBoard(UpdateAggregatedBoardRequest) returns (AggregatedBoard);
+  rpc UpdateAggregatedBoard(UpdateAggregatedBoardRequest) returns (UpdateAggregatedBoardResponse);
 
   // DeleteAggregatedBoard requires "manage" on the aggregated board.
-  rpc DeleteAggregatedBoard(DeleteAggregatedBoardRequest) returns (google.protobuf.Empty);
+  rpc DeleteAggregatedBoard(DeleteAggregatedBoardRequest) returns (DeleteAggregatedBoardResponse);
 
   // ListAggregatedBoards returns aggregates the caller can view, post-filtered
   // via keto_expand_objects(KanbanAggregatedBoard, view, subject).
@@ -169,17 +198,17 @@ service AggregatedBoardService {
 
   // AddSourceBoard includes a board in the aggregate.
   // Requires "manage" on the aggregated board and "view" on the source board.
-  rpc AddSourceBoard(AddSourceBoardRequest) returns (AggregatedBoard);
+  rpc AddSourceBoard(AddSourceBoardRequest) returns (AddSourceBoardResponse);
 
   // RemoveSourceBoard removes a board from the aggregate.
   // Requires "manage" on the aggregated board.
-  rpc RemoveSourceBoard(RemoveSourceBoardRequest) returns (AggregatedBoard);
+  rpc RemoveSourceBoard(RemoveSourceBoardRequest) returns (RemoveSourceBoardResponse);
 
   // MoveSourceBoard reorders a source board within the aggregate.
   // Requires "manage" on the aggregated board.
-  rpc MoveSourceBoard(MoveSourceBoardRequest) returns (AggregatedBoard);
+  rpc MoveSourceBoard(MoveSourceBoardRequest) returns (MoveSourceBoardResponse);
 
   // SubscribeAggregatedBoard merges live event streams from all source boards.
   // Requires "view" on the aggregated board.
-  rpc SubscribeAggregatedBoard(SubscribeAggregatedBoardRequest) returns (stream BoardEventEnvelope);
+  rpc SubscribeAggregatedBoard(SubscribeAggregatedBoardRequest) returns (stream SubscribeAggregatedBoardResponse);
 }

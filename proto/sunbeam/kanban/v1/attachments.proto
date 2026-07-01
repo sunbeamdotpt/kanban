@@ -14,7 +14,6 @@ syntax = "proto3";
 
 package sunbeam.kanban.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 option java_package = "pt.sunbeam.kanban.v1";
@@ -71,6 +70,10 @@ message ConfirmUploadRequest {
   string attachment_id = 1;
 }
 
+message ConfirmUploadResponse {
+  Attachment attachment = 1;
+}
+
 // RequestPresignedDownloadRequest mints a time-limited GET URL.
 message RequestPresignedDownloadRequest {
   string attachment_id = 1;
@@ -85,6 +88,8 @@ message RequestPresignedDownloadResponse {
 message DeleteAttachmentRequest {
   string attachment_id = 1;
 }
+
+message DeleteAttachmentResponse {}
 
 message ListAttachmentsByCardRequest {
   string card_id = 1;
@@ -117,14 +122,14 @@ service AttachmentService {
 
   // ConfirmUpload transitions the attachment to confirmed state after the
   // client PUT succeeds. Emits AttachmentAddedEvent on the board stream.
-  rpc ConfirmUpload(ConfirmUploadRequest) returns (Attachment);
+  rpc ConfirmUpload(ConfirmUploadRequest) returns (ConfirmUploadResponse);
 
   // RequestPresignedDownload mints a time-limited GET URL. Requires "view".
   rpc RequestPresignedDownload(RequestPresignedDownloadRequest) returns (RequestPresignedDownloadResponse);
 
   // DeleteAttachment removes the attachment record and the SeaweedFS object.
   // Requires "edit" on the card's board.
-  rpc DeleteAttachment(DeleteAttachmentRequest) returns (google.protobuf.Empty);
+  rpc DeleteAttachment(DeleteAttachmentRequest) returns (DeleteAttachmentResponse);
 
   // ListAttachmentsByCard returns all confirmed attachments for a card.
   // Requires "view" on the card's board.
