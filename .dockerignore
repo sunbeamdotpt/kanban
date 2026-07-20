@@ -15,8 +15,10 @@ CHANGELOG.md
 LICENSE
 AGENTS.md
 
-# CI / local testing scripts and integration tooling
-.integration/
+# CI / local testing scripts and integration tooling. The OpenFGA model is a
+# build input (embedded into the binary via include_str!), so it is re-included.
+.integration/*
+!.integration/openfga-model.json
 
 # Coverage / profiling artifacts
 coverage*.lcov

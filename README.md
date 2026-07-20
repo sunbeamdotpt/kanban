@@ -1,9 +1,10 @@
-<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 ---
+license: AGPL-3.0-or-later
 title: Sunbeam Kanban
 description: Real-time collaborative board management for Sunbeam Studios.
 category: product
 order: 0
+nav_order: 0
 labels:
   org: sunbeam
   repo: kanban
@@ -31,10 +32,10 @@ Real-time collaborative board management for Sunbeam Studios. Organize cards acr
 
 ## Development stack
 
-- **Backend:** Rust (Axum, SQLx, NATS, sso-gateway).
+- **Backend:** Rust (Axum, SQLx, NATS, Sunbeam Studios' SSO Gateway).
 - **Transport:** Connect-RPC over h2 with SSE fallback.
 - **Realtime:** NATS JetStream fanout and replay.
-- **Auth:** sso-gateway (unified OAuth2 + OpenFGA permissions).
+- **Auth:** Sunbeam Studios' SSO Gateway (unified OAuth2 + OpenFGA permissions).
 - **Database:** PostgreSQL.
 - **Search:** OpenSearch.
 - **Object storage:** S3-compatible store for attachments.

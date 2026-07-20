@@ -1,2 +1,7 @@
-[registries.sunbeam]
-index = "sparse+https://src.sunbeam.pt/api/packages/studio/cargo/"
+# gxhash (via sunbeam-g2v's cache feature) requires AES intrinsics, which the
+# baseline Linux targets do not enable. Every CPU we deploy on has them.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+aes,+neon"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+aes,+sse2"]
