@@ -34,8 +34,8 @@ Sunbeam Kanban is a real-time collaborative board-management service for creativ
 ## High-level capabilities
 
 - **Real-time collaboration:** Every mutation is written to Postgres, published to NATS JetStream, and streamed to connected clients within milliseconds.
-- **Fine-grained access control:** Ory Keto gates every RPC. Object IDs come from headers, not request bodies, so server-streaming calls cannot be bypassed by forging a body.
-- **Global search:** OpenSearch indexes card titles, descriptions, and GitHub issue titles. Results are post-filtered through Keto so users only see cards they are allowed to see.
+- **Fine-grained access control:** The sso-gateway (OpenFGA-backed) gates every RPC. Object IDs come from headers, not request bodies, so server-streaming calls cannot be bypassed by forging a body.
+- **Global search:** OpenSearch indexes card titles, descriptions, and GitHub issue titles. Results are post-filtered through the permission backend so users only see cards they are allowed to see.
 - **GitHub linking:** Cards can be linked to GitHub issues; titles, labels, and assignees are pulled on demand.
 - **Attachments:** Files are uploaded directly to S3 via presigned URLs, then confirmed and stored as card attachments.
 
@@ -46,7 +46,7 @@ Connect-RPC clients  →  Axum/Tonic server
                               │
                               ├── Postgres (projections + event_log)
                               ├── NATS JetStream (real-time fanout)
-                              ├── Ory Keto (permissions)
+                              ├── sso-gateway (auth + permissions)
                               ├── OpenSearch (search index)
                               └── S3 (attachments)
 ```

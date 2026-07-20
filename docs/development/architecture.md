@@ -23,12 +23,12 @@ kanban-server (Rust Axum) :8080
   │
   ├─ TraceLayer → propagates OpenTelemetry context
   ├─ Prometheus middleware → records RPC metrics
-  ├─ IntrospectionLayer → introspects token with Hydra, inserts AuthContext
-  ├─ keto_dispatch → checks MATRIX, calls Keto, inserts CheckedObjectId
+  ├─ IntrospectionLayer → introspects token with the sso-gateway, inserts AuthContext
+  ├─ permission_dispatch → checks MATRIX, calls the permission backend, inserts CheckedObjectId
   └─ Handler → reads checked ID, mutates Postgres, emits event_log
        │
        ├─ Mutates: SQL transaction → event_log INSERT → commit
-       ├─ Reads: SQL + keto_expand_objects() post-filter
+       ├─ Reads: SQL + permission expand post-filter
        └─ Streams: BoardSubscriberRegistry fanout (local broadcast)
             │
             └─ NATS JetStream ← outbox dispatcher drains event_log
@@ -47,9 +47,9 @@ kanban-server (Rust Axum) :8080
 
 | File | Responsibility |
 | --- | --- |
-| `src/server.rs` | Bootstrap: config, OTel, Postgres, NATS, Keto, Axum router. |
-| `src/auth/keto_dispatch.rs` | Static dispatch matrix and middleware. |
-| `src/auth/keto_expand.rs` | Expand Keto subjects/objects for list post-filtering. |
+| `src/server.rs` | Bootstrap: config, OTel, Postgres, NATS, sso-gateway, Axum router. |
+| `src/auth/permission_dispatch.rs` | Static dispatch matrix and middleware. |
+| `src/auth/permission_expand.rs` | Expand subjects/objects for list post-filtering. |
 | `src/realtime/outbox.rs` | Polls `event_log` and publishes to JetStream. |
 | `src/realtime/registry.rs` | Per-pod consumer registry and broadcast fanout. |
 | `src/realtime/cutover.rs` | Resume-token deduplication for subscribers. |
@@ -59,7 +59,7 @@ kanban-server (Rust Axum) :8080
 
 ## Key invariants
 
-- `MATRIX` must contain exactly one entry per proto RPC. `keto-coverage` enforces this in CI.
+- `MATRIX` must contain exactly one entry per proto RPC. `permission-coverage` enforces this in CI.
 - `CheckedObjectId` must be used by handlers, never the request body ID.
-- `project_members` SQL table mirrors Keto tuples. Drift is reconciled hourly; Keto wins.
+- `project_members` SQL table mirrors permission tuples. Drift is logged via `mirror_drift` warnings; the permission backend is the source of truth.
 - The event log is append-only; the outbox marks `nats_seq` on successful publish.

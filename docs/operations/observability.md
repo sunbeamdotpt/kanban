@@ -25,10 +25,10 @@ Key metrics:
 | --- | --- | --- | --- |
 | `kanban_rpc_duration_seconds` | histogram | `service`, `method` | gRPC handler duration. |
 | `kanban_rpc_total` | counter | `service`, `method`, `status` | Total gRPC requests by status. |
-| `kanban_keto_check_total` | counter | `result` (`allow`, `deny`, `error`) | Keto permission check results. |
+| `kanban_permission_check_total` | counter | `result` (`allow`, `deny`, `error`) | Permission check results. |
 | `kanban_subscribe_active_streams` | gauge | — | Active board subscription streams. |
 | `kanban_jet_stream_lag_seconds` | gauge | `board_id` | JetStream consumer lag per board. |
-| `kanban_mirror_drift_ratio` | gauge | — | Fraction of `project_member_view` rows that differ from Keto. |
+| `kanban_mirror_drift_ratio` | gauge | — | Fraction of `project_member_view` rows that differ from the permission backend. |
 
 Configure Prometheus or a scraping agent to scrape pods with the annotation `prometheus.io/scrape: "true"` on port `8080`.
 
@@ -58,7 +58,7 @@ Useful log lines to watch for:
 - `kanban service starting` — server is booting.
 - `Postgres connected and migrations applied` — migrations succeeded.
 - `JetStream stream bootstrapped` — NATS stream is ready.
-- `_kanban_health tuple absent — writing once` — readiness tuple initialized.
+- `Kanban permission namespace ensured` — permission namespace and OpenFGA model registered with the sso-gateway.
 - `kanban shutdown complete` — graceful shutdown finished.
 
 ## Alerting suggestions
@@ -66,7 +66,7 @@ Useful log lines to watch for:
 | Symptom | Metric / log | Severity |
 | --- | --- | --- |
 | High error rate | `kanban_rpc_total{status=~"5.."}` | page |
-| Permission check failures | `kanban_keto_check_total{result="error"}` | page |
+| Permission check failures | `kanban_permission_check_total{result="error"}` | page |
 | Readiness probe failing | `/healthz/ready` != 200 | page |
 | Mirror drift | `kanban_mirror_drift_ratio > 0.001` | warning |
 | NATS consumer lag | `kanban_jet_stream_lag_seconds` p95 > 5s | warning |

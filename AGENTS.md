@@ -5,10 +5,10 @@
 
 ## Project Overview
 
-Sunbeam Kanban is a real-time collaborative board-management backend. It is a Rust service built on Axum + Tonic (Connect-RPC/gRPC), talking to PostgreSQL, NATS JetStream, Keto (permissions), OpenSearch (search), and S3 (attachments). All RPCs are defined in Protobuf at `proto/sunbeam/kanban/v1/`.
+Sunbeam Kanban is a real-time collaborative board-management backend. It is a Rust service built on Axum + Tonic (Connect-RPC/gRPC), talking to PostgreSQL, NATS JetStream, the sso-gateway (unified auth + permissions, OpenFGA-backed), OpenSearch (search), and S3 (attachments). All RPCs are defined in Protobuf at `proto/sunbeam/kanban/v1/`.
 
 - **Protocol:** Connect-RPC over h2 with SSE fallback.
-- **Auth:** Hydra issues opaque OAuth2 tokens; `sunbeam-g2v`'s `IntrospectionLayer` validates every request against Hydra's `/oauth2/introspect`, and Keto checks per-object permissions. The `x-sunbeam-object-id` header gates every mutating RPC.
+- **Auth & permissions:** The sso-gateway is the unified auth stack. It issues opaque OAuth2 tokens; `sunbeam-g2v`'s `IntrospectionLayer` validates every request against the gateway's `/oauth2/introspect`, and per-object permission checks go through the gateway's `PermissionService` (OpenFGA, one store per tenant). The tenant is resolved from the introspected token; trusted service-to-service calls carry `x-tenant-id`. The `x-sunbeam-object-id` header gates every mutating RPC.
 - **Realtime:** Mutations write to Postgres `event_log` → outbox dispatcher publishes to NATS JetStream `kanban.board.{id}.events` → per-pod `BoardSubscriberRegistry` fans out via `tokio::sync::broadcast`.
 
 ---
@@ -36,8 +36,8 @@ If a `sunbeam-memory` MCP server is available in your environment, use it for co
 | Database | PostgreSQL 16+ via `sqlx` 0.8 (dynamic API, **no compile-time macros**) |
 | Migrations | `sqlx::migrate!("./migrations")` embedded at compile time, applied on boot |
 | Message queue | NATS JetStream (`async-nats` 0.47) |
-| Permissions | Ory Keto (gRPC read 4466 / write 4467) |
-| Auth middleware | `sunbeam-g2v` `IntrospectionLayer` + local `keto_dispatch` middleware |
+| Permissions | sso-gateway `PermissionService` (OpenFGA, per-tenant stores) |
+| Auth middleware | `sunbeam-g2v` `IntrospectionLayer` + local `permission_dispatch` middleware |
 | Search | OpenSearch |
 | Object storage | S3 (presigned URLs) |
 | Observability | OpenTelemetry OTLP + Prometheus metrics + `tracing` |
@@ -76,11 +76,11 @@ cargo fmt
 # Run all tests
 cargo test
 
-# Verify Keto dispatch matrix covers all proto RPCs
-cargo run --bin keto-coverage
+# Verify permission dispatch matrix covers all proto RPCs
+cargo run --bin permission-coverage
 ```
 
-**Integration tests** use testcontainers to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically, run migrations, create the MinIO bucket, and export the standard env vars. Run them directly with Cargo:
+**Integration tests** use testcontainers to start Postgres 16, NATS (JetStream), the sso-gateway, MinIO, and OpenSearch automatically, run migrations, bootstrap a test tenant plus service application, provision the Kanban permission namespace, create the MinIO bucket, and export the standard env vars. Run them directly with Cargo:
 
 ```sh
 cargo test                    # full suite
@@ -114,7 +114,7 @@ See `docs/development/testing.md`.
 Backend Rust tests are **inline** inside `#[cfg(test)]` modules at the bottom of each source file. There are **no separate `*_tests.rs` files**.
 
 - **Unit tests:** No external dependencies.
-- **Integration tests:** Require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
+- **Integration tests:** Require Postgres and the sso-gateway, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh UUIDs so parallel runs do not collide.
 - **No `#[ignore]` attributes:** All tests run by default.
 
 For details and examples, see `docs/development/testing.md`.
@@ -130,7 +130,7 @@ For details and examples, see `docs/development/testing.md`.
 - **SQL style:** Dynamic `sqlx` API only — no compile-time macros. Parameters bound with `.bind()`.
 - **Error handling:** Use `anyhow::Result` in bootstrap / async tasks; use `tonic::Status` in gRPC handlers. Log errors with `tracing::error!` before returning `Status::internal(...)`.
 - **Doc comments:** Module-level `//!` comments explain stage/purpose. `// ── Section ──` dividers for visual grouping.
-- **Constants:** `SCREAMING_SNAKE_CASE` for module-level constants (e.g., `KETO_NS_BOARD`).
+- **Constants:** `SCREAMING_SNAKE_CASE` for module-level constants (e.g., `PERMISSION_TYPE_BOARD`).
 - **Timestamp conversion:** Use `to_proto_ts` / `from_proto_ts` helpers (chrono ↔ prost_types).
 
 ---
@@ -142,22 +142,22 @@ For details and examples, see `docs/development/testing.md`.
 - **Every RPC is gated.** The middleware stack is:
   1. `TraceLayer`
   2. `IntrospectionLayer`
-  3. `keto_dispatch`
+  3. `permission_dispatch`
   4. Handler
 - **Object IDs come from headers, never the body.** Handlers must read `CheckedObjectId` from request extensions, not from the protobuf body.
-- **Token revocation:** Logout is handled by Hydra. Because every request is introspected, revoked tokens are rejected immediately.
+- **Token revocation:** Logout is handled by the sso-gateway. Because every request is introspected, revoked tokens are rejected immediately.
 
 For the full security model, see `docs/development/security.md`.
 
 ### Data Integrity
 
-- **Mirror-table write order:** Keto FIRST, then SQL. If SQL fails after Keto succeeds, log a `mirror_drift` warning.
+- **Mirror-table write order:** permission backend FIRST, then SQL. If SQL fails after the permission write succeeds, log a `mirror_drift` warning.
 - **Idempotency keys:** Mutations store idempotency keys in `idempotency_keys`.
 - **Advisory locks:** Card ref allocation uses `pg_advisory_xact_lock(hashtext($project_id))`.
 
 ### Deployment Security
 
-- **Readiness probe:** `/healthz/ready` returns 200 only after the synthetic `_kanban_health` Keto tuple check passes.
+- **Readiness probe:** `/healthz/ready` proxies the sso-gateway's `/health/ready`; it returns 200 only when the gateway (and with it the permission backend) is ready. Separately, server boot fails fast if the Kanban permission namespace cannot be provisioned.
 - **Rollback safety:** Schema migrations are one-way. Rolling back code without downgrading the database will crash the service.
 
 ---
@@ -170,8 +170,8 @@ The full recipe is in `docs/development/adding-an-rpc.md`. In short:
 
 1. Define in `proto/sunbeam/kanban/v1/*.proto`.
 2. Generate Rust code with `buf generate` (or rely on `build.rs` which runs `tonic-prost-build`).
-3. Add `DispatchEntry` to `src/auth/keto_dispatch.rs::MATRIX`.
-4. Run `cargo run --bin keto-coverage` (must exit 0).
+3. Add `DispatchEntry` to `src/auth/permission_dispatch.rs::MATRIX`.
+4. Run `cargo run --bin permission-coverage` (must exit 0).
 5. Implement handler in `src/services/{domain}.rs`.
 6. Wire in `src/services/mod.rs`.
 7. Write tests (authorized, unauthorized, persistence, events).
@@ -186,7 +186,7 @@ The full recipe is in `docs/development/adding-an-rpc.md`. In short:
 
 `tonic-prost-build` in `build.rs` compiles protos at Cargo build time.
 
-### Keto Namespace Evolution
+### Permission Model Evolution
 
 See the zero-downtime recipe in `docs/development/security.md`.
 
@@ -194,14 +194,14 @@ See the zero-downtime recipe in `docs/development/security.md`.
 
 ## Common Gotchas
 
-### Keto namespace mount failures
+### Permission namespace provisioning failures
 
-Keto reads namespace configs from `/etc/namespaces/` (directory mode). If a deploy breaks the syntax, Keto fails to reload and the readiness probe fails, removing pods from service.
+The Kanban permission namespace and OpenFGA model are provisioned at server boot via `EnsurePermissionNamespace` (idempotent), and readiness proxies the sso-gateway. If the gateway is down or provisioning fails, the server fails to boot and pods are removed from service.
 
 **Fix:**
 ```sh
-sunbeam ops logs keto -f
-sunbeam ops restart keto
+sunbeam ops logs sso-gateway -f
+sunbeam ops restart sso-gateway
 ```
 
 ---
@@ -221,13 +221,13 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS` | `10` | Connection acquire timeout |
 | `POD_NAME` | random UUID | Pod identity for NATS consumers and event envelopes |
 
-### Hydra / OAuth2 introspection
+### sso-gateway / OAuth2 introspection
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HYDRA_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | Hydra OAuth2 introspection endpoint |
-| `HYDRA_CLIENT_ID` | `''` | OAuth2 client ID for introspection Basic auth |
-| `HYDRA_CLIENT_SECRET` | `''` | OAuth2 client secret for introspection Basic auth |
+| `HYDRA_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint (historical env name). The gateway base URL — permission API, token endpoint, readiness proxy — is derived from it. |
+| `HYDRA_CLIENT_ID` | `''` | OAuth2 client ID for introspection Basic auth and service-to-service permission calls (app must hold `permission:admin`) |
+| `HYDRA_CLIENT_SECRET` | `''` | OAuth2 client secret for the above |
 
 ### Dependencies
 
@@ -235,10 +235,7 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 |----------|---------|---------|
 | `NATS_URL` | `nats://localhost:4222` | NATS server |
 | `NATS_AUTH_TOKEN` | — | NATS auth callout token |
-| `KETO_READ_ADDR` | `http://localhost:4466` | Keto read endpoint |
-| `KETO_WRITE_ADDR` | `http://localhost:4467` | Keto write endpoint |
-| `KETO_GRPC_URL` | alias for `KETO_READ_ADDR` | Test alias |
-| `KETO_WRITE_GRPC_URL` | alias for `KETO_WRITE_ADDR` | Test alias |
+| `SSO_GATEWAY_URL` | — | Test-only explicit gateway base URL (production derives it from `HYDRA_INTROSPECTION_URL`) |
 | `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
 | `KANBAN_OPENSEARCH_INDEX` | `sunbeam-kanban-cards-v1` | OpenSearch card index |
 
@@ -274,7 +271,7 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `KANBAN_REGISTRY_BROADCAST_CAPACITY` | `256` | Per-board broadcast capacity |
 | `KANBAN_REGISTRY_INACTIVE_THRESHOLD_SECS` | `30` | Ephemeral consumer GC threshold |
 | `KANBAN_HEARTBEAT_INTERVAL_MS` | `15000` | Live stream heartbeat interval |
-| `KANBAN_KETO_RECHECK_INTERVAL_MS` | `30000` | Live stream Keto recheck interval |
+| `KANBAN_PERMISSION_RECHECK_INTERVAL_MS` | `30000` | Live stream permission recheck interval |
 | `KANBAN_CUTOVER_SEEN_CAPACITY` | `1024` | Replay/live dedup capacity |
 
 ### Observability

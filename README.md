@@ -31,10 +31,10 @@ Real-time collaborative board management for Sunbeam Studios. Organize cards acr
 
 ## Development stack
 
-- **Backend:** Rust (Axum, SQLx, NATS, Keto).
+- **Backend:** Rust (Axum, SQLx, NATS, sso-gateway).
 - **Transport:** Connect-RPC over h2 with SSE fallback.
 - **Realtime:** NATS JetStream fanout and replay.
-- **Auth:** Hydra (JWT) + Keto (permissions).
+- **Auth:** sso-gateway (unified OAuth2 + OpenFGA permissions).
 - **Database:** PostgreSQL.
 - **Search:** OpenSearch.
 - **Object storage:** S3-compatible store for attachments.

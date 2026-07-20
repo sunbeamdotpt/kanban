@@ -21,29 +21,27 @@ Symptom: `kubectl get pods -n kanban` shows `0/1 Ready`.
    ```sh
    kubectl describe pod -n kanban <pod>
    ```
-2. Look for Keto errors in logs:
+2. Look for sso-gateway errors in logs:
    ```sh
    kubectl logs -n kanban <pod>
    ```
-3. The readiness probe fails if the `_kanban_health` tuple cannot be read. Verify Keto is reachable and the Kanban namespaces are loaded.
-4. If Keto namespaces are broken, see [Keto namespace failure](#keto-namespace-failure).
+3. The readiness probe proxies the sso-gateway's `/health/ready`. Verify the gateway is reachable and healthy, and that kanban provisioned its permission namespace at boot (look for `Kanban permission namespace ensured` in the boot logs).
+4. If the gateway is unhealthy, see [sso-gateway failure](#sso-gateway-failure).
 
-## Keto namespace failure
+## sso-gateway failure
 
-Symptom: All Kanban pods are `NotReady`; Keto logs show namespace parse errors.
+Symptom: All Kanban pods are `NotReady`; sso-gateway logs show OpenFGA or configuration errors.
 
-1. Check Keto logs:
+1. Check gateway logs:
    ```sh
-   kubectl logs -n ory deployment/keto
+   kubectl logs -n <sso-namespace> deployment/sso-gateway
    ```
-2. Validate the namespace config locally:
+2. Validate the Kanban authorization model locally:
    ```sh
-   cd .integration
-   npm install
-   npm run validate
+   jq . .integration/openfga-model.json
    ```
-3. Fix the namespace file and reapply it to the Keto ConfigMap mount at `/etc/namespaces/`.
-4. Restart Keto to pick up the corrected namespaces.
+3. Fix the model file if it is malformed and redeploy kanban; boot re-registers the model via `EnsurePermissionNamespace` (a changed model publishes a new version, tuples are untouched).
+4. Restart the sso-gateway if its OpenFGA backend is wedged.
 
 ## Migration failure
 
@@ -84,16 +82,13 @@ Symptom: A deploy introduced a regression.
 Symptom: Alert fires on `kanban_rpc_total{status=~"5.."}`.
 
 1. Check recent logs for the error target and span.
-2. Identify if the error is correlated with a downstream dependency (Postgres, Keto, NATS, OpenSearch).
+2. Identify if the error is correlated with a downstream dependency (Postgres, sso-gateway, NATS, OpenSearch).
 3. Scale or restart the failing dependency. If the issue is in code, roll back or deploy a hotfix.
 
 ## Unauthorized access report
 
 Symptom: A user can see or mutate something they should not.
 
-1. Check the Keto tuple for the object and subject:
-   ```sh
-   keto relation-tuple get --namespace KanbanBoard --object <board-id>
-   ```
+1. Check the relation tuple for the object and subject via the sso-gateway `PermissionService` `ListRelationTuples` API (namespace `KanbanBoard`, object `<board-id>`), e.g. with `grpcurl` or the gateway admin console.
 2. Verify the `x-sunbeam-object-id` header was set correctly by the frontend and matched the `CheckedObjectId` used by the handler.
-3. If Keto and SQL are out of sync, run the mirror reconciler or wait for the hourly reconciler to converge.
+3. If the permission backend and SQL are out of sync, the `mirror_drift` warnings in the logs point at the affected objects. SQL converges to the permission backend, which is the source of truth.

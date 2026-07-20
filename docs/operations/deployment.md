@@ -41,7 +41,7 @@ The image is built in two stages:
 1. A `rust:1.88-bookworm` builder with `tonistiigi/xx` for cross-compilation.
 2. A `gcr.io/distroless/cc-debian12:nonroot` runtime image with OCI labels for GHCR autolinking.
 
-Only the `kanban` server binary is included in the runtime image. The `keto-coverage` binary is CI-only and is not shipped.
+Only the `kanban` server binary is included in the runtime image. The `permission-coverage` binary is CI-only and is not shipped.
 
 ## Migrations
 
@@ -123,7 +123,7 @@ spec:
 Key points:
 
 - `POD_NAME` is injected from the pod name so each pod gets a stable identity for NATS consumer naming.
-- `readinessProbe` hits `/healthz/ready`, which only returns 200 after the synthetic `_kanban_health` Keto tuple is present. If Keto is unreachable or misconfigured, the pod is removed from the Service.
+- `readinessProbe` hits `/healthz/ready`, which proxies the sso-gateway's `/health/ready`. If the gateway or its OpenFGA backend is unreachable or misconfigured, the pod is removed from the Service. Server boot additionally fails fast when the Kanban permission namespace cannot be provisioned.
 - `livenessProbe` hits `/healthz/live`, which always returns 200.
 
 ## Supporting resources
@@ -164,6 +164,6 @@ Before the Deployment is rolled out, the following must already be available:
 
 - PostgreSQL database and user.
 - NATS with JetStream enabled.
-- Ory Keto with the Kanban namespaces loaded (see `.integration/keto-namespaces.config.ts`).
+- The sso-gateway. The Kanban permission namespace and OpenFGA model are provisioned automatically at boot from the embedded model (`.integration/openfga-model.json`).
 - OpenSearch.
 - S3-compatible object store with the attachments bucket created.

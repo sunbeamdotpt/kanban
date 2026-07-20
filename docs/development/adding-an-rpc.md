@@ -43,7 +43,7 @@ npm run proto:gen
 
 ## 3. Add the dispatch entry
 
-Edit `src/auth/keto_dispatch.rs`:
+Edit `src/auth/permission_dispatch.rs`:
 
 ```rust
 DispatchEntry {
@@ -54,7 +54,7 @@ DispatchEntry {
 },
 ```
 
-Run `cargo run --bin keto-coverage` and verify it exits 0.
+Run `cargo run --bin permission-coverage` and verify it exits 0.
 
 ## 4. Implement the handler
 

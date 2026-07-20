@@ -19,7 +19,7 @@ Rust tests are inline inside `#[cfg(test)]` modules at the bottom of each source
 
 ### Run the suite
 
-Integration tests use `testcontainers` to start Postgres 16, NATS (JetStream), Ory Keto, MinIO, and OpenSearch automatically, run migrations, and export the standard env vars. Run them directly with Cargo:
+Integration tests use `testcontainers` to start Postgres 16, NATS (JetStream), the sso-gateway, MinIO, and OpenSearch automatically, run migrations, bootstrap a test tenant plus service application, provision the Kanban permission namespace, and export the standard env vars. Run them directly with Cargo:
 
 ```sh
 cargo test                    # full suite
@@ -42,13 +42,15 @@ KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 
 ### Reusing an existing stack
 
-If you already have services running, set the standard env vars instead:
+If you already have services running, set the standard env vars instead. The sso-gateway application credentials must belong to a service application holding `permission:admin`:
 
 ```sh
 export DATABASE_URL='postgres://sunbeam:sunbeam@localhost:5432/kanban'
 export NATS_URL='nats://localhost:4222'
-export KETO_READ_ADDR='http://localhost:4466'
-export KETO_WRITE_ADDR='http://localhost:4467'
+export SSO_GATEWAY_URL='http://localhost:8080'
+export HYDRA_CLIENT_ID='<service-app-client-id>'
+export HYDRA_CLIENT_SECRET='<service-app-client-secret>'
+export KANBAN_TEST_TENANT_ID='<tenant-id-of-the-app>'
 export OPENSEARCH_URL='http://localhost:9200'
 export S3_ENDPOINT='http://localhost:9000'
 export S3_ACCESS_KEY='minioadmin'
@@ -60,7 +62,7 @@ cargo test
 ### Test categories
 
 - **Unit tests** — no external dependencies (e.g., `matrix_covers_all_rpcs`).
-- **Integration tests** — require Postgres, Keto, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh ULIDs so parallel runs do not collide.
+- **Integration tests** — require Postgres and the sso-gateway, and sometimes NATS/OpenSearch/MinIO. Each test uses fresh ULIDs so parallel runs do not collide.
 - **No `#[ignore]` attributes** — all tests run by default.
 
 ### Writing a service integration test
@@ -71,7 +73,11 @@ Use the shared harness:
 #[tokio::test]
 async fn create_then_get_returns_same_board() {
     let infra = crate::test_support::containers::setup().await;
-    let svc = BoardServiceImpl { pool: infra.pool.clone() };
+    let svc = BoardServiceImpl {
+        pool: infra.pool.clone(),
+        permission: infra.permission.clone(),
+        registry: test_registry(&infra),
+    };
     // ... exercise handler and assert
 }
 ```
@@ -83,4 +89,4 @@ The harness returns fresh `TestInfra` per call but reuses the same set of contai
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
-- `cargo run --bin keto-coverage`
+- `cargo run --bin permission-coverage`

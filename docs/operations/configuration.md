@@ -33,12 +33,10 @@ Command-line flags take precedence over environment variables. Run `kanban --hel
 | `KANBAN_PORT` | `--port` | `8080` | HTTP/gRPC listen port. |
 | `NATS_URL` | `--nats-url` | `nats://localhost:4222` | NATS server URL. JetStream must be enabled. |
 | `NATS_AUTH_TOKEN` | `--nats-auth-token` | — | Optional NATS auth callout token. |
-| `KETO_READ_ADDR` | `--keto-read-addr` | `http://localhost:4466` | Keto read API (gRPC/HTTP). |
-| `KETO_WRITE_ADDR` | `--keto-write-addr` | `http://localhost:4467` | Keto write API (gRPC/HTTP). |
 | `OPENSEARCH_URL` | `--opensearch-url` | `http://localhost:9200` | OpenSearch URL. |
 | `KANBAN_OPENSEARCH_INDEX` | `--opensearch-index-name` | `sunbeam-kanban-cards-v1` | OpenSearch index for card search. |
 
-Legacy aliases: `KETO_GRPC_URL` and `KETO_WRITE_GRPC_URL` are still accepted by integration test helpers, but production startup uses `KETO_READ_ADDR` and `KETO_WRITE_ADDR`.
+The sso-gateway base URL (permission API, token endpoint, readiness proxy) is not configured separately; it is derived from `HYDRA_INTROSPECTION_URL` (see below).
 
 ## PostgreSQL pool
 
@@ -47,13 +45,13 @@ Legacy aliases: `KETO_GRPC_URL` and `KETO_WRITE_GRPC_URL` are still accepted by 
 | `KANBAN_DATABASE_MAX_CONNECTIONS` | `--database-max-connections` | `20` | Max Postgres pool size. |
 | `KANBAN_DATABASE_ACQUIRE_TIMEOUT_SECS` | `--database-acquire-timeout-secs` | `10` | Connection acquire timeout. |
 
-## Hydra / OAuth2 introspection
+## sso-gateway / OAuth2 introspection
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `HYDRA_INTROSPECTION_URL` | `--hydra-introspection-url` | `http://localhost:4445/oauth2/introspect` | Hydra OAuth2 introspection endpoint. Every Bearer token is introspected here. |
-| `HYDRA_CLIENT_ID` | `--hydra-client-id` | `''` | OAuth2 client ID for introspection Basic auth. |
-| `HYDRA_CLIENT_SECRET` | `--hydra-client-secret` | `''` | OAuth2 client secret for introspection Basic auth. |
+| `HYDRA_INTROSPECTION_URL` | `--hydra-introspection-url` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint (the env var keeps its historical name). Every Bearer token is introspected here. The gateway base URL — permission API, token endpoint, readiness proxy — is derived by stripping the `/oauth2/introspect` suffix. |
+| `HYDRA_CLIENT_ID` | `--hydra-client-id` | `''` | OAuth2 client ID. Used for introspection Basic auth and for service-to-service permission calls; the application must hold the `permission:admin` scope. |
+| `HYDRA_CLIENT_SECRET` | `--hydra-client-secret` | `''` | OAuth2 client secret for the above. |
 
 ## Object storage (attachments)
 
@@ -104,7 +102,7 @@ The outbox also embeds `POD_NAME` in every emitted event envelope.
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
 | `KANBAN_HEARTBEAT_INTERVAL_MS` | `--heartbeat-interval-ms` | `15000` | Heartbeat interval for `SubscribeBoard` / `SubscribeAggregatedBoard`. |
-| `KANBAN_KETO_RECHECK_INTERVAL_MS` | `--keto-recheck-interval-ms` | `30000` | Permission recheck interval during streaming. |
+| `KANBAN_PERMISSION_RECHECK_INTERVAL_MS` | `--permission-recheck-interval-ms` | `30000` | Permission recheck interval during streaming. |
 | `KANBAN_CUTOVER_SEEN_CAPACITY` | `--cutover-seen-capacity` | `1024` | Replay/live deduplication ring-buffer size. |
 
 ## Observability
@@ -134,8 +132,7 @@ metadata:
 data:
   KANBAN_PORT: "8080"
   NATS_URL: "nats://nats.nats.svc.cluster.local:4222"
-  KETO_READ_ADDR: "http://keto-read.ory.svc.cluster.local:4466"
-  KETO_WRITE_ADDR: "http://keto-write.ory.svc.cluster.local:4467"
+  HYDRA_INTROSPECTION_URL: "http://sso-gateway.sso.svc.cluster.local:8080/oauth2/introspect"
   OPENSEARCH_URL: "http://opensearch.opensearch.svc.cluster.local:9200"
   S3_ENDPOINT: "http://seaweedfs-s3.storage.svc.cluster.local:8333"
   S3_REGION: "us-east-1"

@@ -18,11 +18,11 @@ labels:
 Projects are the top-level boundary for collaboration. Each project has:
 
 - A name, description, and owner.
-- A member list synced to Keto for permission checks.
+- A member list synced to the permission backend for permission checks.
 - One or more boards.
 - Optional project-scoped templates.
 
-Members can be added or removed; removal revokes both the Keto tuple and the mirrored `project_members` row.
+Members can be added or removed; removal revokes both the permission tuple and the mirrored `project_members` row.
 
 ## Boards
 
@@ -58,7 +58,7 @@ See [Templates](templates.md) for the full model.
 
 ## Aggregated boards
 
-An aggregated board is a read-only view that combines cards from multiple source boards. It is useful for cross-team dashboards or executive overviews. Source boards can be added, removed, and reordered. Visibility of individual cards is still enforced through Keto, so users only see cards they have access to.
+An aggregated board is a read-only view that combines cards from multiple source boards. It is useful for cross-team dashboards or executive overviews. Source boards can be added, removed, and reordered. Visibility of individual cards is still enforced through the permission backend, so users only see cards they have access to.
 
 ## Real-time sync
 
@@ -78,7 +78,7 @@ Search is backed by OpenSearch.
 - Query text is matched against card title, description, and linked GitHub issue title.
 - Results can be filtered by project, board, label, or assignee.
 - Results are paginated with opaque cursors.
-- Private-board hits are dropped unless the caller has a Keto `view` relation on the board.
+- Private-board hits are dropped unless the caller has a `view` relation on the board.
 
 ## GitHub integration
 
