@@ -4,6 +4,7 @@
 
 CREATE TABLE columns (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   TEXT NOT NULL,
   board_id    UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   title       TEXT NOT NULL,
   position    INT NOT NULL DEFAULT 0,
@@ -14,3 +15,4 @@ CREATE TABLE columns (
 );
 
 CREATE INDEX idx_columns_board ON columns(board_id);
+CREATE INDEX idx_columns_tenant ON columns(tenant_id);

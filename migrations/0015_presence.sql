@@ -2,6 +2,7 @@
 -- presence: user activity tracking per board
 
 CREATE TABLE presence (
+  tenant_id     TEXT NOT NULL,
   board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   subject       TEXT NOT NULL,
   last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -9,3 +10,4 @@ CREATE TABLE presence (
 );
 
 CREATE INDEX idx_presence_board ON presence(board_id);
+CREATE INDEX idx_presence_tenant ON presence(tenant_id);

@@ -3,6 +3,7 @@
 
 CREATE TABLE card_templates (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id            TEXT NOT NULL,
   project_id           UUID REFERENCES projects(id) ON DELETE CASCADE,
   name                 TEXT NOT NULL,
   description          TEXT DEFAULT '',
@@ -17,6 +18,7 @@ CREATE TABLE card_templates (
 );
 
 CREATE INDEX idx_card_templates_project ON card_templates(project_id) WHERE is_global = false;
+CREATE INDEX idx_card_templates_tenant ON card_templates(tenant_id);
 
 -- Board templates gained an updated_at column after their initial migration.
 ALTER TABLE board_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();

@@ -4,6 +4,7 @@
 
 CREATE TABLE card_attachments (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   TEXT NOT NULL,
   card_id     UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   filename    TEXT NOT NULL,
   mimetype    TEXT NOT NULL DEFAULT 'application/octet-stream',
@@ -14,3 +15,4 @@ CREATE TABLE card_attachments (
 );
 
 CREATE INDEX idx_card_attachments_card ON card_attachments(card_id);
+CREATE INDEX idx_card_attachments_tenant ON card_attachments(tenant_id);

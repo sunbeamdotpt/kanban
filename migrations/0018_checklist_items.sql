@@ -3,6 +3,7 @@
 
 CREATE TABLE checklist_items (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id  TEXT NOT NULL,
   card_id    UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   text       TEXT NOT NULL,
   done       BOOLEAN NOT NULL DEFAULT false,
@@ -12,3 +13,4 @@ CREATE TABLE checklist_items (
 );
 
 CREATE INDEX idx_checklist_items_card ON checklist_items(card_id);
+CREATE INDEX idx_checklist_items_tenant ON checklist_items(tenant_id);

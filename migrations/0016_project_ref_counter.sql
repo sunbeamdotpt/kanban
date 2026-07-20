@@ -4,8 +4,10 @@
 
 CREATE TABLE project_ref_counter (
   project_id  UUID PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  tenant_id   TEXT NOT NULL,
   prefix      TEXT NOT NULL,
   next_seq    INT NOT NULL DEFAULT 1
 );
 
 CREATE INDEX idx_project_ref_counter_project ON project_ref_counter(project_id);
+CREATE INDEX idx_project_ref_counter_tenant ON project_ref_counter(tenant_id, project_id);

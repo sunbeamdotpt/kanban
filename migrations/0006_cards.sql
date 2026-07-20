@@ -4,6 +4,7 @@
 
 CREATE TABLE cards (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     TEXT NOT NULL,
   project_id    UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   column_id     UUID NOT NULL REFERENCES columns(id) ON DELETE CASCADE,
   board_id      UUID NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
@@ -21,10 +22,11 @@ CREATE TABLE cards (
   created_by    TEXT NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (project_id, ref)
+  UNIQUE (tenant_id, project_id, ref)
 );
 
 CREATE INDEX idx_cards_column ON cards(column_id);
 CREATE INDEX idx_cards_board ON cards(board_id);
 CREATE INDEX idx_cards_project ON cards(project_id);
+CREATE INDEX idx_cards_tenant ON cards(tenant_id);
 CREATE INDEX idx_cards_milestone ON cards(milestone_id);

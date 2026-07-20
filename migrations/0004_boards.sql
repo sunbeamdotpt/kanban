@@ -4,6 +4,7 @@
 
 CREATE TABLE boards (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   TEXT NOT NULL,
   project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   name        TEXT NOT NULL,
   slug        TEXT NOT NULL,
@@ -15,3 +16,4 @@ CREATE TABLE boards (
 );
 
 CREATE INDEX idx_boards_project ON boards(project_id);
+CREATE INDEX idx_boards_tenant ON boards(tenant_id);

@@ -3,6 +3,7 @@
 
 CREATE TABLE comments (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   TEXT NOT NULL,
   card_id     UUID NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   author_sub  TEXT NOT NULL,
   body        TEXT NOT NULL,
@@ -12,3 +13,4 @@ CREATE TABLE comments (
 
 CREATE INDEX idx_comments_card ON comments(card_id);
 CREATE INDEX idx_comments_author ON comments(author_sub);
+CREATE INDEX idx_comments_tenant ON comments(tenant_id);

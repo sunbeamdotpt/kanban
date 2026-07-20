@@ -4,6 +4,7 @@
 
 CREATE TABLE board_templates (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   TEXT NOT NULL,
   name        TEXT NOT NULL,
   description TEXT DEFAULT '',
   columns     JSONB NOT NULL DEFAULT '[]',
@@ -14,3 +15,4 @@ CREATE TABLE board_templates (
 );
 
 CREATE INDEX idx_board_templates_project ON board_templates(project_id) WHERE is_global = false;
+CREATE INDEX idx_board_templates_tenant ON board_templates(tenant_id);
