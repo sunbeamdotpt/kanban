@@ -7,7 +7,7 @@
 //!   3. `ConfirmUpload` checks the object exists and marks the row ready.
 //!
 //! Authorization uses the `x-sunbeam-object-id` header to carry the card id.
-//! The Keto dispatch matrix checks that card, and handlers receiving an
+//! The permission dispatch matrix checks that card, and handlers receiving an
 //! `attachment_id` in the body also verify the attachment belongs to that
 //! card so the body cannot override the header.
 //!
@@ -28,7 +28,7 @@ use tracing::{error, warn};
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 
-use crate::auth::keto_dispatch::CheckedObjectId;
+use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::integrations::s3::{S3Client, S3Error, sanitize_filename};
 use crate::pb::attachment_service_server::AttachmentService;
 use crate::pb::{
@@ -109,6 +109,13 @@ fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
 }
 
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
 // ── Row builder ───────────────────────────────────────────────────────────────
 
 fn attachment_from_row(row: &sqlx::postgres::PgRow) -> Attachment {
@@ -143,6 +150,7 @@ impl AttachmentService for AttachmentServiceImpl {
         &self,
         request: Request<RequestPresignedUploadRequest>,
     ) -> Result<Response<RequestPresignedUploadResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let subject = subject_from_request(&request)?;
         let card_id_str = checked_object_id(&request)?;
         let card_id = card_id_str
@@ -168,11 +176,12 @@ impl AttachmentService for AttachmentServiceImpl {
         // INSERT pending row (size=0 initially; ConfirmUpload fills it from HEAD).
         sqlx::query(
             r#"
-            INSERT INTO card_attachments (id, card_id, filename, mimetype, size, s3_key, uploaded_by)
-            VALUES ($1, $2, $3, $4, 0, $5, $6)
+            INSERT INTO card_attachments (id, tenant_id, card_id, filename, mimetype, size, s3_key, uploaded_by)
+            VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
             "#,
         )
         .bind(attachment_id)
+        .bind(&tenant_id)
         .bind(card_id)
         .bind(&safe_filename)
         .bind(&req.mime_type)
@@ -201,6 +210,7 @@ impl AttachmentService for AttachmentServiceImpl {
         &self,
         request: Request<ConfirmUploadRequest>,
     ) -> Result<Response<ConfirmUploadResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
@@ -211,9 +221,10 @@ impl AttachmentService for AttachmentServiceImpl {
 
         // Fetch the attachment row; verify card_id matches the checked object.
         let row = sqlx::query(
-            "SELECT id, card_id, filename, mimetype, size, s3_key, uploaded_by, created_at FROM card_attachments WHERE id = $1",
+            "SELECT id, card_id, filename, mimetype, size, s3_key, uploaded_by, created_at FROM card_attachments WHERE id = $1 AND tenant_id = $2",
         )
         .bind(attachment_id)
+        .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch attachment", e))?
@@ -245,12 +256,13 @@ impl AttachmentService for AttachmentServiceImpl {
         let updated = sqlx::query(
             r#"
             UPDATE card_attachments
-            SET size = $2
-            WHERE id = $1
+            SET size = $3
+            WHERE id = $1 AND tenant_id = $2
             RETURNING id, card_id, filename, mimetype, size, s3_key, uploaded_by, created_at
             "#,
         )
         .bind(attachment_id)
+        .bind(&tenant_id)
         .bind(head.size)
         .fetch_one(&self.pool)
         .await
@@ -267,6 +279,7 @@ impl AttachmentService for AttachmentServiceImpl {
         &self,
         request: Request<RequestPresignedDownloadRequest>,
     ) -> Result<Response<RequestPresignedDownloadResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
@@ -275,12 +288,15 @@ impl AttachmentService for AttachmentServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
-        let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
-            .bind(attachment_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch attachment", e))?
-            .ok_or_else(|| Status::not_found("attachment not found"))?;
+        let row = sqlx::query(
+            "SELECT card_id, s3_key FROM card_attachments WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(attachment_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch attachment", e))?
+        .ok_or_else(|| Status::not_found("attachment not found"))?;
 
         let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -311,6 +327,7 @@ impl AttachmentService for AttachmentServiceImpl {
         &self,
         request: Request<DeleteAttachmentRequest>,
     ) -> Result<Response<DeleteAttachmentResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let checked_card_id = checked_object_id(&request)?;
         let req = request.into_inner();
 
@@ -319,12 +336,15 @@ impl AttachmentService for AttachmentServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
 
-        let row = sqlx::query("SELECT card_id, s3_key FROM card_attachments WHERE id = $1")
-            .bind(attachment_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch attachment", e))?
-            .ok_or_else(|| Status::not_found("attachment not found"))?;
+        let row = sqlx::query(
+            "SELECT card_id, s3_key FROM card_attachments WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(attachment_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch attachment", e))?
+        .ok_or_else(|| Status::not_found("attachment not found"))?;
 
         let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -352,8 +372,9 @@ impl AttachmentService for AttachmentServiceImpl {
             );
         }
 
-        sqlx::query("DELETE FROM card_attachments WHERE id = $1")
+        sqlx::query("DELETE FROM card_attachments WHERE id = $1 AND tenant_id = $2")
             .bind(attachment_id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| internal("failed to delete attachment row", e))?;
@@ -370,6 +391,7 @@ impl AttachmentService for AttachmentServiceImpl {
         // The dispatch matrix authorized by card_id (from x-sunbeam-object-id).
         // CheckedObjectId is the card_id; we also accept it from the request body
         // for symmetry, but the authoritative value is the checked extension.
+        let tenant_id = tenant_id_from_request(&request)?;
         let card_id_str = checked_object_id(&request)?;
         let card_id = card_id_str
             .parse::<Id>()
@@ -379,11 +401,12 @@ impl AttachmentService for AttachmentServiceImpl {
             r#"
             SELECT id, card_id, filename, mimetype, size, s3_key, uploaded_by, created_at
             FROM card_attachments
-            WHERE card_id = $1
+            WHERE card_id = $1 AND tenant_id = $2
             ORDER BY created_at DESC NULLS LAST
             "#,
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list attachments", e))?;
@@ -424,8 +447,10 @@ mod tests {
 
     fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
         let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(subject, None));
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ));
         req.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
         req
@@ -433,8 +458,10 @@ mod tests {
 
     // Clean up a card_attachments row directly.
     async fn cleanup_attachment(pool: &PgPool, id: Id) {
-        let _ = sqlx::query("DELETE FROM card_attachments WHERE id = $1")
+        let tenant_id = crate::test_support::test_tenant_id();
+        let _ = sqlx::query("DELETE FROM card_attachments WHERE id = $1 AND tenant_id = $2")
             .bind(id)
+            .bind(&tenant_id)
             .execute(pool)
             .await;
     }
@@ -717,13 +744,16 @@ mod tests {
         .expect("delete_attachment failed");
 
         // Verify SQL row is gone.
+        let tenant_id = crate::test_support::test_tenant_id();
         let att_id = attachment_id.parse::<Id>().unwrap();
-        let sql_row: Option<Id> = sqlx::query("SELECT id FROM card_attachments WHERE id = $1")
-            .bind(att_id)
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .map(|r| r.get("id"));
+        let sql_row: Option<Id> =
+            sqlx::query("SELECT id FROM card_attachments WHERE id = $1 AND tenant_id = $2")
+                .bind(att_id)
+                .bind(&tenant_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .map(|r| r.get("id"));
         assert!(sql_row.is_none(), "SQL row should be gone after delete");
 
         // Verify S3 object is gone (HEAD should 404).
@@ -756,11 +786,13 @@ mod tests {
         let att_a2 = Id::new();
         let att_b1 = Id::new();
 
+        let tenant_id = crate::test_support::test_tenant_id();
         for (att_id, cid) in &[(att_a1, card_a), (att_a2, card_a), (att_b1, card_b)] {
             sqlx::query(
-                "INSERT INTO card_attachments (id, card_id, filename, mimetype, size, s3_key, uploaded_by) VALUES ($1, $2, 'f.txt', 'text/plain', 0, $3, $4)"
+                "INSERT INTO card_attachments (id, tenant_id, card_id, filename, mimetype, size, s3_key, uploaded_by) VALUES ($1, $2, $3, 'f.txt', 'text/plain', 0, $4, $5)"
             )
             .bind(att_id)
+            .bind(&tenant_id)
             .bind(cid)
             .bind(format!("kanban/cards/{}/{}/f.txt", cid, att_id))
             .bind(&subject)

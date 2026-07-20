@@ -261,11 +261,11 @@ message BoardRenamed {
   string new_name = 1;
 }
 
-// Emitted when a Keto tuple mutation (grant or revoke) on the board's
-// project succeeds. `relation` is the Keto relation string
+// Emitted when a permission tuple mutation (grant or revoke) on the board's
+// project succeeds. `relation` is the permission relation string
 // (e.g. "viewers", "editors", "admins", "owners"). Causes the FE to
 // re-evaluate visibility — denied subjects close their stream on the
-// next per-yield Keto recheck (Pre-mortem 4 / MF-2).
+// next per-yield permission recheck (Pre-mortem 4 / MF-2).
 message MembershipChanged {
   string subject = 1;
   string relation = 2;
@@ -315,7 +315,7 @@ message BoardUpdated {
 message MemberAdded {
   string project_id = 1;
   string subject = 2;
-  // Keto relation: "owner" | "administer" | "edit" | "view".
+  // Permission role: "owner" | "admin" | "editor" | "viewer".
   string relation = 3;
   string display_name = 4;
   string email = 5;

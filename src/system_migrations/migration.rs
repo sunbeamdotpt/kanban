@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `SystemMigration` trait — one unit of work that can mutate Postgres, Keto,
-//! and/or OpenSearch during application startup.
+//! `SystemMigration` trait — one unit of work that can mutate Postgres, the
+//! permission backend, and/or OpenSearch during application startup.
 
 use std::future::Future;
 use std::pin::Pin;

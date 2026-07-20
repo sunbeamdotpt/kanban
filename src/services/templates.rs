@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Board and card templates.
 //!
-//! Templates are project-owned resources. Global templates have no
-//! `project_id`, are read-only, and are visible to every authenticated user.
+//! Templates are project-owned resources within a tenant. Global templates have
+//! no `project_id`, are read-only, and are visible to every authenticated user
+//! in the same tenant.
 //! Project-scoped templates reuse the parent project's permissions:
 //!   * `view`  → list and get
 //!   * `manage` → create, update, and delete
@@ -19,10 +20,10 @@ use sqlx::{PgPool, Row};
 use tonic::{Request, Response, Status};
 use tracing::error;
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_retry::KetoRetryExt;
+use crate::auth::permission_retry::PermissionRetryExt;
 use crate::pb::templates_service_server::TemplatesService;
 use crate::pb::{
     BoardTemplate, CardTemplate, CreateCardTemplateRequest, CreateCardTemplateResponse,
@@ -36,13 +37,14 @@ use crate::pb::{
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const KETO_NS_PROJECT: &str = "KanbanProject";
+const PERMISSION_TYPE_PROJECT: &str = "KanbanProject";
+const SYSTEM_TENANT: &str = "system";
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct TemplatesServiceImpl {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
 }
 
 // ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
@@ -68,6 +70,30 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
 }
 
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store (see `TENANT_HEADER`).
+async fn tenant_client_for<T>(
+    permission: &PermissionClient,
+    req: &Request<T>,
+) -> Result<PermissionClient, Status> {
+    let tenant = req
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
+}
+
 fn parse_id(s: &str, field: &str) -> Result<Id, Status> {
     match s.parse::<Id>() {
         Ok(id) => Ok(id),
@@ -75,16 +101,21 @@ fn parse_id(s: &str, field: &str) -> Result<Id, Status> {
     }
 }
 
-// ── Project-level Keto checks ────────────────────────────────────────────────
+// ── Project-level permission checks ────────────────────────────────────────────────
 
 async fn check_project_permission(
-    keto: &KetoClient,
+    permission: &PermissionClient,
     project_id: Id,
     relation: &str,
     subject: &str,
 ) -> Result<(), Status> {
-    let allowed = keto
-        .check_permission_with_retry(KETO_NS_PROJECT, &project_id.to_string(), relation, subject)
+    let allowed = permission
+        .check_permission_with_retry(
+            PERMISSION_TYPE_PROJECT,
+            &project_id.to_string(),
+            relation,
+            subject,
+        )
         .await
         .map_err(|e| internal("failed to check project permission", e))?;
 
@@ -233,13 +264,21 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<ListTemplatesRequest>,
     ) -> Result<Response<ListTemplatesResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
-        // Global templates are always visible to authenticated users.
+        // Global templates are visible to any authenticated user within the
+        // caller's tenant. The legacy `system` tenant seeds remain available
+        // until the migration is updated.
         let global_rows = sqlx::query(
             "SELECT id, project_id, name, description, columns, is_global, created_at, updated_at \
-             FROM board_templates WHERE is_global = true ORDER BY name",
+             FROM board_templates \
+             WHERE tenant_id IN ($1, $2) AND is_global = true \
+             ORDER BY name",
         )
+        .bind(&tenant_id)
+        .bind(SYSTEM_TENANT)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list global board templates", e))?;
@@ -251,15 +290,19 @@ impl TemplatesService for TemplatesServiceImpl {
         // has view permission on the project.
         if !req.project_id.is_empty() {
             let project_id = parse_id(&req.project_id, "project_id")?;
-            let visible = check_project_permission(&self.keto, project_id, "view", &subject)
+            let visible = check_project_permission(&permission, project_id, "view", &subject)
                 .await
                 .is_ok();
 
             if visible {
                 let project_rows = sqlx::query(
                     "SELECT id, project_id, name, description, columns, is_global, created_at, updated_at \
-                     FROM board_templates WHERE is_global = false AND project_id = $1 ORDER BY name",
+                     FROM board_templates \
+                     WHERE tenant_id IN ($1, $2) AND (project_id = $3 OR is_global = true) \
+                     ORDER BY name",
                 )
+                .bind(&tenant_id)
+                .bind(SYSTEM_TENANT)
                 .bind(project_id)
                 .fetch_all(&self.pool)
                 .await
@@ -277,14 +320,19 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<GetTemplateRequest>,
     ) -> Result<Response<GetTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, description, columns, is_global, created_at, updated_at \
-             FROM board_templates WHERE id = $1",
+             FROM board_templates \
+             WHERE id = $1 AND tenant_id IN ($2, $3)",
         )
         .bind(template_id)
+        .bind(&tenant_id)
+        .bind(SYSTEM_TENANT)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board template", e))?
@@ -294,7 +342,7 @@ impl TemplatesService for TemplatesServiceImpl {
         if !is_global {
             let project_id: Option<Id> = row.get("project_id");
             if let Some(pid) = project_id {
-                check_project_permission(&self.keto, pid, "view", &subject).await?;
+                check_project_permission(&permission, pid, "view", &subject).await?;
             }
         }
 
@@ -308,6 +356,8 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<CreateTemplateRequest>,
     ) -> Result<Response<CreateTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         if req.name.is_empty() {
@@ -322,19 +372,20 @@ impl TemplatesService for TemplatesServiceImpl {
         }
 
         let project_id = parse_id(&req.project_id, "project_id")?;
-        check_project_permission(&self.keto, project_id, "manage", &subject).await?;
+        check_project_permission(&permission, project_id, "manage", &subject).await?;
 
         let columns = columns_to_json(&req.columns);
         let template_id = Id::new();
 
         let row = sqlx::query(
             r#"
-            INSERT INTO board_templates (id, project_id, name, description, columns, is_global, created_by)
-            VALUES ($1, $2, $3, $4, $5, false, $6)
+            INSERT INTO board_templates (id, tenant_id, project_id, name, description, columns, is_global, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, false, $7)
             RETURNING id, project_id, name, description, columns, is_global, created_at, updated_at
             "#,
         )
         .bind(template_id)
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(&req.name)
         .bind(&req.description)
@@ -354,16 +405,20 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<UpdateTemplateRequest>,
     ) -> Result<Response<UpdateTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
-        let existing =
-            sqlx::query("SELECT project_id, is_global FROM board_templates WHERE id = $1")
-                .bind(template_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch board template for update", e))?
-                .ok_or_else(|| Status::not_found("template not found"))?;
+        let existing = sqlx::query(
+            "SELECT project_id, is_global FROM board_templates WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(template_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch board template for update", e))?
+        .ok_or_else(|| Status::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
@@ -374,7 +429,7 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
-            check_project_permission(&self.keto, pid, "manage", &subject).await?;
+            check_project_permission(&permission, pid, "manage", &subject).await?;
         }
 
         let name = if mask_contains(&req.update_mask, "name") {
@@ -400,7 +455,7 @@ impl TemplatesService for TemplatesServiceImpl {
                 description = COALESCE($3, description),
                 columns     = COALESCE($4, columns),
                 updated_at  = now()
-            WHERE id = $1
+            WHERE id = $1 AND tenant_id = $5
             RETURNING id, project_id, name, description, columns, is_global, created_at, updated_at
             "#,
         )
@@ -408,6 +463,7 @@ impl TemplatesService for TemplatesServiceImpl {
         .bind(name)
         .bind(description)
         .bind(columns)
+        .bind(&tenant_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| internal("failed to update board template", e))?;
@@ -422,16 +478,20 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<DeleteTemplateRequest>,
     ) -> Result<Response<DeleteTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
-        let existing =
-            sqlx::query("SELECT project_id, is_global FROM board_templates WHERE id = $1")
-                .bind(template_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch board template for delete", e))?
-                .ok_or_else(|| Status::not_found("template not found"))?;
+        let existing = sqlx::query(
+            "SELECT project_id, is_global FROM board_templates WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(template_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch board template for delete", e))?
+        .ok_or_else(|| Status::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
@@ -442,11 +502,12 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
-            check_project_permission(&self.keto, pid, "manage", &subject).await?;
+            check_project_permission(&permission, pid, "manage", &subject).await?;
         }
 
-        let result = sqlx::query("DELETE FROM board_templates WHERE id = $1")
+        let result = sqlx::query("DELETE FROM board_templates WHERE id = $1 AND tenant_id = $2")
             .bind(template_id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| internal("failed to delete board template", e))?;
@@ -465,13 +526,19 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<ListCardTemplatesRequest>,
     ) -> Result<Response<ListCardTemplatesResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         let global_rows = sqlx::query(
             "SELECT id, project_id, name, description, title, default_description, \
              label_names, checklist_items, is_global, created_at, updated_at \
-             FROM card_templates WHERE is_global = true ORDER BY name",
+             FROM card_templates \
+             WHERE tenant_id IN ($1, $2) AND is_global = true \
+             ORDER BY name",
         )
+        .bind(&tenant_id)
+        .bind(SYSTEM_TENANT)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list global card templates", e))?;
@@ -481,7 +548,7 @@ impl TemplatesService for TemplatesServiceImpl {
 
         if !req.project_id.is_empty() {
             let project_id = parse_id(&req.project_id, "project_id")?;
-            let visible = check_project_permission(&self.keto, project_id, "view", &subject)
+            let visible = check_project_permission(&permission, project_id, "view", &subject)
                 .await
                 .is_ok();
 
@@ -489,8 +556,12 @@ impl TemplatesService for TemplatesServiceImpl {
                 let project_rows = sqlx::query(
                     "SELECT id, project_id, name, description, title, default_description, \
                      label_names, checklist_items, is_global, created_at, updated_at \
-                     FROM card_templates WHERE is_global = false AND project_id = $1 ORDER BY name",
+                     FROM card_templates \
+                     WHERE tenant_id IN ($1, $2) AND (project_id = $3 OR is_global = true) \
+                     ORDER BY name",
                 )
+                .bind(&tenant_id)
+                .bind(SYSTEM_TENANT)
                 .bind(project_id)
                 .fetch_all(&self.pool)
                 .await
@@ -508,15 +579,20 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<GetCardTemplateRequest>,
     ) -> Result<Response<GetCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, description, title, default_description, \
              label_names, checklist_items, is_global, created_at, updated_at \
-             FROM card_templates WHERE id = $1",
+             FROM card_templates \
+             WHERE id = $1 AND tenant_id IN ($2, $3)",
         )
         .bind(template_id)
+        .bind(&tenant_id)
+        .bind(SYSTEM_TENANT)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card template", e))?
@@ -526,7 +602,7 @@ impl TemplatesService for TemplatesServiceImpl {
         if !is_global {
             let project_id: Option<Id> = row.get("project_id");
             if let Some(pid) = project_id {
-                check_project_permission(&self.keto, pid, "view", &subject).await?;
+                check_project_permission(&permission, pid, "view", &subject).await?;
             }
         }
 
@@ -540,6 +616,8 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<CreateCardTemplateRequest>,
     ) -> Result<Response<CreateCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         if req.name.is_empty() {
@@ -553,7 +631,7 @@ impl TemplatesService for TemplatesServiceImpl {
         }
 
         let project_id = parse_id(&req.project_id, "project_id")?;
-        check_project_permission(&self.keto, project_id, "manage", &subject).await?;
+        check_project_permission(&permission, project_id, "manage", &subject).await?;
 
         let checklist = checklist_to_json(&req.checklist_items);
         let template_id = Id::new();
@@ -561,15 +639,16 @@ impl TemplatesService for TemplatesServiceImpl {
         let row = sqlx::query(
             r#"
             INSERT INTO card_templates (
-                id, project_id, name, description, title, default_description,
+                id, tenant_id, project_id, name, description, title, default_description,
                 label_names, checklist_items, is_global, created_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
             RETURNING id, project_id, name, description, title, default_description,
                       label_names, checklist_items, is_global, created_at, updated_at
             "#,
         )
         .bind(template_id)
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(&req.name)
         .bind(&req.description)
@@ -592,16 +671,20 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<UpdateCardTemplateRequest>,
     ) -> Result<Response<UpdateCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
-        let existing =
-            sqlx::query("SELECT project_id, is_global FROM card_templates WHERE id = $1")
-                .bind(template_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch card template for update", e))?
-                .ok_or_else(|| Status::not_found("template not found"))?;
+        let existing = sqlx::query(
+            "SELECT project_id, is_global FROM card_templates WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(template_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch card template for update", e))?
+        .ok_or_else(|| Status::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
@@ -612,7 +695,7 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
-            check_project_permission(&self.keto, pid, "manage", &subject).await?;
+            check_project_permission(&permission, pid, "manage", &subject).await?;
         }
 
         let name = if mask_contains(&req.update_mask, "name") {
@@ -656,7 +739,7 @@ impl TemplatesService for TemplatesServiceImpl {
                 label_names         = COALESCE($6, label_names),
                 checklist_items     = COALESCE($7, checklist_items),
                 updated_at          = now()
-            WHERE id = $1
+            WHERE id = $1 AND tenant_id = $8
             RETURNING id, project_id, name, description, title, default_description,
                       label_names, checklist_items, is_global, created_at, updated_at
             "#,
@@ -668,6 +751,7 @@ impl TemplatesService for TemplatesServiceImpl {
         .bind(default_description)
         .bind(label_names)
         .bind(checklist_items)
+        .bind(&tenant_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| internal("failed to update card template", e))?;
@@ -682,16 +766,20 @@ impl TemplatesService for TemplatesServiceImpl {
         request: Request<DeleteCardTemplateRequest>,
     ) -> Result<Response<DeleteCardTemplateResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
-        let existing =
-            sqlx::query("SELECT project_id, is_global FROM card_templates WHERE id = $1")
-                .bind(template_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch card template for delete", e))?
-                .ok_or_else(|| Status::not_found("template not found"))?;
+        let existing = sqlx::query(
+            "SELECT project_id, is_global FROM card_templates WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(template_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch card template for delete", e))?
+        .ok_or_else(|| Status::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
@@ -702,11 +790,12 @@ impl TemplatesService for TemplatesServiceImpl {
 
         let project_id: Option<Id> = existing.get("project_id");
         if let Some(pid) = project_id {
-            check_project_permission(&self.keto, pid, "manage", &subject).await?;
+            check_project_permission(&permission, pid, "manage", &subject).await?;
         }
 
-        let result = sqlx::query("DELETE FROM card_templates WHERE id = $1")
+        let result = sqlx::query("DELETE FROM card_templates WHERE id = $1 AND tenant_id = $2")
             .bind(template_id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| internal("failed to delete card template", e))?;
@@ -733,27 +822,35 @@ mod tests {
         let infra = containers::setup().await;
         TemplatesServiceImpl {
             pool: infra.pool,
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
         }
     }
 
     /// Build a request with an authenticated subject in its extensions.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(subject, None));
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ));
         req
     }
 
     /// Create a minimal project and grant the test subject manage and view on it.
-    async fn create_test_project(pool: &PgPool, keto: &KetoClient, subject: &str) -> Id {
+    async fn create_test_project(
+        pool: &PgPool,
+        permission: &PermissionClient,
+        subject: &str,
+    ) -> Id {
         let project_id = Id::new();
         let slug = format!("tp-{}", &project_id.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
 
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id) VALUES ($1, $2, $3, $4, '', $5)",
         )
         .bind(project_id)
+        .bind(tenant_id)
         .bind(format!("Test Project {project_id}"))
         .bind(&slug)
         .bind(subject)
@@ -761,12 +858,24 @@ mod tests {
         .await
         .expect("failed to insert test project");
 
-        keto.grant_with_retry(KETO_NS_PROJECT, &project_id.to_string(), "manage", subject)
+        permission
+            .grant_with_retry(
+                PERMISSION_TYPE_PROJECT,
+                &project_id.to_string(),
+                "admin",
+                subject,
+            )
             .await
-            .expect("grant manage failed");
-        keto.grant_with_retry(KETO_NS_PROJECT, &project_id.to_string(), "view", subject)
+            .expect("grant admin failed");
+        permission
+            .grant_with_retry(
+                PERMISSION_TYPE_PROJECT,
+                &project_id.to_string(),
+                "viewer",
+                subject,
+            )
             .await
-            .expect("grant view failed");
+            .expect("grant viewer failed");
 
         project_id
     }
@@ -779,10 +888,14 @@ mod tests {
     }
 
     async fn cleanup_template(pool: &PgPool, table: &str, template_id: Id) {
-        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
-            .bind(template_id)
-            .execute(pool)
-            .await;
+        let tenant_id = crate::test_support::test_tenant_id();
+        let _ = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE tenant_id = $1 AND id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(template_id)
+        .execute(pool)
+        .await;
     }
 
     // ── Board template tests ─────────────────────────────────────────────────
@@ -815,7 +928,7 @@ mod tests {
     async fn create_then_get_board_template() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_template(authed_request(
@@ -880,7 +993,7 @@ mod tests {
     async fn list_templates_includes_project_scoped_when_authorized() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_template(authed_request(
@@ -957,7 +1070,7 @@ mod tests {
     async fn update_template_applies_mask() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_template(authed_request(
@@ -1020,7 +1133,7 @@ mod tests {
     async fn delete_template_removes_row() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_template(authed_request(
@@ -1066,7 +1179,7 @@ mod tests {
     async fn create_then_get_card_template() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_card_template(authed_request(
@@ -1128,7 +1241,7 @@ mod tests {
     async fn list_card_templates_includes_project_scoped_when_authorized() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_card_template(authed_request(
@@ -1180,7 +1293,7 @@ mod tests {
     async fn update_card_template_applies_mask() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_card_template(authed_request(
@@ -1241,7 +1354,7 @@ mod tests {
     async fn delete_card_template_removes_row() {
         let svc = make_service().await;
         let subject = format!("user:test-{}", Id::new());
-        let project_id = create_test_project(&svc.pool, &svc.keto, &subject).await;
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
             .create_card_template(authed_request(

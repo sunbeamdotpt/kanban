@@ -83,6 +83,7 @@ pub struct SearchHit {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CardDocument {
     pub id: String,
+    pub tenant_id: String,
     pub board_id: String,
     pub project_id: String,
     #[serde(rename = "ref", default)]
@@ -223,6 +224,7 @@ impl OpenSearchClient {
             "mappings": {
                 "properties": {
                     "id":           { "type": "keyword" },
+                    "tenant_id":    { "type": "keyword" },
                     "board_id":     { "type": "keyword" },
                     "project_id":   { "type": "keyword" },
                     "ref":          { "type": "keyword" },
@@ -357,6 +359,7 @@ mod tests {
     fn card_document_serializes_and_deserializes() {
         let doc = CardDocument {
             id: "card-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
             board_id: "board-1".to_string(),
             project_id: "proj-1".to_string(),
             card_ref: "KB-1".to_string(),
@@ -421,6 +424,7 @@ mod tests {
                 "_score": 1.0,
                 "_source": {
                     "id": "card-1",
+                    "tenant_id": "tenant-1",
                     "board_id": "board-1",
                     "project_id": "proj-1",
                     "ref": "KB-1",
@@ -579,6 +583,7 @@ mod tests {
 
         let doc = CardDocument {
             id: "card-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
             board_id: "board-1".to_string(),
             project_id: "proj-1".to_string(),
             card_ref: "KB-1".to_string(),
@@ -599,6 +604,7 @@ mod tests {
 
         let doc = CardDocument {
             id: "card-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
             board_id: "board-1".to_string(),
             project_id: "proj-1".to_string(),
             card_ref: "KB-1".to_string(),
@@ -637,6 +643,7 @@ mod tests {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::remove_var("OPENSEARCH_URL") };
         let cfg = OpenSearchConfig::from_env();
         assert_eq!(cfg.url, "http://localhost:9200");
@@ -647,9 +654,11 @@ mod tests {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("OPENSEARCH_URL", "http://opensearch:9200") };
         let cfg = OpenSearchConfig::from_env();
         assert_eq!(cfg.url, "http://opensearch:9200");
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::remove_var("OPENSEARCH_URL") };
     }
 }

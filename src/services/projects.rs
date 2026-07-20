@@ -2,8 +2,8 @@
 //! ProjectService implementation.
 //!
 //! Handles project lifecycle and membership. All permission changes are
-//! written to Keto first, then mirrored to the `project_members` table.
-//! If the SQL write fails after Keto succeeds, we log a `mirror_drift`
+//! written to the permission backend first, then mirrored to the `project_members` table.
+//! If the SQL write fails after the permission write succeeds, we log a `mirror_drift`
 //! warning so the background reconciler can catch up.
 //!
 // (original doc below)
@@ -26,12 +26,12 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_dispatch::CheckedObjectId;
-use crate::auth::keto_expand::{ExpandQuery, expand_objects};
-use crate::auth::keto_retry::KetoRetryExt;
+use crate::auth::permission_dispatch::CheckedObjectId;
+use crate::auth::permission_expand::{ExpandQuery, expand_objects};
+use crate::auth::permission_retry::PermissionRetryExt;
 use crate::pb::project_service_server::ProjectService;
 use crate::pb::{
     AddMemberRequest, AddMemberResponse, CreateProjectRequest, CreateProjectResponse,
@@ -44,14 +44,14 @@ use crate::realtime::registry::BoardSubscriberRegistry;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const KETO_NS: &str = "KanbanProject";
+const PERMISSION_TYPE: &str = "KanbanProject";
 const MAX_PROJECTS: usize = 10_000;
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct ProjectServiceImpl {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
 }
 
@@ -67,8 +67,9 @@ fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
-    error!(error = %err, "{msg}");
-    Status::internal(msg)
+    let full = format!("{msg}: {err}");
+    error!("{full}");
+    Status::internal(full)
 }
 
 fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
@@ -76,6 +77,31 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
+/// Extract the caller's tenant id from the auth context.
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store (see `TENANT_HEADER`).
+async fn tenant_client_for<T>(
+    permission: &PermissionClient,
+    req: &Request<T>,
+) -> Result<PermissionClient, Status> {
+    let tenant = req
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
 fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
@@ -124,16 +150,19 @@ fn member_from_row(row: &sqlx::postgres::PgRow) -> ProjectMember {
     }
 }
 
-async fn fetch_member_count(pool: &PgPool, project_id: Id) -> i32 {
-    sqlx::query("SELECT COUNT(*) AS cnt FROM project_members WHERE project_id = $1")
-        .bind(project_id)
-        .fetch_one(pool)
-        .await
-        .map(|r| {
-            let cnt: i64 = r.get("cnt");
-            cnt as i32
-        })
-        .unwrap_or(0)
+async fn fetch_member_count(pool: &PgPool, tenant_id: &str, project_id: Id) -> i32 {
+    sqlx::query(
+        "SELECT COUNT(*) AS cnt FROM project_members WHERE tenant_id = $1 AND project_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map(|r| {
+        let cnt: i64 = r.get("cnt");
+        cnt as i32
+    })
+    .unwrap_or(0)
 }
 
 // ── Type alias ───────────────────────────────────────────────────────────────
@@ -152,29 +181,34 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<CreateProjectRequest>,
     ) -> Result<Response<CreateProjectResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         // Idempotency check — look up by key; if found, re-fetch the project from DB.
         if !req.idempotency_key.is_empty() {
-            let cached_id: Option<Option<Id>> =
-                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
-                    .bind(&req.idempotency_key)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| internal("idempotency key lookup failed", e))?
-                    .map(|r| r.get("response_card_id"));
+            let cached_id: Option<Option<Id>> = sqlx::query(
+                "SELECT response_card_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2",
+            )
+            .bind(&tenant_id)
+            .bind(&req.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("idempotency key lookup failed", e))?
+            .map(|r| r.get("response_card_id"));
 
             if let Some(Some(project_id)) = cached_id {
                 let row = sqlx::query(
-                    "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE id = $1",
+                    "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
                 )
+                .bind(&tenant_id)
                 .bind(project_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch cached project", e))?;
 
                 if let Some(row) = row {
-                    let member_count = fetch_member_count(&self.pool, project_id).await;
+                    let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
                     return Ok(Response::new(CreateProjectResponse {
                         project: Some(project_from_row(&row, member_count)),
                     }));
@@ -205,12 +239,13 @@ impl ProjectService for ProjectServiceImpl {
         // INSERT project.
         let row = sqlx::query(
             r#"
-            INSERT INTO projects (id, name, slug, description, owner_id)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO projects (id, tenant_id, name, slug, description, owner_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, name, slug, description, owner_id, created_at, updated_at
             "#,
         )
         .bind(project_id)
+        .bind(&tenant_id)
         .bind(&req.name)
         .bind(&slug)
         .bind(&req.description)
@@ -219,30 +254,32 @@ impl ProjectService for ProjectServiceImpl {
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db) = e
-                && db.constraint() == Some("projects_slug_key")
+                && db.constraint() == Some("projects_tenant_slug_key")
             {
                 return Status::already_exists("project with that prefix already exists");
             }
             internal("failed to insert project", e)
         })?;
 
-        // Write Keto owner tuple.
-        self.keto
-            .grant_with_retry(KETO_NS, &project_id.to_string(), "owner", &subject)
+        // Write owner tuple to the permission backend.
+        permission
+            .grant_with_retry(PERMISSION_TYPE, &project_id.to_string(), "owner", &subject)
             .await
-            .map_err(|e| internal("failed to write Keto owner tuple", e))?;
+            .map_err(|e| internal("failed to write owner tuple to the permission backend", e))?;
 
-        // Also write a "view" tuple so ListProjects sees it.
-        self.keto
-            .grant_with_retry(KETO_NS, &project_id.to_string(), "view", &subject)
+        // Also write a "viewer" tuple so ListProjects sees it (owner already
+        // implies viewer; the explicit role keeps the expand query simple).
+        permission
+            .grant_with_retry(PERMISSION_TYPE, &project_id.to_string(), "viewer", &subject)
             .await
-            .map_err(|e| internal("failed to write Keto view tuple", e))?;
+            .map_err(|e| internal("failed to write viewer tuple to the permission backend", e))?;
 
-        // Insert owner into project_members mirror (Keto is already written — best-effort SQL).
+        // Insert owner into project_members mirror (permission backend is already written — best-effort SQL).
         if let Err(e) = sqlx::query(
-            "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING",
+            "INSERT INTO project_members (project_id, tenant_id, user_id, role) VALUES ($1, $2, $3, 'owner') ON CONFLICT DO NOTHING",
         )
         .bind(project_id)
+        .bind(&tenant_id)
         .bind(&subject)
         .execute(&self.pool)
         .await
@@ -250,18 +287,19 @@ impl ProjectService for ProjectServiceImpl {
             warn!(
                 error = %e,
                 project_id = %project_id,
-                "mirror_drift: Keto owner tuple written but project_members insert failed"
+                "mirror_drift: owner tuple written to the permission backend but project_members insert failed"
             );
         }
 
-        let member_count = fetch_member_count(&self.pool, project_id).await;
+        let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         let project = project_from_row(&row, member_count);
 
         // Store idempotency response — record the created project UUID.
         if !req.idempotency_key.is_empty()
             && let Err(e) = sqlx::query(
-                "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO idempotency_keys (tenant_id, key, response_card_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
+            .bind(&tenant_id)
             .bind(&req.idempotency_key)
             .bind(project_id)
             .execute(&self.pool)
@@ -282,20 +320,22 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<GetProjectRequest>,
     ) -> Result<Response<GetProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let row = sqlx::query(
-            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE id = $1",
+            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
         )
+        .bind(&tenant_id)
         .bind(project_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch project", e))?
         .ok_or_else(|| Status::not_found("project not found"))?;
 
-        let member_count = fetch_member_count(&self.pool, project_id).await;
+        let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         Ok(Response::new(GetProjectResponse {
             project: Some(project_from_row(&row, member_count)),
         }))
@@ -308,19 +348,20 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<ListProjectsRequest>,
     ) -> Result<Response<ListProjectsResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
 
         let visible_ids = expand_objects(
-            &self.keto,
+            &permission,
             ExpandQuery {
-                namespace: KETO_NS,
+                namespace: PERMISSION_TYPE,
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             MAX_PROJECTS,
         )
         .await
-        .map_err(|e| internal("keto expand failed", e))?;
+        .map_err(|e| internal("permission expand failed", e))?;
 
         if visible_ids.is_empty() {
             return Ok(Response::new(ListProjectsResponse { projects: vec![] }));
@@ -332,8 +373,9 @@ impl ProjectService for ProjectServiceImpl {
             .collect();
 
         let rows = sqlx::query(
-            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE id = ANY($1)",
+            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = ANY($2)",
         )
+        .bind(&tenant_id)
         .bind(&ids as &[Id])
         .fetch_all(&self.pool)
         .await
@@ -342,7 +384,7 @@ impl ProjectService for ProjectServiceImpl {
         let mut projects = Vec::with_capacity(rows.len());
         for row in &rows {
             let pid: Id = row.get("id");
-            let member_count = fetch_member_count(&self.pool, pid).await;
+            let member_count = fetch_member_count(&self.pool, &tenant_id, pid).await;
             projects.push(project_from_row(row, member_count));
         }
 
@@ -356,6 +398,7 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<UpdateProjectRequest>,
     ) -> Result<Response<UpdateProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
@@ -367,14 +410,15 @@ impl ProjectService for ProjectServiceImpl {
         let row = sqlx::query(
             r#"
             UPDATE projects SET
-                name        = CASE WHEN $2 != '' THEN $2 ELSE name END,
-                slug        = CASE WHEN $3 != '' THEN $3 ELSE slug END,
-                description = CASE WHEN $4 != '' THEN $4 ELSE description END,
+                name        = CASE WHEN $3 != '' THEN $3 ELSE name END,
+                slug        = CASE WHEN $4 != '' THEN $4 ELSE slug END,
+                description = CASE WHEN $5 != '' THEN $5 ELSE description END,
                 updated_at  = now()
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             RETURNING id, name, slug, description, owner_id, created_at, updated_at
             "#,
         )
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(&patch.name)
         .bind(patch.prefix.to_uppercase())
@@ -384,7 +428,7 @@ impl ProjectService for ProjectServiceImpl {
         .map_err(|e| internal("failed to update project", e))?
         .ok_or_else(|| Status::not_found("project not found"))?;
 
-        let member_count = fetch_member_count(&self.pool, project_id).await;
+        let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         Ok(Response::new(UpdateProjectResponse {
             project: Some(project_from_row(&row, member_count)),
         }))
@@ -397,11 +441,13 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<DeleteProjectRequest>,
     ) -> Result<Response<DeleteProjectResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
-        let result = sqlx::query("DELETE FROM projects WHERE id = $1")
+        let result = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
+            .bind(&tenant_id)
             .bind(project_id)
             .execute(&self.pool)
             .await
@@ -411,13 +457,13 @@ impl ProjectService for ProjectServiceImpl {
             return Err(Status::not_found("project not found"));
         }
 
-        // Best-effort: Keto tuple cleanup for this project is logged as drift.
+        // Best-effort: permission tuple cleanup for this project is logged as drift.
         // delete_relation_tuples filters by subject (not object); object-scoped
         // deletion requires the Stage 7a reconciler. We log the drift so it is
         // visible in metrics and the reconciler can mop it up.
         warn!(
             project_id = %project_id,
-            "delete_project: Keto tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
+            "delete_project: permission tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
         Ok(Response::new(DeleteProjectResponse {}))
@@ -430,9 +476,11 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<AddMemberRequest>,
     ) -> Result<Response<AddMemberResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
 
         let req = request.into_inner();
 
@@ -448,27 +496,35 @@ impl ProjectService for ProjectServiceImpl {
                 "owner relation cannot be granted via AddMember",
             ));
         }
+        // The OpenFGA model only accepts role writes; computed relations
+        // (view/edit/manage/delete) cannot be written directly.
+        if !matches!(req.relation.as_str(), "admin" | "editor" | "viewer") {
+            return Err(Status::invalid_argument(
+                "relation must be one of: admin, editor, viewer",
+            ));
+        }
 
-        // Keto FIRST (mirror-table write order per plan / Pre-mortem 5).
-        self.keto
+        // Permission backend FIRST (mirror-table write order per plan / Pre-mortem 5).
+        permission
             .grant_with_retry(
-                KETO_NS,
+                PERMISSION_TYPE,
                 &project_id.to_string(),
                 &req.relation,
                 &req.subject,
             )
             .await
-            .map_err(|e| internal("failed to write Keto member tuple", e))?;
+            .map_err(|e| internal("failed to write member tuple to the permission backend", e))?;
 
-        // SQL mirror second — best-effort; Keto is the source of truth.
+        // SQL mirror second — best-effort; the permission backend is the source of truth.
         if let Err(e) = sqlx::query(
             r#"
-            INSERT INTO project_members (project_id, user_id, role)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (project_id, user_id) DO UPDATE SET role = $3
+            INSERT INTO project_members (project_id, tenant_id, user_id, role)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (project_id, user_id) DO UPDATE SET role = $4
             "#,
         )
         .bind(project_id)
+        .bind(&tenant_id)
         .bind(&req.subject)
         .bind(&req.relation)
         .execute(&self.pool)
@@ -478,7 +534,7 @@ impl ProjectService for ProjectServiceImpl {
                 error = %e,
                 project_id = %project_id,
                 subject = %req.subject,
-                "mirror_drift: Keto tuple written but project_members insert failed"
+                "mirror_drift: permission tuple written but project_members insert failed"
             );
             // Do not return error — reconciler will fix SQL drift.
         }
@@ -493,9 +549,11 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<RemoveMemberRequest>,
     ) -> Result<Response<RemoveMemberResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
 
         let req = request.into_inner();
 
@@ -503,42 +561,47 @@ impl ProjectService for ProjectServiceImpl {
             return Err(Status::invalid_argument("subject is required"));
         }
 
-        // Read existing relation from mirror to know which Keto tuple to delete.
-        let existing_role: Option<String> =
-            sqlx::query("SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2")
-                .bind(project_id)
-                .bind(&req.subject)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to look up member", e))?
-                .map(|r| r.get("role"));
+        // Read existing relation from mirror to know which permission tuple to delete.
+        let existing_role: Option<String> = sqlx::query(
+            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(project_id)
+        .bind(&req.subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to look up member", e))?
+        .map(|r| r.get("role"));
 
-        // Delete Keto tuple for the known relation.
+        // Delete permission tuple for the known relation.
         if let Some(ref relation) = existing_role
-            && let Err(e) = crate::auth::keto_compat::delete_relation_tuples(
-                &self.keto,
-                KETO_NS,
-                Some(relation.as_str()),
-                Some(&req.subject),
-            )
-            .await
+            && let Err(e) = permission
+                .delete_relation_tuples(
+                    PERMISSION_TYPE,
+                    None,
+                    Some(relation.clone()),
+                    Some(req.subject.clone()),
+                )
+                .await
         {
             warn!(
                 error = %e,
                 project_id = %project_id,
                 subject = %req.subject,
-                "mirror_drift: failed to delete Keto tuple for removed member"
+                "mirror_drift: failed to delete permission tuple for removed member"
             );
         }
 
         // Delete SQL row.
-        let result =
-            sqlx::query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2")
-                .bind(project_id)
-                .bind(&req.subject)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| internal("failed to delete member row", e))?;
+        let result = sqlx::query(
+            "DELETE FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(project_id)
+        .bind(&req.subject)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| internal("failed to delete member row", e))?;
 
         if result.rows_affected() == 0 {
             return Err(Status::not_found("member not found"));
@@ -554,13 +617,15 @@ impl ProjectService for ProjectServiceImpl {
         request: Request<ListMembersRequest>,
     ) -> Result<Response<ListMembersResponse>, Status> {
         let object_id = checked_object_id(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
-            "SELECT project_id, user_id, role, created_at FROM project_members WHERE project_id = $1 ORDER BY created_at",
+            "SELECT project_id, user_id, role, created_at FROM project_members WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at",
         )
+        .bind(&tenant_id)
         .bind(project_id)
         .fetch_all(&self.pool)
         .await
@@ -573,7 +638,7 @@ impl ProjectService for ProjectServiceImpl {
     // ── SubscribeProject (Stage 4c — deferred to 4c.5) ───────────────────────
     //
     // TODO(4c.5): multi-board merge — enumerate all KanbanBoard objects visible
-    // to the subject via `keto_expand_objects(KanbanBoard, view, subject)`, then
+    // to the subject via `permission_expand_objects(KanbanBoard, view, subject)`, then
     // open one `build_subscribe_board_stream` per board and merge them via
     // `tokio_stream::StreamExt::merge` / `select_all`.
 
@@ -603,11 +668,11 @@ mod tests {
         crate::test_support::setup_pool().await
     }
 
-    async fn setup_keto() -> Arc<KetoClient> {
-        crate::test_support::setup_keto().await
+    async fn setup_permission() -> Arc<PermissionClient> {
+        crate::test_support::setup_permission().await
     }
 
-    async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> ProjectServiceImpl {
+    async fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> ProjectServiceImpl {
         let nats_url =
             std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
         let nats = Arc::new(
@@ -623,7 +688,7 @@ mod tests {
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-projects"));
         ProjectServiceImpl {
             pool,
-            keto,
+            permission,
             registry,
         }
     }
@@ -631,8 +696,10 @@ mod tests {
     /// Create an authenticated request that only carries the caller subject.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(subject, None));
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ));
         req
     }
 
@@ -644,25 +711,32 @@ mod tests {
         req
     }
 
-    /// Remove every Keto relation tuple a test may have created for a subject.
-    async fn cleanup_keto_for_subject(keto: &KetoClient, subject: &str) {
-        for relation in &["owner", "view", "edit", "manage", "administer"] {
-            let _ = crate::auth::keto_compat::delete_relation_tuples(
-                keto,
-                KETO_NS,
-                Some(relation),
-                Some(subject),
-            )
-            .await;
+    /// Remove every permission relation tuple a test may have created for a subject.
+    async fn cleanup_permission_for_subject(permission: &PermissionClient, subject: &str) {
+        for relation in &["owner", "admin", "editor", "viewer"] {
+            let _ = permission
+                .delete_relation_tuples(
+                    PERMISSION_TYPE,
+                    None,
+                    Some(relation.to_string()),
+                    Some(subject.to_string()),
+                )
+                .await;
         }
     }
 
     /// Delete a project row directly during test cleanup.
-    async fn cleanup_project(pool: &PgPool, project_id: Id) {
-        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+    async fn cleanup_project(pool: &PgPool, tenant_id: &str, project_id: Id) {
+        let _ = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
             .bind(project_id)
             .execute(pool)
             .await;
+    }
+
+    /// Tenant id used by the test helpers below.
+    fn test_tenant_id() -> String {
+        crate::test_support::test_tenant_id()
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
@@ -670,8 +744,8 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_returns_same_project() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
 
@@ -722,15 +796,15 @@ mod tests {
         assert_eq!(fetched.description, created.description);
 
         // Cleanup
-        cleanup_project(&pool, project_id).await;
-        cleanup_keto_for_subject(&keto, &subject).await;
+        cleanup_project(&pool, &test_tenant_id(), project_id).await;
+        cleanup_permission_for_subject(&permission, &subject).await;
     }
 
     #[tokio::test]
-    async fn list_projects_returns_only_visible_via_keto_expand() {
+    async fn list_projects_returns_only_visible_via_permission_expand() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject_a = format!("user:test-a-{}", Id::new());
         let subject_b = format!("user:test-b-{}", Id::new());
@@ -821,19 +895,20 @@ mod tests {
         );
 
         // Cleanup
+        let tenant_id = test_tenant_id();
         for pid in &project_ids_a {
-            cleanup_project(&pool, *pid).await;
+            cleanup_project(&pool, &tenant_id, *pid).await;
         }
-        cleanup_project(&pool, project_id_b).await;
-        cleanup_keto_for_subject(&keto, &subject_a).await;
-        cleanup_keto_for_subject(&keto, &subject_b).await;
+        cleanup_project(&pool, &tenant_id, project_id_b).await;
+        cleanup_permission_for_subject(&permission, &subject_a).await;
+        cleanup_permission_for_subject(&permission, &subject_b).await;
     }
 
     #[tokio::test]
     async fn update_project_applies_patch_fields_only() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
 
@@ -893,15 +968,15 @@ mod tests {
 
         // Cleanup
         let pid = project_id.parse::<Id>().unwrap();
-        cleanup_project(&pool, pid).await;
-        cleanup_keto_for_subject(&keto, &subject).await;
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &subject).await;
     }
 
     #[tokio::test]
-    async fn delete_project_cascades_and_clears_keto_tuples() {
+    async fn delete_project_cascades_and_clears_permission_tuples() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
 
@@ -926,13 +1001,17 @@ mod tests {
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
 
+        let tenant_id = test_tenant_id();
+
         // Verify it exists before delete.
-        let before: Option<Id> = sqlx::query("SELECT id FROM projects WHERE id = $1")
-            .bind(pid)
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .map(|r| r.get("id"));
+        let before: Option<Id> =
+            sqlx::query("SELECT id FROM projects WHERE tenant_id = $1 AND id = $2")
+                .bind(&tenant_id)
+                .bind(pid)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .map(|r| r.get("id"));
         assert!(before.is_some(), "project should exist before delete");
 
         svc.delete_project(authed_request_with_object(
@@ -946,23 +1025,25 @@ mod tests {
         .expect("delete_project failed");
 
         // Verify row is gone.
-        let after: Option<Id> = sqlx::query("SELECT id FROM projects WHERE id = $1")
-            .bind(pid)
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            .map(|r| r.get("id"));
+        let after: Option<Id> =
+            sqlx::query("SELECT id FROM projects WHERE tenant_id = $1 AND id = $2")
+                .bind(&tenant_id)
+                .bind(pid)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .map(|r| r.get("id"));
         assert!(after.is_none(), "project row should be gone after delete");
 
-        // Cleanup residual Keto tuples (best-effort; delete already ran).
-        cleanup_keto_for_subject(&keto, &subject).await;
+        // Cleanup residual permission tuples (best-effort; delete already ran).
+        cleanup_permission_for_subject(&permission, &subject).await;
     }
 
     #[tokio::test]
-    async fn add_member_writes_keto_then_sql_row() {
+    async fn add_member_writes_permission_then_sql_row() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-owner-{}", Id::new());
         let member = format!("user:test-member-{}", Id::new());
@@ -992,7 +1073,7 @@ mod tests {
             AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: member.clone(),
-                relation: "edit".to_string(),
+                relation: "editor".to_string(),
             },
             &owner,
             &project_id,
@@ -1000,36 +1081,42 @@ mod tests {
         .await
         .expect("add_member failed");
 
-        // Verify Keto tuple was written.
-        let keto_allowed = keto
-            .check_permission_with_retry(KETO_NS, &project_id, "edit", &member)
+        // Verify permission tuple was written.
+        let permission_allowed = permission
+            .check_permission_with_retry(PERMISSION_TYPE, &project_id, "edit", &member)
             .await
-            .expect("keto check failed");
-        assert!(keto_allowed, "Keto should have 'edit' tuple for member");
+            .expect("permission check failed");
+        assert!(
+            permission_allowed,
+            "permission backend should have 'edit' tuple for member"
+        );
 
         // Verify SQL mirror row.
-        let sql_role: Option<String> =
-            sqlx::query("SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2")
-                .bind(pid)
-                .bind(&member)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
-                .map(|r| r.get("role"));
+        let tenant_id = test_tenant_id();
+        let sql_role: Option<String> = sqlx::query(
+            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(pid)
+        .bind(&member)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .map(|r| r.get("role"));
         assert!(sql_role.is_some(), "project_members row should exist");
-        assert_eq!(sql_role.unwrap(), "edit");
+        assert_eq!(sql_role.unwrap(), "editor");
 
         // Cleanup
-        cleanup_project(&pool, pid).await;
-        cleanup_keto_for_subject(&keto, &owner).await;
-        cleanup_keto_for_subject(&keto, &member).await;
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &owner).await;
+        cleanup_permission_for_subject(&permission, &member).await;
     }
 
     #[tokio::test]
-    async fn remove_member_clears_both_keto_and_sql() {
+    async fn remove_member_clears_both_permission_and_sql() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-owner-{}", Id::new());
         let member = format!("user:test-member-{}", Id::new());
@@ -1060,7 +1147,7 @@ mod tests {
             AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: member.clone(),
-                relation: "view".to_string(),
+                relation: "viewer".to_string(),
             },
             &owner,
             &project_id,
@@ -1079,40 +1166,43 @@ mod tests {
         .await
         .expect("remove_member failed");
 
-        // Keto tuple should be gone.
-        let keto_allowed = keto
-            .check_permission_with_retry(KETO_NS, &project_id, "view", &member)
+        // permission tuple should be gone.
+        let permission_allowed = permission
+            .check_permission_with_retry(PERMISSION_TYPE, &project_id, "view", &member)
             .await
             .unwrap_or(false);
         assert!(
-            !keto_allowed,
-            "Keto 'view' tuple should be gone after remove"
+            !permission_allowed,
+            "permission 'view' tuple should be gone after remove"
         );
 
         // SQL row should be gone.
-        let sql_row: Option<String> =
-            sqlx::query("SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2")
-                .bind(pid)
-                .bind(&member)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
-                .map(|r| r.get("role"));
+        let tenant_id = test_tenant_id();
+        let sql_row: Option<String> = sqlx::query(
+            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(pid)
+        .bind(&member)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .map(|r| r.get("role"));
         assert!(
             sql_row.is_none(),
             "project_members row should be gone after remove"
         );
 
         // Cleanup
-        cleanup_project(&pool, pid).await;
-        cleanup_keto_for_subject(&keto, &owner).await;
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &owner).await;
     }
 
     #[tokio::test]
     async fn list_members_returns_inserted_rows() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-owner-{}", Id::new());
         let viewer = format!("user:test-viewer-{}", Id::new());
@@ -1142,7 +1232,7 @@ mod tests {
             AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: viewer.clone(),
-                relation: "view".to_string(),
+                relation: "viewer".to_string(),
             },
             &owner,
             &project_id,
@@ -1181,21 +1271,21 @@ mod tests {
         );
 
         let viewer_entry = members.iter().find(|m| m.subject == viewer).unwrap();
-        assert_eq!(viewer_entry.relation, "view");
+        assert_eq!(viewer_entry.relation, "viewer");
         assert_eq!(viewer_entry.project_id, project_id);
         assert!(viewer_entry.added_at.is_some());
 
         // Cleanup
-        cleanup_project(&pool, pid).await;
-        cleanup_keto_for_subject(&keto, &owner).await;
-        cleanup_keto_for_subject(&keto, &viewer).await;
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &owner).await;
+        cleanup_permission_for_subject(&permission, &viewer).await;
     }
 
     #[tokio::test]
     async fn create_with_idempotency_key_returns_cached_response_on_replay() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let idem_key = format!("idem-test-{}", Id::new());
@@ -1238,13 +1328,97 @@ mod tests {
         assert_eq!(first.name, second.name);
 
         // Cleanup
+        let tenant_id = test_tenant_id();
         let pid = first.id.parse::<Id>().unwrap();
-        cleanup_project(&pool, pid).await;
-        let _ = sqlx::query("DELETE FROM idempotency_keys WHERE key = $1")
+        cleanup_project(&pool, &tenant_id, pid).await;
+        let _ = sqlx::query("DELETE FROM idempotency_keys WHERE tenant_id = $1 AND key = $2")
+            .bind(&tenant_id)
             .bind(&idem_key)
             .execute(&pool)
             .await;
-        cleanup_keto_for_subject(&keto, &subject).await;
+        cleanup_permission_for_subject(&permission, &subject).await;
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_project_is_invisible() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let sso_gateway_url = crate::test_support::setup_sso_gateway_url().await;
+        let tenant_a = test_tenant_id();
+        let tenant_b = crate::test_support::containers::create_tenant(
+            &sso_gateway_url,
+            &format!("tenant-b-{}", Id::new()),
+            "Tenant B",
+        )
+        .await
+        .expect("failed to create tenant B");
+
+        let subject_a = format!("user:test-a-{}", Id::new());
+        let subject_b = format!("user:test-b-{}", Id::new());
+
+        // Create a project in tenant A.
+        let created = svc
+            .create_project(authed_request(
+                CreateProjectRequest {
+                    name: "Tenant A Project".to_string(),
+                    prefix: format!("TA{}", Id::new().to_string()[20..26].to_uppercase()),
+                    icon: String::new(),
+                    color: String::new(),
+                    description: String::new(),
+                    idempotency_key: String::new(),
+                },
+                &subject_a,
+            ))
+            .await
+            .expect("create failed")
+            .into_inner()
+            .project
+            .expect("project missing");
+        let project_id = created.id.parse::<Id>().expect("invalid id");
+
+        // Tenant B caller cannot read the project even with the id in the
+        // CheckedObjectId extension (SQL isolation).
+        let mut get_req = Request::new(GetProjectRequest {
+            project_id: created.id.clone(),
+        });
+        get_req
+            .extensions_mut()
+            .insert(AuthContext::authenticated(&tenant_b, &subject_b));
+        get_req
+            .extensions_mut()
+            .insert(CheckedObjectId(created.id.clone()));
+
+        let status = svc
+            .get_project(get_req)
+            .await
+            .expect_err("tenant B must not see tenant A project")
+            .code();
+        assert_eq!(
+            status,
+            tonic::Code::NotFound,
+            "cross-tenant get_project must return NotFound"
+        );
+
+        // Tenant B caller lists projects and sees none.
+        let mut list_req = Request::new(ListProjectsRequest {});
+        list_req
+            .extensions_mut()
+            .insert(AuthContext::authenticated(&tenant_b, &subject_b));
+        let list = svc
+            .list_projects(list_req)
+            .await
+            .expect("list_projects failed for tenant B")
+            .into_inner();
+        assert!(
+            list.projects.is_empty(),
+            "tenant B must not see tenant A projects"
+        );
+
+        // Cleanup
+        cleanup_project(&pool, &tenant_a, project_id).await;
+        cleanup_permission_for_subject(&permission, &subject_a).await;
     }
 
     // ── Stage 4c SubscribeProject tests ──────────────────────────────────────
@@ -1253,8 +1427,8 @@ mod tests {
     #[tokio::test]
     async fn subscribe_project_returns_unimplemented_pending_stage_4c5() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = Id::new().to_string();
@@ -1263,10 +1437,12 @@ mod tests {
             project_id: project_id.clone(),
             since_seq: 0,
         });
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            &subject,
+        ));
         req.extensions_mut()
-            .insert(AuthContext::authenticated(&subject, None));
-        req.extensions_mut()
-            .insert(crate::auth::keto_dispatch::CheckedObjectId(
+            .insert(crate::auth::permission_dispatch::CheckedObjectId(
                 project_id.clone(),
             ));
 

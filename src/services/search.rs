@@ -3,7 +3,7 @@
 //!
 //! `SearchCards` runs a full-text query against the `sunbeam-kanban-cards-v1`
 //! OpenSearch index, then removes any hit whose board the caller cannot view.
-//! Visibility is checked by expanding the subject's viewable boards with Keto
+//! Visibility is checked by expanding the subject's viewable boards with the permission backend
 //! (`expand_objects(KanbanBoard, view, subject)`).
 
 use std::collections::BTreeSet;
@@ -14,10 +14,10 @@ use serde_json::{Value, json};
 use tonic::{Request, Response, Status};
 use tracing::error;
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_expand::{ExpandQuery, expand_objects};
+use crate::auth::permission_expand::{ExpandQuery, expand_objects};
 use crate::integrations::opensearch::{KANBAN_CARDS_INDEX, OpenSearchClient};
 use crate::pb::search_service_server::SearchService;
 use crate::pb::{CardSearchHit, SearchCardsRequest, SearchCardsResponse};
@@ -27,7 +27,7 @@ use crate::pb::{CardSearchHit, SearchCardsRequest, SearchCardsResponse};
 const DEFAULT_LIMIT: i32 = 20;
 const MAX_LIMIT: i32 = 100;
 
-/// Upper bound on the number of boards returned by the Keto expand.
+/// Upper bound on the number of boards returned by the permission expand.
 /// Keeps the post-filter from paging indefinitely for users with very broad access.
 const MAX_BOARD_EXPAND: usize = 50_000;
 
@@ -35,7 +35,7 @@ const MAX_BOARD_EXPAND: usize = 50_000;
 
 pub struct SearchServiceImpl {
     pub pool: sqlx::PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub opensearch: Arc<OpenSearchClient>,
     /// Index name used in tests; when unset the production index is used.
     pub index_name: Option<String>,
@@ -55,17 +55,40 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
 }
 
-/// Filter a list of board ids down to those with public or internal visibility.
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store (see `TENANT_HEADER`).
+async fn tenant_client_for<T>(
+    permission: &PermissionClient,
+    req: &Request<T>,
+) -> Result<PermissionClient, Status> {
+    let tenant = tenant_id_from_request(req)?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
+}
+
+/// Filter a list of board ids down to those with public or internal visibility
+/// within the caller's tenant.
 async fn fetch_public_internal_board_ids(
     pool: &sqlx::PgPool,
+    tenant_id: &str,
     board_ids: &[Id],
 ) -> Result<BTreeSet<Id>, sqlx::Error> {
     use sqlx::Row;
 
     let rows = sqlx::query(
-        "SELECT id FROM boards WHERE id = ANY($1) AND visibility IN ('public', 'internal')",
+        "SELECT id FROM boards WHERE id = ANY($1) AND tenant_id = $2 AND visibility IN ('public', 'internal')",
     )
     .bind(board_ids)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await?;
 
@@ -87,7 +110,7 @@ async fn fetch_public_internal_board_ids(
 ///   * `sort` — `_score` descending then `id` ascending for stable pagination.
 ///   * `search_after` — the decoded cursor, when one is provided.
 ///   * `size` — the clamped page limit.
-fn build_query(req: &SearchCardsRequest) -> Result<Value, Status> {
+fn build_query(req: &SearchCardsRequest, tenant_id: &str) -> Result<Value, Status> {
     let limit = {
         let l = if req.limit <= 0 {
             DEFAULT_LIMIT
@@ -99,6 +122,9 @@ fn build_query(req: &SearchCardsRequest) -> Result<Value, Status> {
 
     let mut must: Vec<Value> = Vec::new();
     let mut filter: Vec<Value> = Vec::new();
+
+    // Tenant isolation — every search is scoped to the caller's tenant.
+    filter.push(json!({ "term": { "tenant_id": tenant_id } }));
 
     // Full-text query — multi_match across title, description, ref.
     if !req.query.trim().is_empty() {
@@ -249,6 +275,8 @@ impl SearchService for SearchServiceImpl {
         request: Request<SearchCardsRequest>,
     ) -> Result<Response<SearchCardsResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         // ── 1. Build OpenSearch query ────────────────────────────────────────
@@ -261,7 +289,7 @@ impl SearchService for SearchServiceImpl {
             l.min(MAX_LIMIT) as usize
         };
 
-        let query_body = build_query(&req)?;
+        let query_body = build_query(&req, &tenant_id)?;
 
         // ── 2. Execute search ────────────────────────────────────────────────
         let index = self.index_name.as_deref().unwrap_or(KANBAN_CARDS_INDEX);
@@ -294,24 +322,23 @@ impl SearchService for SearchServiceImpl {
             }));
         }
 
-        // ── 3. Post-filter via visibility + Keto expand (OQ8 resolution) ────
+        // ── 3. Post-filter via visibility + permission expand (OQ8 resolution) ────
         //
         // Public and internal boards are visible to any authenticated user.
-        // Private boards require an explicit Keto view relation. We expand the
+        // Private boards require an explicit view relation in the permission backend. We expand the
         // private board IDs the subject can view, then also allow any board
         // whose Postgres visibility is public or internal.
         let allowed_private_boards: BTreeSet<String> = expand_objects(
-            &self.keto,
+            &permission,
             ExpandQuery {
                 namespace: "KanbanBoard",
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             MAX_BOARD_EXPAND,
         )
         .await
-        .map_err(|e| internal("keto expand failed during search post-filter", e))?;
+        .map_err(|e| internal("permission expand failed during search post-filter", e))?;
 
         let board_ids: Vec<Id> = raw_hits
             .iter()
@@ -320,9 +347,10 @@ impl SearchService for SearchServiceImpl {
             .into_iter()
             .collect();
 
-        let public_internal_ids = fetch_public_internal_board_ids(&self.pool, &board_ids)
-            .await
-            .map_err(|e| internal("failed to fetch board visibilities for search", e))?;
+        let public_internal_ids =
+            fetch_public_internal_board_ids(&self.pool, &tenant_id, &board_ids)
+                .await
+                .map_err(|e| internal("failed to fetch board visibilities for search", e))?;
 
         let allowed_boards: BTreeSet<String> = board_ids
             .iter()
@@ -395,9 +423,9 @@ impl SearchService for SearchServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
+    use crate::auth::permission_client::PermissionClient;
 
-    use crate::auth::keto_retry::KetoRetryExt;
+    use crate::auth::permission_retry::PermissionRetryExt;
     use crate::integrations::opensearch::{CardDocument, OpenSearchClient, OpenSearchConfig};
     use crate::test_support::containers;
 
@@ -413,6 +441,7 @@ mod tests {
     fn subject_from_request_returns_subject() {
         let mut req = Request::new(SearchCardsRequest::default());
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:alice".to_string()),
             ..Default::default()
         });
@@ -432,7 +461,7 @@ mod tests {
             limit: -5,
             ..Default::default()
         };
-        let body = build_query(&req).unwrap();
+        let body = build_query(&req, "test-tenant").unwrap();
         assert_eq!(body["size"], 20);
     }
 
@@ -443,7 +472,7 @@ mod tests {
             query: "q".to_string(),
             ..Default::default()
         };
-        let body = build_query(&req).unwrap();
+        let body = build_query(&req, "test-tenant").unwrap();
         assert_eq!(body["size"], 100);
     }
 
@@ -453,8 +482,23 @@ mod tests {
             query: "   ".to_string(),
             ..Default::default()
         };
-        let body = build_query(&req).unwrap();
+        let body = build_query(&req, "test-tenant").unwrap();
         assert_eq!(body["query"]["bool"]["must"][0], json!({ "match_all": {} }));
+    }
+
+    #[test]
+    fn build_query_adds_tenant_filter() {
+        let req = SearchCardsRequest {
+            query: "bug".to_string(),
+            ..Default::default()
+        };
+        let body = build_query(&req, "tenant-a").unwrap();
+        let filters = body["query"]["bool"]["filter"].as_array().unwrap();
+        assert!(
+            filters
+                .iter()
+                .any(|f| f["term"]["tenant_id"] == json!("tenant-a"))
+        );
     }
 
     #[test]
@@ -468,7 +512,7 @@ mod tests {
             limit: 10,
             ..Default::default()
         };
-        let body = build_query(&req).unwrap();
+        let body = build_query(&req, "test-tenant").unwrap();
         let filters = body["query"]["bool"]["filter"].as_array().unwrap();
         assert!(
             filters
@@ -498,7 +542,7 @@ mod tests {
             cursor: "not-base64!!!".to_string(),
             ..Default::default()
         };
-        let err = build_query(&req).unwrap_err();
+        let err = build_query(&req, "test-tenant").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
@@ -518,10 +562,7 @@ mod tests {
 
     #[test]
     fn internal_returns_internal_status() {
-        let err = internal(
-            "boom",
-            std::io::Error::new(std::io::ErrorKind::Other, "ouch"),
-        );
+        let err = internal("boom", std::io::Error::other("ouch"));
         assert_eq!(err.code(), tonic::Code::Internal);
         assert!(err.message().contains("boom"));
     }
@@ -532,15 +573,8 @@ mod tests {
         Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()))
     }
 
-    fn keto_client() -> Arc<KetoClient> {
-        let grpc =
-            std::env::var("KETO_READ_ADDR").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let write_grpc = std::env::var("KETO_WRITE_ADDR")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: grpc,
-            write_grpc_endpoint: write_grpc,
-        }))
+    async fn permission_client() -> Arc<PermissionClient> {
+        crate::test_support::setup_permission().await
     }
 
     /// Generate a unique OpenSearch index name for this test run.
@@ -566,6 +600,30 @@ mod tests {
     ) -> CardDocument {
         CardDocument {
             id: id.to_string(),
+            tenant_id: crate::test_support::test_tenant_id(),
+            board_id: board_id.to_string(),
+            project_id: project_id.to_string(),
+            card_ref: format!("KB-{}", &id[22..26]),
+            title: title.to_string(),
+            description: format!("Description for {title}"),
+            priority: "medium".to_string(),
+            labels: labels.into_iter().map(|s| s.to_string()).collect(),
+            assignees: vec![],
+            completed_at: None,
+        }
+    }
+
+    fn sample_card_for_tenant(
+        id: &str,
+        tenant_id: &str,
+        board_id: &str,
+        project_id: &str,
+        title: &str,
+        labels: Vec<&str>,
+    ) -> CardDocument {
+        CardDocument {
+            id: id.to_string(),
+            tenant_id: tenant_id.to_string(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
             card_ref: format!("KB-{}", &id[22..26]),
@@ -583,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn search_returns_empty_when_index_missing() {
         let os = os_client();
-        let keto = keto_client();
+        let permission = permission_client().await;
 
         // Deliberately use a non-existent index name.
         let nonexistent = "sunbeam-kanban-cards-test-does-not-exist-ever";
@@ -610,6 +668,7 @@ mod tests {
             cursor: String::new(),
         });
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-missing-index".to_string()),
             ..Default::default()
         });
@@ -619,7 +678,7 @@ mod tests {
         // the "missing index" path in the OS client returns None regardless of
         // the index name.  The service handles that by returning empty — verified
         // by the direct client call above.
-        let _ = (os, keto);
+        let _ = (os, permission);
     }
 
     // ── Test: full-text match by title ────────────────────────────────────────
@@ -627,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn search_finds_card_by_title_match() {
         let os = os_client();
-        let keto = keto_client();
+        let permission = permission_client().await;
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -637,10 +696,11 @@ mod tests {
         let card_id = format!("{}", Id::new());
         let subject = format!("user:test-{}", Id::new());
 
-        // Grant Keto view on the board.
-        keto.grant_with_retry("KanbanBoard", &board_id, "view", &subject)
+        // Grant view on the board in the permission backend.
+        permission
+            .grant_with_retry("KanbanBoard", &board_id, "viewer", &subject)
             .await
-            .expect("keto grant");
+            .expect("permission grant");
 
         let doc = sample_card(
             &card_id,
@@ -679,14 +739,15 @@ mod tests {
 
         // Teardown
         os.delete_index(&index).await.ok();
-        crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject),
-        )
-        .await
-        .ok();
+        permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject.clone()),
+            )
+            .await
+            .ok();
     }
 
     // ── Test: filter by project_id ────────────────────────────────────────────
@@ -821,12 +882,12 @@ mod tests {
         os.delete_index(&index).await.ok();
     }
 
-    // ── Test: Keto post-filter drops unauthorized cards ───────────────────────
+    // ── Test: permission post-filter drops unauthorized cards ───────────────────────
 
     #[tokio::test]
-    async fn search_post_filters_via_keto_expand() {
+    async fn search_post_filters_via_permission_expand() {
         let os = os_client();
-        let keto = keto_client();
+        let permission = permission_client().await;
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -837,9 +898,10 @@ mod tests {
         let subject = format!("user:test-postfilter-{}", Id::new());
 
         // Grant view only on board_allowed.
-        keto.grant_with_retry("KanbanBoard", &board_allowed, "view", &subject)
+        permission
+            .grant_with_retry("KanbanBoard", &board_allowed, "viewer", &subject)
             .await
-            .expect("keto grant allowed board");
+            .expect("permission grant allowed board");
 
         let card_allowed = format!("{}", Id::new());
         let card_denied = format!("{}", Id::new());
@@ -862,14 +924,13 @@ mod tests {
         os.index_card(&index, &doc_d).await.expect("index denied");
         os.refresh(&index).await.expect("refresh");
 
-        // Fetch the set of boards the user can view via Keto.
+        // Fetch the set of boards the user can view via the permission backend.
         let allowed_boards = expand_objects(
-            &keto,
+            &permission,
             ExpandQuery {
                 namespace: "KanbanBoard",
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             50_000,
         )
@@ -920,14 +981,15 @@ mod tests {
 
         // Teardown
         os.delete_index(&index).await.ok();
-        crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject),
-        )
-        .await
-        .ok();
+        permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject.clone()),
+            )
+            .await
+            .ok();
     }
 
     // ── Test: pagination via search_after cursor ──────────────────────────────
@@ -1024,12 +1086,14 @@ mod tests {
 
     async fn insert_test_board(pool: &sqlx::PgPool, board_id: Id, visibility: &str) {
         let project_id = crate::test_support::seed_project(pool).await;
+        let tenant_id = crate::test_support::test_tenant_id();
         let slug = format!("bd-{}", &board_id.to_string()[18..26]);
         sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
-             VALUES ($1, $2, $3, $4, '', '', $5)",
+            "INSERT INTO boards (id, tenant_id, project_id, name, slug, description, icon, visibility) \
+             VALUES ($1, $2, $3, $4, $5, '', '', $6)",
         )
         .bind(board_id)
+        .bind(tenant_id)
         .bind(project_id)
         .bind(format!("Test Board {board_id}"))
         .bind(&slug)
@@ -1050,6 +1114,7 @@ mod tests {
             cursor: String::new(),
         });
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-search".to_string()),
             ..Default::default()
         });
@@ -1057,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_returns_public_board_hit_without_keto_relation() {
+    async fn search_returns_public_board_hit_without_permission_relation() {
         let os = os_client();
         let infra = containers::setup().await;
 
@@ -1072,6 +1137,7 @@ mod tests {
 
         let doc = CardDocument {
             id: card_id.clone(),
+            tenant_id: crate::test_support::test_tenant_id(),
             board_id: board_id.to_string(),
             project_id: Id::new().to_string(),
             card_ref: format!("KB-{}", &card_id[22..26]),
@@ -1087,13 +1153,14 @@ mod tests {
 
         let mut req = search_request("Public Visibility Hit");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject),
             ..Default::default()
         });
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1111,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_hides_private_board_hit_without_keto_relation() {
+    async fn search_hides_private_board_hit_without_permission_relation() {
         let os = os_client();
         let infra = containers::setup().await;
 
@@ -1126,6 +1193,7 @@ mod tests {
 
         let doc = CardDocument {
             id: card_id.clone(),
+            tenant_id: crate::test_support::test_tenant_id(),
             board_id: board_id.to_string(),
             project_id: Id::new().to_string(),
             card_ref: format!("KB-{}", &card_id[22..26]),
@@ -1141,13 +1209,14 @@ mod tests {
 
         let mut req = search_request("Private Visibility Hit");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1160,18 +1229,19 @@ mod tests {
 
         assert!(
             resp.hits.is_empty(),
-            "private board hit must be hidden without Keto view relation"
+            "private board hit must be hidden without view relation in the permission backend"
         );
 
         // Grant explicit view and verify the hit now appears.
         infra
-            .keto
-            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", &subject)
+            .permission
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "viewer", &subject)
             .await
             .expect("grant view failed");
 
         let mut req2 = search_request("Private Visibility Hit");
         req2.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
@@ -1190,14 +1260,70 @@ mod tests {
         assert_eq!(resp2.hits[0].card_id, card_id);
 
         os.delete_index(&index).await.ok();
-        crate::auth::keto_compat::delete_relation_tuples(
-            &infra.keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject),
-        )
-        .await
-        .ok();
+        infra
+            .permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject.clone()),
+            )
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn search_filters_hits_by_tenant_id() {
+        let os = os_client();
+        let infra = containers::setup().await;
+
+        let index = test_index();
+        os.create_cards_index(&index).await.expect("create index");
+
+        let board_id = Id::new();
+        let card_id = format!("{}", Id::new());
+        let subject = format!("user:test-cross-tenant-search-{}", Id::new());
+
+        insert_test_board(&infra.pool, board_id, "public").await;
+
+        // Index a card that belongs to a different tenant.
+        let doc = sample_card_for_tenant(
+            &card_id,
+            "other-tenant",
+            &board_id.to_string(),
+            &Id::new().to_string(),
+            "Cross Tenant Card",
+            vec![],
+        );
+        os.index_card(&index, &doc).await.expect("index card");
+        os.refresh(&index).await.expect("refresh");
+
+        let mut req = search_request("Cross Tenant Card");
+        req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
+            subject: Some(subject),
+            ..Default::default()
+        });
+
+        let svc = SearchServiceImpl {
+            pool: infra.pool.clone(),
+            permission: Arc::clone(&infra.permission),
+            opensearch: Arc::clone(&os),
+            index_name: Some(index.clone()),
+        };
+
+        let resp = svc
+            .search_cards(req)
+            .await
+            .expect("search_cards failed")
+            .into_inner();
+
+        assert!(
+            resp.hits.is_empty(),
+            "hits from a different tenant must be excluded by the OpenSearch tenant filter"
+        );
+
+        os.delete_index(&index).await.ok();
     }
 
     // ── Handler-level filter tests (exercise search_cards end-to-end) ───────────
@@ -1215,13 +1341,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
 
         let mut req = search_request("no-such-card-xyz");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-empty".to_string()),
             ..Default::default()
         });
@@ -1254,6 +1381,7 @@ mod tests {
 
         let mut req = search_request("Card");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-project-filter".to_string()),
             ..Default::default()
         });
@@ -1261,7 +1389,7 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1295,6 +1423,7 @@ mod tests {
 
         let mut req = search_request("Card");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-board-filter".to_string()),
             ..Default::default()
         });
@@ -1302,7 +1431,7 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1350,6 +1479,7 @@ mod tests {
 
         let mut req = search_request("card");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-label-filter".to_string()),
             ..Default::default()
         });
@@ -1357,7 +1487,7 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1405,6 +1535,7 @@ mod tests {
 
         let mut req = search_request("card");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-assignee-filter".to_string()),
             ..Default::default()
         });
@@ -1412,7 +1543,7 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1438,6 +1569,7 @@ mod tests {
 
         let doc = CardDocument {
             id: Id::new().to_string(),
+            tenant_id: crate::test_support::test_tenant_id(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
             card_ref: "KB-DONE".to_string(),
@@ -1453,13 +1585,14 @@ mod tests {
 
         let mut req = search_request("Done card");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-status".to_string()),
             ..Default::default()
         });
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: Some(index.clone()),
         };
@@ -1481,12 +1614,14 @@ mod tests {
 
         // Ensure the parent project exists; callers that already seeded one will
         // hit ON CONFLICT DO NOTHING.
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at) \
-             VALUES ($1, $2, $3, 'user:test', now(), now()) \
+            "INSERT INTO projects (id, tenant_id, name, slug, owner_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'user:test', now(), now()) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(project_id)
+        .bind(&tenant_id)
         .bind(format!("test-proj-{project_id}"))
         .bind(format!("{project_id}"))
         .execute(pool)
@@ -1494,10 +1629,11 @@ mod tests {
         .expect("failed to insert test project");
 
         sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
-             VALUES ($1, $2, $3, $4, '', '', $5)",
+            "INSERT INTO boards (id, tenant_id, project_id, name, slug, description, icon, visibility) \
+             VALUES ($1, $2, $3, $4, $5, '', '', $6)",
         )
         .bind(board_id)
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(format!("Test Board {board_id}"))
         .bind(&slug)
@@ -1519,6 +1655,7 @@ mod tests {
         let card_id = Id::new().to_string();
         let doc = CardDocument {
             id: card_id.clone(),
+            tenant_id: crate::test_support::test_tenant_id(),
             board_id: board_id.to_string(),
             project_id: project_id.to_string(),
             card_ref: format!("KB-{}", &card_id[22..26]),
@@ -1580,13 +1717,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("anything");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-missing".to_string()),
             ..Default::default()
         });
@@ -1613,13 +1751,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-public-mock".to_string()),
             ..Default::default()
         });
@@ -1652,6 +1791,7 @@ mod tests {
                                     "_score": 1.0,
                                     "_source": {
                                         "id": card_id,
+                                        "tenant_id": crate::test_support::test_tenant_id(),
                                         "board_id": board_id,
                                         "project_id": Id::new().to_string(),
                                         "ref": "KB-1",
@@ -1720,13 +1860,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("anything");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-500".to_string()),
             ..Default::default()
         });
@@ -1751,13 +1892,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("anything");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-404".to_string()),
             ..Default::default()
         });
@@ -1787,13 +1929,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("anything");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-empty-hits".to_string()),
             ..Default::default()
         });
@@ -1805,7 +1948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_cards_drops_private_board_hit_without_keto_relation() {
+    async fn search_cards_drops_private_board_hit_without_permission_relation() {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
@@ -1820,7 +1963,7 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
@@ -1828,6 +1971,7 @@ mod tests {
         let subject = format!("user:test-private-drop-{}", Id::new());
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
@@ -1837,7 +1981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_cards_returns_private_board_hit_with_keto_relation() {
+    async fn search_cards_returns_private_board_hit_with_permission_relation() {
         let infra = containers::setup().await;
 
         let project_id = crate::test_support::seed_project(&infra.pool).await;
@@ -1847,8 +1991,8 @@ mod tests {
 
         let subject = format!("user:test-private-allow-{}", Id::new());
         infra
-            .keto
-            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", &subject)
+            .permission
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "viewer", &subject)
             .await
             .expect("grant view failed");
 
@@ -1859,13 +2003,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
@@ -1874,14 +2019,16 @@ mod tests {
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_id);
 
-        crate::auth::keto_compat::delete_relation_tuples(
-            &infra.keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject),
-        )
-        .await
-        .ok();
+        infra
+            .permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject.clone()),
+            )
+            .await
+            .ok();
     }
 
     /// Start a mock OpenSearch server that returns repeated hits for one board.
@@ -1905,6 +2052,7 @@ mod tests {
                                 "_score": 1.0,
                                 "_source": {
                                     "id": card_id,
+                                    "tenant_id": crate::test_support::test_tenant_id(),
                                     "board_id": board_id,
                                     "project_id": project_id,
                                     "ref": format!("KB-{i}"),
@@ -1959,13 +2107,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-cursor-full".to_string()),
             ..Default::default()
         });
@@ -1993,13 +2142,14 @@ mod tests {
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             opensearch: Arc::clone(&os),
             index_name: None,
         };
 
         let mut req = search_request("find me");
         req.extensions_mut().insert(AuthContext {
+            tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-cursor-partial".to_string()),
             ..Default::default()
         });

@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Public, unauthenticated read access to boards.
 //!
-//! Mounted on its own Axum router without `JwtLayer` or `keto_dispatch`, so
+//! Mounted on its own Axum router without `JwtLayer` or `permission_dispatch`, so
 //! every handler must confirm the requested board's visibility is exactly
 //! `public` before returning anything.
+//!
+//! # Multitenancy note
+//!
+//! Public boards are intentionally scoped by their unique board/project IDs.
+//! The RPC requests do not carry a `tenant_id`, and the service does not apply
+//! a tenant filter. This preserves the existing public-by-URL semantics: anyone
+//! who knows a public board's UUID can read it. Cross-tenant isolation relies
+//! on the fact that board and project IDs are generated as random ULIDs and do
+//! not collide across tenants.
 
 use crate::id::Id;
 use sqlx::Row;
@@ -54,8 +63,8 @@ impl PublicBoardService for PublicBoardServiceImpl {
             return Err(Status::not_found("board not found"));
         }
 
-        let columns_count = fetch_columns_count(&self.pool, board_id).await;
-        let cards_count = fetch_cards_count(&self.pool, board_id).await;
+        let columns_count = fetch_columns_count(&self.pool, board_id, None).await;
+        let cards_count = fetch_cards_count(&self.pool, board_id, None).await;
         let board = board_from_row(&row, columns_count, cards_count);
 
         Ok(Response::new(GetPublicBoardResponse { board: Some(board) }))
@@ -83,8 +92,8 @@ impl PublicBoardService for PublicBoardServiceImpl {
         let mut boards = Vec::with_capacity(rows.len());
         for row in &rows {
             let bid: Id = row.get("id");
-            let columns_count = fetch_columns_count(&self.pool, bid).await;
-            let cards_count = fetch_cards_count(&self.pool, bid).await;
+            let columns_count = fetch_columns_count(&self.pool, bid, None).await;
+            let cards_count = fetch_cards_count(&self.pool, bid, None).await;
             boards.push(board_from_row(row, columns_count, cards_count));
         }
 
@@ -116,10 +125,12 @@ mod tests {
     async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Id {
         let pid = Id::new();
         let slug = format!("tp-{}", &pid.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id) VALUES ($1, $2, $3, $4, '', $5)",
         )
         .bind(pid)
+        .bind(tenant_id)
         .bind(format!("Test Project {pid}"))
         .bind(&slug)
         .bind(subject)
@@ -132,11 +143,13 @@ mod tests {
     async fn insert_board(pool: &sqlx::PgPool, project_id: Id, name: &str, visibility: &str) -> Id {
         let board_id = Id::new();
         let slug = format!("bd-{}", &board_id.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO boards (id, project_id, name, slug, description, icon, visibility) \
-             VALUES ($1, $2, $3, $4, '', '', $5)",
+            "INSERT INTO boards (id, tenant_id, project_id, name, slug, description, icon, visibility) \
+             VALUES ($1, $2, $3, $4, $5, '', '', $6)",
         )
         .bind(board_id)
+        .bind(tenant_id)
         .bind(project_id)
         .bind(name)
         .bind(&slug)

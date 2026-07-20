@@ -18,10 +18,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_dispatch::CheckedObjectId;
+use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::pb::card_service_server::CardService;
 use crate::pb::{
     AddCardDependencyRequest, AddCardDependencyResponse, AddChecklistItemRequest,
@@ -46,7 +46,7 @@ const MAX_PAGE_LIMIT: i32 = 200;
 
 pub struct CardServiceImpl {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
@@ -83,6 +83,13 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
 }
 
 // ── Priority mapping ──────────────────────────────────────────────────────────
@@ -228,15 +235,16 @@ fn checklist_item_from_row(row: &sqlx::postgres::PgRow) -> ChecklistItem {
 
 // ── Fetch helpers for embedded sub-entities ───────────────────────────────────
 
-pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id) -> Vec<Label> {
+pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id, tenant_id: &str) -> Vec<Label> {
     sqlx::query(
         "SELECT l.id, l.project_id, l.name, l.style \
          FROM labels l \
          JOIN card_labels cl ON cl.label_id = l.id \
-         WHERE cl.card_id = $1 \
+         WHERE cl.card_id = $1 AND l.tenant_id = $2 \
          ORDER BY l.name",
     )
     .bind(card_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -254,9 +262,10 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id) -> Vec<Label> {
     .collect()
 }
 
-pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id) -> Vec<Assignee> {
-    sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 ORDER BY assigned_at")
+pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id, tenant_id: &str) -> Vec<Assignee> {
+    sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 AND tenant_id = $2 ORDER BY assigned_at")
         .bind(card_id)
+        .bind(tenant_id)
         .fetch_all(pool)
         .await
         .unwrap_or_default()
@@ -269,12 +278,17 @@ pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id) -> Vec<Assignee>
         .collect()
 }
 
-pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Id) -> Vec<ChecklistItem> {
+pub(crate) async fn fetch_checklist(
+    pool: &PgPool,
+    card_id: Id,
+    tenant_id: &str,
+) -> Vec<ChecklistItem> {
     sqlx::query(
         "SELECT id, text, done, position FROM checklist_items \
-         WHERE card_id = $1 ORDER BY position ASC",
+         WHERE card_id = $1 AND tenant_id = $2 ORDER BY position ASC",
     )
     .bind(card_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -283,9 +297,10 @@ pub(crate) async fn fetch_checklist(pool: &PgPool, card_id: Id) -> Vec<Checklist
     .collect()
 }
 
-pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Id) -> i32 {
-    sqlx::query("SELECT COUNT(*) AS cnt FROM comments WHERE card_id = $1")
+pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Id, tenant_id: &str) -> i32 {
+    sqlx::query("SELECT COUNT(*) AS cnt FROM comments WHERE card_id = $1 AND tenant_id = $2")
         .bind(card_id)
+        .bind(tenant_id)
         .fetch_one(pool)
         .await
         .map(|r| {
@@ -295,23 +310,30 @@ pub(crate) async fn fetch_comments_count(pool: &PgPool, card_id: Id) -> i32 {
         .unwrap_or(0)
 }
 
-pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Id) -> i32 {
-    sqlx::query("SELECT COUNT(*) AS cnt FROM card_attachments WHERE card_id = $1")
-        .bind(card_id)
-        .fetch_one(pool)
-        .await
-        .map(|r| {
-            let c: i64 = r.get("cnt");
-            c as i32
-        })
-        .unwrap_or(0)
-}
-
-pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Id) -> Vec<String> {
+pub(crate) async fn fetch_attachments_count(pool: &PgPool, card_id: Id, tenant_id: &str) -> i32 {
     sqlx::query(
-        "SELECT depends_on_card_id FROM card_dependencies WHERE card_id = $1 ORDER BY created_at",
+        "SELECT COUNT(*) AS cnt FROM card_attachments WHERE card_id = $1 AND tenant_id = $2",
     )
     .bind(card_id)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .map(|r| {
+        let c: i64 = r.get("cnt");
+        c as i32
+    })
+    .unwrap_or(0)
+}
+
+pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Id, tenant_id: &str) -> Vec<String> {
+    sqlx::query(
+        "SELECT depends_on_card_id FROM card_dependencies \
+         WHERE card_id = $1 \
+           AND card_id IN (SELECT id FROM cards WHERE tenant_id = $2) \
+         ORDER BY created_at",
+    )
+    .bind(card_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -323,11 +345,15 @@ pub(crate) async fn fetch_dependencies(pool: &PgPool, card_id: Id) -> Vec<String
     .collect()
 }
 
-pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id) -> Vec<String> {
+pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id, tenant_id: &str) -> Vec<String> {
     sqlx::query(
-        "SELECT card_id FROM card_dependencies WHERE depends_on_card_id = $1 ORDER BY created_at",
+        "SELECT card_id FROM card_dependencies \
+         WHERE depends_on_card_id = $1 \
+           AND depends_on_card_id IN (SELECT id FROM cards WHERE tenant_id = $2) \
+         ORDER BY created_at",
     )
     .bind(card_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -340,26 +366,27 @@ pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id) -> Vec<String> 
 }
 
 /// Load a complete card, including its relationships, by id.
-async fn fetch_full_card(pool: &PgPool, card_id: Id) -> Result<Card, Status> {
+async fn fetch_full_card(pool: &PgPool, card_id: Id, tenant_id: &str) -> Result<Card, Status> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
                 position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                 milestone_id, revision, created_at, updated_at \
-         FROM cards WHERE id = $1",
+         FROM cards WHERE id = $1 AND tenant_id = $2",
     )
     .bind(card_id)
+    .bind(tenant_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| internal("failed to fetch card", e))?
     .ok_or_else(|| Status::not_found("card not found"))?;
 
-    let labels = fetch_labels(pool, card_id).await;
-    let assignees = fetch_assignees(pool, card_id).await;
-    let checklist = fetch_checklist(pool, card_id).await;
-    let comments_count = fetch_comments_count(pool, card_id).await;
-    let attachments_count = fetch_attachments_count(pool, card_id).await;
-    let depends_on = fetch_dependencies(pool, card_id).await;
-    let dependents = fetch_dependents(pool, card_id).await;
+    let labels = fetch_labels(pool, card_id, tenant_id).await;
+    let assignees = fetch_assignees(pool, card_id, tenant_id).await;
+    let checklist = fetch_checklist(pool, card_id, tenant_id).await;
+    let comments_count = fetch_comments_count(pool, card_id, tenant_id).await;
+    let attachments_count = fetch_attachments_count(pool, card_id, tenant_id).await;
+    let depends_on = fetch_dependencies(pool, card_id, tenant_id).await;
+    let dependents = fetch_dependents(pool, card_id, tenant_id).await;
 
     Ok(card_from_row(
         &row,
@@ -393,6 +420,7 @@ async fn fetch_full_card(pool: &PgPool, card_id: Id) -> Result<Card, Status> {
 async fn allocate_card_ref(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Id,
+    tenant_id: &str,
 ) -> Result<String, Status> {
     // Advisory lock scoped to this transaction — serialises per project.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
@@ -402,13 +430,14 @@ async fn allocate_card_ref(
         .map_err(|e| internal("advisory lock failed", e))?;
 
     let row = sqlx::query(
-        "INSERT INTO project_ref_counter (project_id, prefix, next_seq)
-         SELECT $1, p.prefix, 2 FROM projects p WHERE p.id = $1
+        "INSERT INTO project_ref_counter (project_id, prefix, next_seq, tenant_id)
+         SELECT $1, p.prefix, 2, $2 FROM projects p WHERE p.id = $1 AND p.tenant_id = $2
          ON CONFLICT (project_id) DO UPDATE
            SET next_seq = project_ref_counter.next_seq + 1
          RETURNING prefix, (next_seq - 1) AS allocated_seq",
     )
     .bind(project_id)
+    .bind(tenant_id)
     .fetch_one(&mut **tx)
     .await
     .map_err(|e| internal("failed to allocate card ref", e))?;
@@ -426,16 +455,18 @@ async fn allocate_card_ref(
 
 async fn insert_event_log(
     tx: &mut Transaction<'_, Postgres>,
+    tenant_id: &str,
     board_id: Id,
     event_type: &str,
     payload: serde_json::Value,
     card_revision: i64,
 ) -> Result<(), Status> {
     sqlx::query(
-        "INSERT INTO event_log (id, board_id, event_type, payload, created_at)
-         VALUES ($1, $2, $3, $4::jsonb, now())",
+        "INSERT INTO event_log (id, tenant_id, board_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, now())",
     )
     .bind(Id::new())
+    .bind(tenant_id)
     .bind(board_id)
     .bind(event_type)
     .bind(payload)
@@ -455,15 +486,22 @@ async fn insert_event_log(
 /// was already processed.
 ///
 /// Returns `Ok(Some(card_id))` for a replayed key and `Ok(None)` for a new key.
-async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Id>, Status> {
+async fn check_idempotency_card(
+    pool: &PgPool,
+    tenant_id: &str,
+    key: &str,
+) -> Result<Option<Id>, Status> {
     if key.is_empty() {
         return Ok(None);
     }
-    let row = sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| internal("idempotency key lookup failed", e))?;
+    let row = sqlx::query(
+        "SELECT response_card_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2",
+    )
+    .bind(tenant_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| internal("idempotency key lookup failed", e))?;
 
     match row {
         None => Ok(None),
@@ -474,13 +512,14 @@ async fn check_idempotency_card(pool: &PgPool, key: &str) -> Result<Option<Id>, 
     }
 }
 
-async fn store_idempotency_card(pool: &PgPool, key: &str, card_id: Id) {
+async fn store_idempotency_card(pool: &PgPool, tenant_id: &str, key: &str, card_id: Id) {
     if key.is_empty() {
         return;
     }
     if let Err(e) = sqlx::query(
-        "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        "INSERT INTO idempotency_keys (tenant_id, key, response_card_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
+    .bind(tenant_id)
     .bind(key)
     .bind(card_id)
     .execute(pool)
@@ -508,7 +547,8 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(GetCardResponse { card: Some(card) }))
     }
 
@@ -527,6 +567,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         if req.card_ids.is_empty() {
             return Ok(Response::new(BatchGetCardsResponse { cards: vec![] }));
@@ -545,10 +586,11 @@ impl CardService for CardServiceImpl {
                     position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                     milestone_id, revision, created_at, updated_at \
              FROM cards \
-             WHERE board_id = $1 AND id = ANY($2) \
+             WHERE board_id = $1 AND tenant_id = $2 AND id = ANY($3) \
              ORDER BY column_id, position",
         )
         .bind(board_id)
+        .bind(&tenant_id)
         .bind(&ids)
         .fetch_all(&self.pool)
         .await
@@ -557,13 +599,13 @@ impl CardService for CardServiceImpl {
         let mut cards = Vec::with_capacity(rows.len());
         for row in &rows {
             let cid: Id = row.get("id");
-            let labels = fetch_labels(&self.pool, cid).await;
-            let assignees = fetch_assignees(&self.pool, cid).await;
-            let checklist = fetch_checklist(&self.pool, cid).await;
-            let comments_count = fetch_comments_count(&self.pool, cid).await;
-            let attachments_count = fetch_attachments_count(&self.pool, cid).await;
-            let depends_on = fetch_dependencies(&self.pool, cid).await;
-            let dependents = fetch_dependents(&self.pool, cid).await;
+            let labels = fetch_labels(&self.pool, cid, &tenant_id).await;
+            let assignees = fetch_assignees(&self.pool, cid, &tenant_id).await;
+            let checklist = fetch_checklist(&self.pool, cid, &tenant_id).await;
+            let comments_count = fetch_comments_count(&self.pool, cid, &tenant_id).await;
+            let attachments_count = fetch_attachments_count(&self.pool, cid, &tenant_id).await;
+            let depends_on = fetch_dependencies(&self.pool, cid, &tenant_id).await;
+            let dependents = fetch_dependents(&self.pool, cid, &tenant_id).await;
             cards.push(card_from_row(
                 row,
                 labels,
@@ -595,6 +637,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
         let limit = if limit == 0 {
@@ -631,11 +674,12 @@ impl CardService for CardServiceImpl {
                             position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
                      FROM cards \
-                     WHERE board_id = $1 AND column_id = $2 AND id > $3 \
+                     WHERE board_id = $1 AND tenant_id = $2 AND column_id = $3 AND id > $4 \
                      ORDER BY column_id, position \
-                     LIMIT $4",
+                     LIMIT $5",
                 )
                 .bind(board_id)
+                .bind(&tenant_id)
                 .bind(col_id)
                 .bind(after)
                 .bind(limit + 1)
@@ -646,10 +690,11 @@ impl CardService for CardServiceImpl {
                     "SELECT id, project_id, board_id, column_id, ref, title, description, \
                             position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
-                     FROM cards WHERE board_id = $1 AND column_id = $2 \
-                     ORDER BY column_id, position LIMIT $3",
+                     FROM cards WHERE board_id = $1 AND tenant_id = $2 AND column_id = $3 \
+                     ORDER BY column_id, position LIMIT $4",
                 )
                 .bind(board_id)
+                .bind(&tenant_id)
                 .bind(col_id)
                 .bind(limit + 1)
                 .fetch_all(&self.pool)
@@ -660,10 +705,11 @@ impl CardService for CardServiceImpl {
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
                         position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
-                 FROM cards WHERE board_id = $1 AND id > $2 \
-                 ORDER BY column_id, position LIMIT $3",
+                 FROM cards WHERE board_id = $1 AND tenant_id = $2 AND id > $3 \
+                 ORDER BY column_id, position LIMIT $4",
             )
             .bind(board_id)
+            .bind(&tenant_id)
             .bind(after)
             .bind(limit + 1)
             .fetch_all(&self.pool)
@@ -673,10 +719,11 @@ impl CardService for CardServiceImpl {
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
                         position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
-                 FROM cards WHERE board_id = $1 \
-                 ORDER BY column_id, position LIMIT $2",
+                 FROM cards WHERE board_id = $1 AND tenant_id = $2 \
+                 ORDER BY column_id, position LIMIT $3",
             )
             .bind(board_id)
+            .bind(&tenant_id)
             .bind(limit + 1)
             .fetch_all(&self.pool)
             .await
@@ -704,13 +751,13 @@ impl CardService for CardServiceImpl {
         let mut cards = Vec::with_capacity(rows.len());
         for row in rows {
             let cid: Id = row.get("id");
-            let labels = fetch_labels(&self.pool, cid).await;
-            let assignees = fetch_assignees(&self.pool, cid).await;
-            let checklist = fetch_checklist(&self.pool, cid).await;
-            let comments_count = fetch_comments_count(&self.pool, cid).await;
-            let attachments_count = fetch_attachments_count(&self.pool, cid).await;
-            let depends_on = fetch_dependencies(&self.pool, cid).await;
-            let dependents = fetch_dependents(&self.pool, cid).await;
+            let labels = fetch_labels(&self.pool, cid, &tenant_id).await;
+            let assignees = fetch_assignees(&self.pool, cid, &tenant_id).await;
+            let checklist = fetch_checklist(&self.pool, cid, &tenant_id).await;
+            let comments_count = fetch_comments_count(&self.pool, cid, &tenant_id).await;
+            let attachments_count = fetch_attachments_count(&self.pool, cid, &tenant_id).await;
+            let depends_on = fetch_dependencies(&self.pool, cid, &tenant_id).await;
+            let dependents = fetch_dependents(&self.pool, cid, &tenant_id).await;
             cards.push(card_from_row(
                 row,
                 labels,
@@ -747,6 +794,7 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.title.is_empty() {
@@ -754,19 +802,23 @@ impl CardService for CardServiceImpl {
         }
 
         // Idempotency check.
-        if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, existing_id)
+        if let Some(existing_id) =
+            check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
+        {
+            return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
                 .map(|card| Response::new(CreateCardResponse { card: Some(card) }));
         }
 
         // Verify board exists and get project_id.
-        let board_row = sqlx::query("SELECT project_id FROM boards WHERE id = $1")
-            .bind(board_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch board", e))?
-            .ok_or_else(|| Status::not_found("board not found"))?;
+        let board_row =
+            sqlx::query("SELECT project_id FROM boards WHERE id = $1 AND tenant_id = $2")
+                .bind(board_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch board", e))?
+                .ok_or_else(|| Status::not_found("board not found"))?;
 
         let project_id: Id = board_row.get("project_id");
 
@@ -776,13 +828,16 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
-        let col_row = sqlx::query("SELECT id FROM columns WHERE id = $1 AND board_id = $2")
-            .bind(col_id)
-            .bind(board_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to verify column", e))?
-            .ok_or_else(|| Status::not_found("column not found on this board"))?;
+        let col_row = sqlx::query(
+            "SELECT id FROM columns WHERE id = $1 AND board_id = $2 AND tenant_id = $3",
+        )
+        .bind(col_id)
+        .bind(board_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to verify column", e))?
+        .ok_or_else(|| Status::not_found("column not found on this board"))?;
         let _ = col_row;
 
         // Begin transaction.
@@ -793,16 +848,17 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("begin tx failed", e))?;
 
         // Allocate card ref (advisory lock inside).
-        let card_ref = allocate_card_ref(&mut tx, project_id).await?;
+        let card_ref = allocate_card_ref(&mut tx, project_id, &tenant_id).await?;
 
         let card_id = Id::new();
 
         // Compute position.
         let position: i32 = if req.position == 0 {
             sqlx::query(
-                "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM cards WHERE column_id = $1",
+                "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM cards WHERE column_id = $1 AND tenant_id = $2",
             )
             .bind(col_id)
+            .bind(&tenant_id)
             .fetch_one(&mut *tx)
             .await
             .map(|r| r.get::<i32, _>("next_pos"))
@@ -811,9 +867,10 @@ impl CardService for CardServiceImpl {
             // Shift cards at >= requested position.
             sqlx::query(
                 "UPDATE cards SET position = position + 1, updated_at = now() \
-                 WHERE column_id = $1 AND position >= $2",
+                 WHERE column_id = $1 AND tenant_id = $2 AND position >= $3",
             )
             .bind(col_id)
+            .bind(&tenant_id)
             .bind(req.position)
             .execute(&mut *tx)
             .await
@@ -834,11 +891,12 @@ impl CardService for CardServiceImpl {
         };
 
         sqlx::query(
-            "INSERT INTO cards (id, project_id, board_id, column_id, ref, title, description, \
+            "INSERT INTO cards (id, tenant_id, project_id, board_id, column_id, ref, title, description, \
                                 position, priority, urgency, due_date, milestone_id, created_by, revision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::card_priority, $10::card_urgency, $11, $12, $13, 0)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::card_priority, $11::card_urgency, $12, $13, $14, 0)",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(board_id)
         .bind(col_id)
@@ -871,16 +929,16 @@ impl CardService for CardServiceImpl {
             "urgency": urgency_str,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, board_id, "CardCreated", payload, 0).await?;
+        insert_event_log(&mut tx, &tenant_id, board_id, "CardCreated", payload, 0).await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
         // Store idempotency.
-        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(CreateCardResponse { card: Some(card) }))
     }
 
@@ -898,23 +956,28 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let patch = req.card.unwrap_or_default();
 
         // Idempotency check.
-        if let Some(_existing) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, card_id)
+        if let Some(_existing) =
+            check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
+        {
+            return fetch_full_card(&self.pool, card_id, &tenant_id)
                 .await
                 .map(|card| Response::new(UpdateCardResponse { card: Some(card) }));
         }
 
         // Fetch current card for board_id + revision.
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -953,7 +1016,7 @@ impl CardService for CardServiceImpl {
                 milestone_id = CASE WHEN $9 IS NOT NULL THEN $9 ELSE milestone_id END,
                 revision    = revision + 1,
                 updated_at  = now()
-             WHERE id = $1
+             WHERE id = $1 AND tenant_id = $10
              RETURNING board_id, revision",
         )
         .bind(card_id)
@@ -965,6 +1028,7 @@ impl CardService for CardServiceImpl {
         .bind(patch.blocked)
         .bind(&patch.cover)
         .bind(milestone_id)
+        .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update card", e))?
@@ -993,14 +1057,22 @@ impl CardService for CardServiceImpl {
             .begin()
             .await
             .map_err(|e| internal("begin tx failed", e))?;
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(UpdateCardResponse { card: Some(card) }))
     }
 
@@ -1020,6 +1092,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let to_col_id = req
             .to_column_id
@@ -1027,20 +1100,21 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid to_column_id"))?;
 
         // Idempotency check.
-        if check_idempotency_card(&self.pool, &req.idempotency_key)
+        if check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key)
             .await?
             .is_some()
         {
-            return fetch_full_card(&self.pool, card_id)
+            return fetch_full_card(&self.pool, card_id, &tenant_id)
                 .await
                 .map(|card| Response::new(MoveCardResponse { card: Some(card) }));
         }
 
         // Fetch card's current state.
         let card_row = sqlx::query(
-            "SELECT board_id, column_id, position, revision, project_id FROM cards WHERE id = $1",
+            "SELECT board_id, column_id, position, revision, project_id FROM cards WHERE id = $1 AND tenant_id = $2",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card", e))?
@@ -1053,22 +1127,26 @@ impl CardService for CardServiceImpl {
         let card_project_id: Id = card_row.get("project_id");
 
         // Fetch target column's board_id.
-        let target_col_row = sqlx::query("SELECT board_id FROM columns WHERE id = $1")
-            .bind(to_col_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch target column", e))?
-            .ok_or_else(|| Status::not_found("target column not found"))?;
+        let target_col_row =
+            sqlx::query("SELECT board_id FROM columns WHERE id = $1 AND tenant_id = $2")
+                .bind(to_col_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch target column", e))?
+                .ok_or_else(|| Status::not_found("target column not found"))?;
 
         let target_board_id: Id = target_col_row.get("board_id");
 
         // Fetch target board's project_id to verify no cross-project move.
-        let target_board_row = sqlx::query("SELECT project_id FROM boards WHERE id = $1")
-            .bind(target_board_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch target board", e))?
-            .ok_or_else(|| Status::not_found("target board not found"))?;
+        let target_board_row =
+            sqlx::query("SELECT project_id FROM boards WHERE id = $1 AND tenant_id = $2")
+                .bind(target_board_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch target board", e))?
+                .ok_or_else(|| Status::not_found("target board not found"))?;
 
         let target_project_id: Id = target_board_row.get("project_id");
 
@@ -1096,9 +1174,10 @@ impl CardService for CardServiceImpl {
                 if to_pos > from_pos {
                     sqlx::query(
                         "UPDATE cards SET position = position - 1, updated_at = now() \
-                         WHERE column_id = $1 AND position > $2 AND position <= $3",
+                         WHERE column_id = $1 AND tenant_id = $2 AND position > $3 AND position <= $4",
                     )
                     .bind(from_col_id)
+                    .bind(&tenant_id)
                     .bind(from_pos)
                     .bind(to_pos)
                     .execute(&mut *tx)
@@ -1107,9 +1186,10 @@ impl CardService for CardServiceImpl {
                 } else {
                     sqlx::query(
                         "UPDATE cards SET position = position + 1, updated_at = now() \
-                         WHERE column_id = $1 AND position >= $2 AND position < $3",
+                         WHERE column_id = $1 AND tenant_id = $2 AND position >= $3 AND position < $4",
                     )
                     .bind(from_col_id)
+                    .bind(&tenant_id)
                     .bind(to_pos)
                     .bind(from_pos)
                     .execute(&mut *tx)
@@ -1121,9 +1201,10 @@ impl CardService for CardServiceImpl {
             // Cross-column: close gap in source, open slot in target.
             sqlx::query(
                 "UPDATE cards SET position = position - 1, updated_at = now() \
-                 WHERE column_id = $1 AND position > $2",
+                 WHERE column_id = $1 AND tenant_id = $2 AND position > $3",
             )
             .bind(from_col_id)
+            .bind(&tenant_id)
             .bind(from_pos)
             .execute(&mut *tx)
             .await
@@ -1131,9 +1212,10 @@ impl CardService for CardServiceImpl {
 
             sqlx::query(
                 "UPDATE cards SET position = position + 1, updated_at = now() \
-                 WHERE column_id = $1 AND position >= $2",
+                 WHERE column_id = $1 AND tenant_id = $2 AND position >= $3",
             )
             .bind(to_col_id)
+            .bind(&tenant_id)
             .bind(to_pos)
             .execute(&mut *tx)
             .await
@@ -1144,11 +1226,12 @@ impl CardService for CardServiceImpl {
         let new_revision_row = sqlx::query(
             "UPDATE cards SET column_id = $2, position = $3, revision = revision + 1, \
                               updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $4 RETURNING revision",
         )
         .bind(card_id)
         .bind(to_col_id)
         .bind(to_pos)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to place card at new position", e))?;
@@ -1165,15 +1248,23 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, board_id, "CardMoved", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardMoved",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(MoveCardResponse { card: Some(card) }))
     }
 
@@ -1192,13 +1283,17 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
+
         // Fetch board_id + revision before deleting.
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1209,8 +1304,9 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        let result = sqlx::query("DELETE FROM cards WHERE id = $1")
+        let result = sqlx::query("DELETE FROM cards WHERE id = $1 AND tenant_id = $2")
             .bind(card_id)
+            .bind(&tenant_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| internal("failed to delete card", e))?;
@@ -1225,7 +1321,15 @@ impl CardService for CardServiceImpl {
             "board_id": board_id.to_string(),
             "prev_revision": prev_revision,
         });
-        insert_event_log(&mut tx, board_id, "CardDeleted", payload, prev_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardDeleted",
+            payload,
+            prev_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -1250,6 +1354,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.idempotency_key.is_empty() {
@@ -1269,8 +1374,10 @@ impl CardService for CardServiceImpl {
             return Err(Status::invalid_argument("a card cannot depend on itself"));
         }
 
-        if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, existing_id)
+        if let Some(existing_id) =
+            check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
+        {
+            return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
                 .map(|card| Response::new(AddCardDependencyResponse { card: Some(card) }));
         }
@@ -1283,9 +1390,10 @@ impl CardService for CardServiceImpl {
 
         // Verify both cards belong to the authorized board.
         let rows =
-            sqlx::query("SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2")
+            sqlx::query("SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2 AND tenant_id = $3")
                 .bind(&[card_id, depends_on_id][..])
                 .bind(board_id)
+                .bind(&tenant_id)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to verify cards", e))?;
@@ -1316,9 +1424,10 @@ impl CardService for CardServiceImpl {
 
         let updated = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump card revision", e))?;
@@ -1332,15 +1441,23 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(AddCardDependencyResponse {
             card: Some(card),
         }))
@@ -1361,6 +1478,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.idempotency_key.is_empty() {
@@ -1376,8 +1494,10 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
 
-        if let Some(existing_id) = check_idempotency_card(&self.pool, &req.idempotency_key).await? {
-            return fetch_full_card(&self.pool, existing_id)
+        if let Some(existing_id) =
+            check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
+        {
+            return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
                 .map(|card| Response::new(RemoveCardDependencyResponse { card: Some(card) }));
         }
@@ -1389,12 +1509,15 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("begin tx failed", e))?;
 
         // Verify both cards belong to the authorized board and fetch the card revision.
-        let card_row = sqlx::query("SELECT revision FROM cards WHERE id = $1 AND board_id = $2")
-            .bind(card_id)
-            .bind(board_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| internal("failed to verify card", e))?;
+        let card_row = sqlx::query(
+            "SELECT revision FROM cards WHERE id = $1 AND board_id = $2 AND tenant_id = $3",
+        )
+        .bind(card_id)
+        .bind(board_id)
+        .bind(&tenant_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to verify card", e))?;
 
         let prev_revision = match card_row {
             Some(row) => row.get::<i64, _>("revision"),
@@ -1405,12 +1528,14 @@ impl CardService for CardServiceImpl {
             }
         };
 
-        let depends_row = sqlx::query("SELECT 1 FROM cards WHERE id = $1 AND board_id = $2")
-            .bind(depends_on_id)
-            .bind(board_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| internal("failed to verify dependency card", e))?;
+        let depends_row =
+            sqlx::query("SELECT 1 FROM cards WHERE id = $1 AND board_id = $2 AND tenant_id = $3")
+                .bind(depends_on_id)
+                .bind(board_id)
+                .bind(&tenant_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| internal("failed to verify dependency card", e))?;
 
         if depends_row.is_none() {
             return Err(Status::invalid_argument(
@@ -1430,9 +1555,10 @@ impl CardService for CardServiceImpl {
         let new_revision = if result.rows_affected() > 0 {
             let updated = sqlx::query(
                 "UPDATE cards SET revision = revision + 1, updated_at = now() \
-                 WHERE id = $1 RETURNING revision",
+                 WHERE id = $1 AND tenant_id = $2 RETURNING revision",
             )
             .bind(card_id)
+            .bind(&tenant_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to bump card revision", e))?;
@@ -1449,15 +1575,23 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        store_idempotency_card(&self.pool, &req.idempotency_key, card_id).await;
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(RemoveCardDependencyResponse {
             card: Some(card),
         }))
@@ -1479,6 +1613,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.card_ids.is_empty() {
@@ -1500,14 +1635,14 @@ impl CardService for CardServiceImpl {
             .collect();
 
         // Idempotency.
-        if check_idempotency_card(&self.pool, &req.idempotency_key)
+        if check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key)
             .await?
             .is_some()
         {
             // Re-fetch all cards and return.
             let mut cards = vec![];
             for &cid in &card_ids {
-                if let Ok(c) = fetch_full_card(&self.pool, cid).await {
+                if let Ok(c) = fetch_full_card(&self.pool, cid, &tenant_id).await {
                     cards.push(c);
                 }
             }
@@ -1525,9 +1660,10 @@ impl CardService for CardServiceImpl {
         for &cid in &card_ids {
             // Verify this card belongs to the board.
             let exists: bool =
-                sqlx::query("SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1 AND board_id = $2)")
+                sqlx::query("SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1 AND board_id = $2 AND tenant_id = $3)")
                     .bind(cid)
                     .bind(board_id)
+                    .bind(&tenant_id)
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| internal("failed to verify card ownership", e))
@@ -1559,9 +1695,10 @@ impl CardService for CardServiceImpl {
             // Bump revision.
             let rev_row = sqlx::query(
                 "UPDATE cards SET revision = revision + 1, updated_at = now() \
-                 WHERE id = $1 RETURNING revision",
+                 WHERE id = $1 AND tenant_id = $2 RETURNING revision",
             )
             .bind(cid)
+            .bind(&tenant_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to bump card revision", e))?;
@@ -1576,7 +1713,15 @@ impl CardService for CardServiceImpl {
                 "label_ids": label_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
                 "idempotency_key": req.idempotency_key,
             });
-            insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_rev).await?;
+            insert_event_log(
+                &mut tx,
+                &tenant_id,
+                board_id,
+                "CardUpdated",
+                payload,
+                new_rev,
+            )
+            .await?;
 
             updated_card_ids.push(cid);
         }
@@ -1588,12 +1733,12 @@ impl CardService for CardServiceImpl {
         if !req.idempotency_key.is_empty()
             && let Some(&first) = updated_card_ids.first()
         {
-            store_idempotency_card(&self.pool, &req.idempotency_key, first).await;
+            store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, first).await;
         }
 
         let mut cards = vec![];
         for cid in updated_card_ids {
-            cards.push(fetch_full_card(&self.pool, cid).await?);
+            cards.push(fetch_full_card(&self.pool, cid, &tenant_id).await?);
         }
 
         Ok(Response::new(BulkUpdateCardLabelsResponse { cards }))
@@ -1614,17 +1759,20 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         if req.subject.is_empty() {
             return Err(Status::invalid_argument("subject is required"));
         }
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1636,8 +1784,9 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("begin tx failed", e))?;
 
         sqlx::query(
-            "INSERT INTO card_assignees (card_id, subject) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            "INSERT INTO card_assignees (tenant_id, card_id, subject) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
+        .bind(&tenant_id)
         .bind(card_id)
         .bind(&req.subject)
         .execute(&mut *tx)
@@ -1646,9 +1795,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -1661,13 +1811,21 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "assignees": [req.subject] },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
             .map(|card| Response::new(AssignCardResponse { card: Some(card) }))
     }
@@ -1686,14 +1844,17 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1704,18 +1865,22 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        sqlx::query("DELETE FROM card_assignees WHERE card_id = $1 AND subject = $2")
-            .bind(card_id)
-            .bind(&req.subject)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| internal("failed to unassign card", e))?;
+        sqlx::query(
+            "DELETE FROM card_assignees WHERE card_id = $1 AND subject = $2 AND tenant_id = $3",
+        )
+        .bind(card_id)
+        .bind(&req.subject)
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to unassign card", e))?;
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -1728,13 +1893,21 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "unassigned": req.subject },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
             .map(|card| Response::new(UnassignCardResponse { card: Some(card) }))
     }
@@ -1754,17 +1927,20 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         if req.text.is_empty() {
             return Err(Status::invalid_argument("text is required"));
         }
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1780,11 +1956,12 @@ impl CardService for CardServiceImpl {
         if req.position == 0 {
             // Append.
             sqlx::query(
-                "INSERT INTO checklist_items (id, card_id, text, position) \
-                 SELECT $1, $2, $3, COALESCE(MAX(position), -1) + 1 \
-                 FROM checklist_items WHERE card_id = $2",
+                "INSERT INTO checklist_items (id, tenant_id, card_id, text, position) \
+                 SELECT $1, $2, $3, $4, COALESCE(MAX(position), -1) + 1 \
+                 FROM checklist_items WHERE card_id = $3 AND tenant_id = $2",
             )
             .bind(item_id)
+            .bind(&tenant_id)
             .bind(card_id)
             .bind(&req.text)
             .execute(&mut *tx)
@@ -1794,18 +1971,20 @@ impl CardService for CardServiceImpl {
             // Shift and insert.
             sqlx::query(
                 "UPDATE checklist_items SET position = position + 1, updated_at = now() \
-                 WHERE card_id = $1 AND position >= $2",
+                 WHERE card_id = $1 AND tenant_id = $2 AND position >= $3",
             )
             .bind(card_id)
+            .bind(&tenant_id)
             .bind(req.position)
             .execute(&mut *tx)
             .await
             .map_err(|e| internal("failed to shift checklist items", e))?;
 
             sqlx::query(
-                "INSERT INTO checklist_items (id, card_id, text, position) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO checklist_items (id, tenant_id, card_id, text, position) VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(item_id)
+            .bind(&tenant_id)
             .bind(card_id)
             .bind(&req.text)
             .bind(req.position)
@@ -1816,9 +1995,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -1831,13 +2011,21 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_added": item_id.to_string() },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
             .map(|card| Response::new(AddChecklistItemResponse { card: Some(card) }))
     }
@@ -1857,6 +2045,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let item_id = req
             .item_id
@@ -1864,12 +2053,14 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid item_id"))?;
         let patch = req.item.unwrap_or_default();
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1885,12 +2076,13 @@ impl CardService for CardServiceImpl {
                 text       = CASE WHEN $3 != '' THEN $3 ELSE text END,
                 done       = $4,
                 updated_at = now()
-             WHERE id = $1 AND card_id = $2",
+             WHERE id = $1 AND card_id = $2 AND tenant_id = $5",
         )
         .bind(item_id)
         .bind(card_id)
         .bind(&patch.text)
         .bind(patch.done)
+        .bind(&tenant_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal("failed to update checklist item", e))?;
@@ -1901,9 +2093,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -1916,13 +2109,21 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_updated": item_id.to_string() },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
             .map(|card| Response::new(UpdateChecklistItemResponse { card: Some(card) }))
     }
@@ -1941,18 +2142,21 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let item_id = req
             .item_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid item_id"))?;
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1963,12 +2167,15 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        let result = sqlx::query("DELETE FROM checklist_items WHERE id = $1 AND card_id = $2")
-            .bind(item_id)
-            .bind(card_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| internal("failed to remove checklist item", e))?;
+        let result = sqlx::query(
+            "DELETE FROM checklist_items WHERE id = $1 AND card_id = $2 AND tenant_id = $3",
+        )
+        .bind(item_id)
+        .bind(card_id)
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to remove checklist item", e))?;
 
         if result.rows_affected() == 0 {
             return Err(Status::not_found("checklist item not found on this card"));
@@ -1976,9 +2183,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -1991,7 +2199,15 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_removed": item_id.to_string() },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -2015,6 +2231,7 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.body.is_empty() {
@@ -2023,11 +2240,14 @@ impl CardService for CardServiceImpl {
 
         // Idempotency.
         if !req.idempotency_key.is_empty() {
-            let row = sqlx::query("SELECT response_payload FROM idempotency_keys WHERE key = $1")
-                .bind(&req.idempotency_key)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("idempotency key lookup failed", e))?;
+            let row = sqlx::query(
+                "SELECT response_payload FROM idempotency_keys WHERE tenant_id = $1 AND key = $2",
+            )
+            .bind(&tenant_id)
+            .bind(&req.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("idempotency key lookup failed", e))?;
 
             if let Some(r) = row {
                 let payload: Option<serde_json::Value> = r.get("response_payload");
@@ -2037,9 +2257,10 @@ impl CardService for CardServiceImpl {
                 {
                     let comment_row = sqlx::query(
                         "SELECT id, card_id, author_sub, body, created_at, updated_at \
-                                 FROM comments WHERE id = $1",
+                                 FROM comments WHERE id = $1 AND tenant_id = $2",
                     )
                     .bind(comment_id)
+                    .bind(&tenant_id)
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(|e| internal("failed to fetch cached comment", e))?;
@@ -2052,12 +2273,14 @@ impl CardService for CardServiceImpl {
             }
         }
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2071,11 +2294,12 @@ impl CardService for CardServiceImpl {
         let comment_id = Id::new();
 
         let comment_row = sqlx::query(
-            "INSERT INTO comments (id, card_id, author_sub, body) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO comments (id, tenant_id, card_id, author_sub, body) \
+             VALUES ($1, $2, $3, $4, $5) \
              RETURNING id, card_id, author_sub, body, created_at, updated_at",
         )
         .bind(comment_id)
+        .bind(&tenant_id)
         .bind(card_id)
         .bind(&subject)
         .bind(&req.body)
@@ -2085,9 +2309,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -2101,7 +2326,15 @@ impl CardService for CardServiceImpl {
             "patch": { "comments_count": "+1" },
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -2111,8 +2344,9 @@ impl CardService for CardServiceImpl {
         if !req.idempotency_key.is_empty() {
             let idem_payload = json!({ "comment_id": comment_id.to_string() });
             if let Err(e) = sqlx::query(
-                "INSERT INTO idempotency_keys (key, response_payload) VALUES ($1, $2::jsonb) ON CONFLICT DO NOTHING",
+                "INSERT INTO idempotency_keys (tenant_id, key, response_payload) VALUES ($1, $2, $3::jsonb) ON CONFLICT DO NOTHING",
             )
+            .bind(&tenant_id)
             .bind(&req.idempotency_key)
             .bind(idem_payload)
             .execute(&self.pool)
@@ -2143,6 +2377,7 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let comment_id = req
             .comment_id
@@ -2153,12 +2388,14 @@ impl CardService for CardServiceImpl {
             return Err(Status::invalid_argument("body is required"));
         }
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2171,13 +2408,14 @@ impl CardService for CardServiceImpl {
 
         let comment_row = sqlx::query(
             "UPDATE comments SET body = $3, updated_at = now() \
-             WHERE id = $1 AND card_id = $2 AND author_sub = $4 \
+             WHERE id = $1 AND card_id = $2 AND tenant_id = $5 AND author_sub = $4 \
              RETURNING id, card_id, author_sub, body, created_at, updated_at",
         )
         .bind(comment_id)
         .bind(card_id)
         .bind(&req.body)
         .bind(&subject)
+        .bind(&tenant_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to edit comment", e))?
@@ -2185,9 +2423,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -2200,7 +2439,15 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "comment_edited": comment_id.to_string() },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -2217,7 +2464,7 @@ impl CardService for CardServiceImpl {
     // The `edit` relation covers admins/owners. We also allow the comment author
     // by checking author_sub in the WHERE clause.
     // Strategy: try author-delete first; if 0 rows affected and caller has `edit`
-    // (which Keto already confirmed), delete by id+card_id only.
+    // (which the permission check already confirmed), delete by id+card_id only.
     // event_log: CardUpdated.
 
     async fn delete_comment(
@@ -2230,18 +2477,21 @@ impl CardService for CardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let comment_id = req
             .comment_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid comment_id"))?;
 
-        let cur = sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1")
-            .bind(card_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch card", e))?
-            .ok_or_else(|| Status::not_found("card not found"))?;
+        let cur =
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch card", e))?
+                .ok_or_else(|| Status::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2254,23 +2504,27 @@ impl CardService for CardServiceImpl {
 
         // Try author-only delete first.
         let result =
-            sqlx::query("DELETE FROM comments WHERE id = $1 AND card_id = $2 AND author_sub = $3")
+            sqlx::query("DELETE FROM comments WHERE id = $1 AND card_id = $2 AND tenant_id = $4 AND author_sub = $3")
                 .bind(comment_id)
                 .bind(card_id)
                 .bind(&subject)
+                .bind(&tenant_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to delete comment (author path)", e))?;
 
         if result.rows_affected() == 0 {
-            // Caller is not the author; Keto already confirmed `edit` relation
-            // (admin/owner), so delete unconditionally by id+card_id.
-            let result2 = sqlx::query("DELETE FROM comments WHERE id = $1 AND card_id = $2")
-                .bind(comment_id)
-                .bind(card_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| internal("failed to delete comment (admin path)", e))?;
+            // Caller is not the author; the permission check already confirmed `edit` relation
+            // (admin/owner), so delete unconditionally by id+card_id+tenant_id.
+            let result2 = sqlx::query(
+                "DELETE FROM comments WHERE id = $1 AND card_id = $2 AND tenant_id = $3",
+            )
+            .bind(comment_id)
+            .bind(card_id)
+            .bind(&tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to delete comment (admin path)", e))?;
 
             if result2.rows_affected() == 0 {
                 return Err(Status::not_found("comment not found on this card"));
@@ -2279,9 +2533,10 @@ impl CardService for CardServiceImpl {
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
-             WHERE id = $1 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
         )
         .bind(card_id)
+        .bind(&tenant_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to bump revision", e))?;
@@ -2294,7 +2549,15 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "comment_deleted": comment_id.to_string() },
         });
-        insert_event_log(&mut tx, board_id, "CardUpdated", payload, new_revision).await?;
+        insert_event_log(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardUpdated",
+            payload,
+            new_revision,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -2317,6 +2580,7 @@ impl CardService for CardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid card_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
         let limit = if limit == 0 {
@@ -2336,12 +2600,14 @@ impl CardService for CardServiceImpl {
         };
 
         // Verify card exists.
-        let exists: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1)")
-            .bind(card_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| internal("failed to verify card", e))
-            .map(|r| r.get::<bool, _>(0))?;
+        let exists: bool =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM cards WHERE id = $1 AND tenant_id = $2)")
+                .bind(card_id)
+                .bind(&tenant_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| internal("failed to verify card", e))
+                .map(|r| r.get::<bool, _>(0))?;
         if !exists {
             return Err(Status::not_found("card not found"));
         }
@@ -2349,10 +2615,11 @@ impl CardService for CardServiceImpl {
         let rows = if let Some(after) = cursor_id {
             sqlx::query(
                 "SELECT id, card_id, author_sub, body, created_at, updated_at \
-                 FROM comments WHERE card_id = $1 AND id > $2 \
-                 ORDER BY created_at ASC LIMIT $3",
+                 FROM comments WHERE card_id = $1 AND tenant_id = $2 AND id > $3 \
+                 ORDER BY created_at ASC LIMIT $4",
             )
             .bind(card_id)
+            .bind(&tenant_id)
             .bind(after)
             .bind(limit + 1)
             .fetch_all(&self.pool)
@@ -2360,10 +2627,11 @@ impl CardService for CardServiceImpl {
         } else {
             sqlx::query(
                 "SELECT id, card_id, author_sub, body, created_at, updated_at \
-                 FROM comments WHERE card_id = $1 \
-                 ORDER BY created_at ASC LIMIT $2",
+                 FROM comments WHERE card_id = $1 AND tenant_id = $2 \
+                 ORDER BY created_at ASC LIMIT $3",
             )
             .bind(card_id)
+            .bind(&tenant_id)
             .bind(limit + 1)
             .fetch_all(&self.pool)
             .await
@@ -2413,18 +2681,20 @@ mod tests {
         crate::test_support::setup_pool().await
     }
 
-    async fn setup_keto() -> Arc<KetoClient> {
-        crate::test_support::setup_keto().await
+    async fn setup_permission() -> Arc<PermissionClient> {
+        crate::test_support::setup_permission().await
     }
 
-    fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> CardServiceImpl {
-        CardServiceImpl { pool, keto }
+    fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> CardServiceImpl {
+        CardServiceImpl { pool, permission }
     }
 
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(subject, None));
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ));
         req
     }
 
@@ -2435,16 +2705,32 @@ mod tests {
         req
     }
 
+    fn authed_request_with_object_for_tenant<T>(
+        body: T,
+        tenant_id: &str,
+        subject: &str,
+        object_id: &str,
+    ) -> Request<T> {
+        let mut req = Request::new(body);
+        req.extensions_mut()
+            .insert(AuthContext::authenticated(tenant_id.to_string(), subject));
+        req.extensions_mut()
+            .insert(CheckedObjectId(object_id.to_string()));
+        req
+    }
+
     // ── Seed helpers ─────────────────────────────────────────────────────────
 
     async fn seed_project(pool: &PgPool, subject: &str, prefix: &str) -> Id {
         let pid = Id::new();
         let slug = format!("tp-{}", &pid.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, description, owner_id, prefix) \
-             VALUES ($1, $2, $3, '', $4, $5)",
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id, prefix) \
+             VALUES ($1, $2, $3, $4, '', $5, $6)",
         )
         .bind(pid)
+        .bind(tenant_id)
         .bind(format!("Test Project {pid}"))
         .bind(&slug)
         .bind(subject)
@@ -2455,51 +2741,61 @@ mod tests {
         pid
     }
 
-    async fn seed_board(pool: &PgPool, project_id: Id) -> Id {
+    async fn seed_board(pool: &PgPool, project_id: Id, tenant_id: &str) -> Id {
         let bid = Id::new();
         let slug = format!("b-{}", &bid.to_string()[18..26]);
-        sqlx::query("INSERT INTO boards (id, project_id, name, slug) VALUES ($1, $2, $3, $4)")
-            .bind(bid)
-            .bind(project_id)
-            .bind(format!("Board {bid}"))
-            .bind(slug)
-            .execute(pool)
-            .await
-            .expect("seed board failed");
+        sqlx::query(
+            "INSERT INTO boards (id, tenant_id, project_id, name, slug) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(bid)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(format!("Board {bid}"))
+        .bind(slug)
+        .execute(pool)
+        .await
+        .expect("seed board failed");
         bid
     }
 
-    async fn seed_column(pool: &PgPool, board_id: Id) -> Id {
+    async fn seed_column(pool: &PgPool, board_id: Id, tenant_id: &str) -> Id {
         let cid = Id::new();
-        sqlx::query("INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, $3, 0)")
-            .bind(cid)
-            .bind(board_id)
-            .bind("To Do")
-            .execute(pool)
-            .await
-            .expect("seed column failed");
+        sqlx::query(
+            "INSERT INTO columns (id, tenant_id, board_id, title, position) VALUES ($1, $2, $3, $4, 0)",
+        )
+        .bind(cid)
+        .bind(tenant_id)
+        .bind(board_id)
+        .bind("To Do")
+        .execute(pool)
+        .await
+        .expect("seed column failed");
         cid
     }
 
-    async fn seed_label(pool: &PgPool, project_id: Id, name: &str) -> Id {
+    async fn seed_label(pool: &PgPool, project_id: Id, tenant_id: &str, name: &str) -> Id {
         let lid = Id::new();
         sqlx::query(
-            "INSERT INTO labels (id, project_id, name, style) VALUES ($1, $2, $3, 'amber') \
-             ON CONFLICT (project_id, name) DO NOTHING",
+            "INSERT INTO labels (id, tenant_id, project_id, name, style) VALUES ($1, $2, $3, $4, 'amber') \
+             ON CONFLICT (tenant_id, project_id, name) DO NOTHING",
         )
         .bind(lid)
+        .bind(tenant_id)
         .bind(project_id)
         .bind(name)
         .execute(pool)
         .await
         .expect("seed label failed");
         // Re-fetch the actual id (might differ if conflict).
-        let row = sqlx::query("SELECT id FROM labels WHERE project_id = $1 AND name = $2")
-            .bind(project_id)
-            .bind(name)
-            .fetch_one(pool)
-            .await
-            .expect("fetch label id failed");
+        let row = sqlx::query(
+            "SELECT id FROM labels WHERE project_id = $1 AND tenant_id = $2 AND name = $3",
+        )
+        .bind(project_id)
+        .bind(tenant_id)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("fetch label id failed");
         row.get("id")
     }
 
@@ -2515,13 +2811,14 @@ mod tests {
     #[tokio::test]
     async fn create_card_allocates_ref() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "REF").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let ikey = |n: u8| format!("ikey-{}-{}", Id::new(), n);
 
@@ -2589,16 +2886,17 @@ mod tests {
     #[tokio::test]
     async fn create_card_in_different_projects_have_independent_seqs() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid_a = seed_project(&pool, &subject, "ALPHA").await;
         let pid_b = seed_project(&pool, &subject, "BETA").await;
-        let bid_a = seed_board(&pool, pid_a).await;
-        let bid_b = seed_board(&pool, pid_b).await;
-        let col_a = seed_column(&pool, bid_a).await;
-        let col_b = seed_column(&pool, bid_b).await;
+        let bid_a = seed_board(&pool, pid_a, &tenant_id).await;
+        let bid_b = seed_board(&pool, pid_b, &tenant_id).await;
+        let col_a = seed_column(&pool, bid_a, &tenant_id).await;
+        let col_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let ca = svc
             .create_card(authed_request_with_object(
@@ -2649,18 +2947,20 @@ mod tests {
     #[tokio::test]
     async fn move_card_within_same_board_succeeds() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "MV").await;
-        let bid = seed_board(&pool, pid).await;
-        let col_a = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let col_a = seed_column(&pool, bid, &tenant_id).await;
         let col_b_id = Id::new();
         sqlx::query(
-            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'In Progress', 1)",
+            "INSERT INTO columns (id, tenant_id, board_id, title, position) VALUES ($1, $2, $3, 'In Progress', 1)",
         )
         .bind(col_b_id)
+        .bind(&tenant_id)
         .bind(bid)
         .execute(&pool)
         .await
@@ -2714,16 +3014,17 @@ mod tests {
     #[tokio::test]
     async fn move_card_to_column_on_different_project_returns_invalid_argument() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid_a = seed_project(&pool, &subject, "PA").await;
         let pid_b = seed_project(&pool, &subject, "PB").await;
-        let bid_a = seed_board(&pool, pid_a).await;
-        let bid_b = seed_board(&pool, pid_b).await;
-        let col_a = seed_column(&pool, bid_a).await;
-        let col_b = seed_column(&pool, bid_b).await;
+        let bid_a = seed_board(&pool, pid_a, &tenant_id).await;
+        let bid_b = seed_board(&pool, pid_b, &tenant_id).await;
+        let col_a = seed_column(&pool, bid_a, &tenant_id).await;
+        let col_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -2770,18 +3071,20 @@ mod tests {
     #[tokio::test]
     async fn move_card_with_idempotency_key_replays_returns_same_state() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "IMP").await;
-        let bid = seed_board(&pool, pid).await;
-        let col_a = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let col_a = seed_column(&pool, bid, &tenant_id).await;
         let col_b_id = Id::new();
         sqlx::query(
-            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'Done', 1)",
+            "INSERT INTO columns (id, tenant_id, board_id, title, position) VALUES ($1, $2, $3, 'Done', 1)",
         )
         .bind(col_b_id)
+        .bind(&tenant_id)
         .bind(bid)
         .execute(&pool)
         .await
@@ -2851,13 +3154,14 @@ mod tests {
     #[tokio::test]
     async fn update_card_bumps_revision_and_writes_event_log_row() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UPD").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -2920,14 +3224,15 @@ mod tests {
     #[tokio::test]
     async fn delete_card_cascades_assignees_labels_checklist_comments() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEL").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
-        let label_id = seed_label(&pool, pid, "bug").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+        let label_id = seed_label(&pool, pid, &tenant_id, "bug").await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3027,14 +3332,15 @@ mod tests {
     #[tokio::test]
     async fn bulk_update_card_labels_writes_event_log_per_card() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "BUL").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
-        let label_id = seed_label(&pool, pid, "feature").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+        let label_id = seed_label(&pool, pid, &tenant_id, "feature").await;
 
         let card1 = svc
             .create_card(authed_request_with_object(
@@ -3111,13 +3417,14 @@ mod tests {
     #[tokio::test]
     async fn assign_card_idempotent_on_repeat() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "ASN").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3160,7 +3467,7 @@ mod tests {
         .await
         .expect("assign 2 failed");
 
-        let c = fetch_full_card(&pool, card.id.parse::<Id>().unwrap())
+        let c = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id)
             .await
             .unwrap();
         assert_eq!(c.assignees.len(), 1, "duplicate assign must be idempotent");
@@ -3171,13 +3478,14 @@ mod tests {
     #[tokio::test]
     async fn add_checklist_item_appends_to_position_max_plus_one() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHK").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3212,7 +3520,7 @@ mod tests {
             .expect("add checklist failed");
         }
 
-        let updated = fetch_full_card(&pool, card.id.parse::<Id>().unwrap())
+        let updated = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id)
             .await
             .unwrap();
         assert_eq!(updated.checklist.len(), 3);
@@ -3232,13 +3540,14 @@ mod tests {
     #[tokio::test]
     async fn add_then_edit_comment_updates_body_and_writes_event_log() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CMT").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3315,15 +3624,16 @@ mod tests {
     #[tokio::test]
     async fn delete_comment_rejects_when_caller_is_not_author_or_admin() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let author = format!("user:author-{}", Id::new());
         let other = format!("user:other-{}", Id::new());
 
         let pid = seed_project(&pool, &author, "DCM").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3359,7 +3669,7 @@ mod tests {
             .comment
             .expect("comment missing");
 
-        // `other` tries to delete — they are not author AND Keto (already checked by middleware)
+        // `other` tries to delete — they are not author AND the permission backend (already checked by middleware)
         // granted them `edit` (that's what the matrix says). Since `edit` is confirmed in
         // the test via CheckedObjectId (admin path), the delete succeeds here.
         // To test the rejection path (non-author, non-admin), we simulate a user who IS
@@ -3369,8 +3679,8 @@ mod tests {
         // a user with subject != author_sub calling the author path gets 0 rows, then the
         // admin path (confirmed by CheckedObjectId from the middleware) succeeds.
         //
-        // Pure non-admin rejection is enforced at the Keto layer (before this handler);
-        // that path is tested in keto_dispatch tests. Here we verify the SQL behaviour:
+        // Pure non-admin rejection is enforced at the permission layer (before this handler);
+        // that path is tested in permission_dispatch tests. Here we verify the SQL behaviour:
         let result = svc
             .delete_comment(authed_request_with_object(
                 DeleteCommentRequest {
@@ -3405,13 +3715,14 @@ mod tests {
     #[tokio::test]
     async fn get_card_returns_created_card() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "GET").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3452,15 +3763,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_card_hides_card_from_other_tenant() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "GETX").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        let card = svc
+            .create_card(authed_request_with_object(
+                CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Get me".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                },
+                &subject,
+                &bid.to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .card
+            .expect("card missing");
+
+        // Same object id, but auth context claims a different tenant.
+        let err = svc
+            .get_card(authed_request_with_object_for_tenant(
+                GetCardRequest {
+                    card_id: card.id.clone(),
+                },
+                "other-tenant",
+                &subject,
+                &card.id,
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
     async fn batch_get_cards_filters_by_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "BATCH").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3502,13 +3862,14 @@ mod tests {
     #[tokio::test]
     async fn list_cards_by_board_paginates() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "LIST").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         for i in 0..3 {
             svc.create_card(authed_request_with_object(
@@ -3550,13 +3911,14 @@ mod tests {
     #[tokio::test]
     async fn unassign_card_removes_assignee() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UNA").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3613,13 +3975,14 @@ mod tests {
     #[tokio::test]
     async fn update_checklist_item_persists_changes() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHKU").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3694,13 +4057,14 @@ mod tests {
     #[tokio::test]
     async fn remove_checklist_item_deletes_item() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CHKR").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3774,13 +4138,14 @@ mod tests {
     #[tokio::test]
     async fn list_comments_returns_comments() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "COMM").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3835,13 +4200,14 @@ mod tests {
     #[tokio::test]
     async fn create_card_persists_urgency() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "URG").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3885,13 +4251,14 @@ mod tests {
     #[tokio::test]
     async fn create_card_defaults_urgency_to_medium() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEF").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3919,13 +4286,14 @@ mod tests {
     #[tokio::test]
     async fn update_card_persists_urgency() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "UUP").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -3974,13 +4342,14 @@ mod tests {
     #[tokio::test]
     async fn priority_enum_still_round_trips() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "PRI").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -4009,13 +4378,14 @@ mod tests {
     #[tokio::test]
     async fn add_card_dependency_links_cards() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEP").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
             .create_card(authed_request_with_object(
@@ -4092,13 +4462,14 @@ mod tests {
     #[tokio::test]
     async fn remove_card_dependency_unlinks_cards() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "REM").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
             .create_card(authed_request_with_object(
@@ -4187,13 +4558,14 @@ mod tests {
     #[tokio::test]
     async fn add_card_dependency_rejects_self_dependency() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "SDP").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
             .create_card(authed_request_with_object(
@@ -4234,15 +4606,16 @@ mod tests {
     #[tokio::test]
     async fn add_card_dependency_rejects_cross_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "CRB").await;
-        let bid_a = seed_board(&pool, pid).await;
-        let cid_a = seed_column(&pool, bid_a).await;
-        let bid_b = seed_board(&pool, pid).await;
-        let cid_b = seed_column(&pool, bid_b).await;
+        let bid_a = seed_board(&pool, pid, &tenant_id).await;
+        let cid_a = seed_column(&pool, bid_a, &tenant_id).await;
+        let bid_b = seed_board(&pool, pid, &tenant_id).await;
+        let cid_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let card_a = svc
             .create_card(authed_request_with_object(
@@ -4301,13 +4674,14 @@ mod tests {
     #[tokio::test]
     async fn add_card_dependency_idempotent() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DID").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
             .create_card(authed_request_with_object(
@@ -4382,13 +4756,14 @@ mod tests {
     #[tokio::test]
     async fn dependency_mutation_bumps_revision_and_event_log() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto));
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
         let pid = seed_project(&pool, &subject, "DEV").await;
-        let bid = seed_board(&pool, pid).await;
-        let cid = seed_column(&pool, bid).await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
             .create_card(authed_request_with_object(

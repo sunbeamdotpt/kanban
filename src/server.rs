@@ -3,8 +3,8 @@
 //!
 //! This is where the whole process comes together: load configuration from the
 //! environment, set up OpenTelemetry tracing, connect to Postgres and run
-//! migrations, bootstrap the NATS JetStream board-events stream, warm up the
-//! Keto readiness tuple, register Prometheus metrics, build the axum router,
+//! migrations, bootstrap the NATS JetStream board-events stream, check
+//! sso-gateway readiness, register Prometheus metrics, build the axum router,
 //! and finally start listening on `KANBAN_PORT` until the process receives a
 //! shutdown signal.
 
@@ -23,13 +23,16 @@ use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use sunbeam_g2v::config::HydraConfig;
 use sunbeam_g2v::config::NatsConfig;
-use sunbeam_g2v::middleware::auth::introspection::{IntrospectionClient, IntrospectionLayer};
-use sunbeam_g2v::middleware::auth::keto::{KetoClient, KetoConfig};
+use sunbeam_g2v::middleware::auth::{
+    AuthMiddlewareState, auth_middleware, introspection::IntrospectionConfig,
+};
 use sunbeam_g2v::mq::NatsClient;
 
-use crate::auth::keto_dispatch::{DispatchState, dispatch};
+use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
+use crate::auth::session_client::SsoGatewaySessionClient;
+
+use crate::auth::permission_dispatch::{DispatchState, dispatch};
 use crate::id::Id;
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
@@ -59,13 +62,13 @@ use crate::services::{
 #[derive(Clone)]
 pub struct KanbanMetrics {
     pub registry: Arc<Registry>,
-    /// Counter for Keto permission checks, labeled `result` (allow, deny, or error).
-    pub keto_check_total: CounterVec,
+    /// Counter for permission checks, labeled `result` (allow, deny, or error).
+    pub permission_check_total: CounterVec,
     /// Number of active board subscription streams.
     pub subscribe_active_streams: prometheus::Gauge,
     /// JetStream consumer lag in seconds, labeled by board.
     pub jet_stream_lag_seconds: GaugeVec,
-    /// Fraction of `project_member_view` rows that differ from Keto.
+    /// Fraction of `project_member_view` rows that differ from the permission backend.
     pub mirror_drift_ratio: prometheus::Gauge,
     /// Histogram of gRPC handler durations, labeled by service and method.
     pub rpc_duration_seconds: HistogramVec,
@@ -83,11 +86,11 @@ impl KanbanMetrics {
     pub fn with_buckets(buckets: Vec<f64>) -> Result<Self> {
         let registry = Arc::new(Registry::new());
 
-        let keto_check_total = CounterVec::new(
-            Opts::new("kanban_keto_check_total", "Keto permission check results"),
+        let permission_check_total = CounterVec::new(
+            Opts::new("kanban_permission_check_total", "Permission check results"),
             &["result"],
         )?;
-        registry.register(Box::new(keto_check_total.clone()))?;
+        registry.register(Box::new(permission_check_total.clone()))?;
 
         let subscribe_active_streams = prometheus::Gauge::with_opts(Opts::new(
             "kanban_subscribe_active_streams",
@@ -106,7 +109,7 @@ impl KanbanMetrics {
 
         let mirror_drift_ratio = prometheus::Gauge::with_opts(Opts::new(
             "kanban_mirror_drift_ratio",
-            "Fraction of project_member_view rows that differ from Keto (Stage 7a)",
+            "Fraction of project_member_view rows that differ from the permission backend (Stage 7a)",
         ))?;
         registry.register(Box::new(mirror_drift_ratio.clone()))?;
 
@@ -131,7 +134,7 @@ impl KanbanMetrics {
 
         Ok(Self {
             registry,
-            keto_check_total,
+            permission_check_total,
             subscribe_active_streams,
             jet_stream_lag_seconds,
             mirror_drift_ratio,
@@ -145,7 +148,7 @@ impl KanbanMetrics {
 
 #[derive(Clone)]
 struct AppState {
-    keto: Arc<KetoClient>,
+    sso_gateway_url: String,
     metrics: Arc<KanbanMetrics>,
 }
 
@@ -155,26 +158,18 @@ async fn healthz_live() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Ready probe. Returns 200 once Keto confirms the synthetic `_kanban_health`
-/// tuple is present; otherwise returns 503.
+/// Ready probe. Returns 200 when the sso-gateway ready endpoint responds
+/// successfully; otherwise returns 503.
 async fn healthz_ready(State(state): State<AppState>) -> impl IntoResponse {
-    match state
-        .keto
-        .check_permission(
-            "_kanban_health",
-            "probe",
-            "health",
-            &crate::auth::keto_retry::keto_subject_id("user:_kanban_startup_probe"),
-        )
-        .await
-    {
-        Ok(true) => StatusCode::OK,
-        Ok(false) => {
-            tracing::warn!("readiness probe: Keto health tuple missing");
+    let url = format!("{}/health/ready", state.sso_gateway_url);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => StatusCode::OK,
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "readiness probe: sso-gateway not ready");
             StatusCode::SERVICE_UNAVAILABLE
         }
         Err(e) => {
-            tracing::error!(error = %e, "readiness probe: Keto check failed");
+            tracing::error!(error = %e, "readiness probe: sso-gateway ready check failed");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
@@ -244,6 +239,11 @@ pub struct Cli {
     #[arg(long, env = "HYDRA_CLIENT_SECRET", default_value = "")]
     hydra_client_secret: String,
 
+    /// System tenant id used for globally-shared resources (e.g. system-wide
+    /// board/card templates). Must be a valid tenant id in the sso-gateway.
+    #[arg(long, env = "KANBAN_SYSTEM_TENANT_ID", default_value = "system")]
+    system_tenant_id: String,
+
     /// NATS server URL.
     #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
     nats_url: String,
@@ -251,14 +251,6 @@ pub struct Cli {
     /// Optional NATS authentication token (supports NATS auth callout).
     #[arg(long, env = "NATS_AUTH_TOKEN")]
     nats_auth_token: Option<String>,
-
-    /// Keto read API endpoint.
-    #[arg(long, env = "KETO_READ_ADDR", default_value = "http://localhost:4466")]
-    keto_read_addr: String,
-
-    /// Keto write API endpoint.
-    #[arg(long, env = "KETO_WRITE_ADDR", default_value = "http://localhost:4467")]
-    keto_write_addr: String,
 
     /// OpenSearch base URL.
     #[arg(long, env = "OPENSEARCH_URL", default_value = "http://localhost:9200")]
@@ -365,9 +357,13 @@ pub struct Cli {
     #[arg(long, env = "KANBAN_HEARTBEAT_INTERVAL_MS", default_value = "15000")]
     heartbeat_interval_ms: u64,
 
-    /// Keto permission recheck interval for live streams in milliseconds.
-    #[arg(long, env = "KANBAN_KETO_RECHECK_INTERVAL_MS", default_value = "30000")]
-    keto_recheck_interval_ms: u64,
+    /// Permission recheck interval for live streams in milliseconds.
+    #[arg(
+        long,
+        env = "KANBAN_PERMISSION_RECHECK_INTERVAL_MS",
+        default_value = "30000"
+    )]
+    permission_recheck_interval_ms: u64,
 
     /// Cutover tracker deduplication capacity.
     #[arg(long, env = "KANBAN_CUTOVER_SEEN_CAPACITY", default_value = "1024")]
@@ -405,20 +401,28 @@ impl Cli {
                 anyhow::anyhow!("KANBAN_STREAM_STORAGE must be one of: file, memory: {e}")
             })?;
 
+        let sso_gateway_url = self
+            .hydra_introspection_url
+            .strip_suffix("/oauth2/introspect")
+            .map(String::from)
+            .unwrap_or_else(|| self.hydra_introspection_url.clone());
+
         Ok(AppConfig {
             addr,
             host: self.host,
             hydra_introspection_url: self.hydra_introspection_url,
             hydra_client_id: self.hydra_client_id,
             hydra_client_secret: self.hydra_client_secret,
+            system_tenant_id: self.system_tenant_id,
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
             database_acquire_timeout_secs: self.database_acquire_timeout_secs,
             nats_url: self.nats_url,
             nats_auth_token: self.nats_auth_token,
             nats_lease_duration_secs: self.nats_lease_duration_secs,
-            keto_read_addr: self.keto_read_addr,
-            keto_write_addr: self.keto_write_addr,
+            sso_gateway_url: sso_gateway_url.clone(),
+            sso_gateway_permission_url: sso_gateway_url.clone(),
+            sso_gateway_token_url: format!("{sso_gateway_url}/oauth2/token"),
             opensearch_url: self.opensearch_url,
             opensearch_index_name: self.opensearch_index_name,
             s3_endpoint: self.s3_endpoint,
@@ -438,7 +442,7 @@ impl Cli {
             registry_broadcast_capacity: self.registry_broadcast_capacity,
             registry_inactive_threshold_secs: self.registry_inactive_threshold_secs,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
-            keto_recheck_interval_ms: self.keto_recheck_interval_ms,
+            permission_recheck_interval_ms: self.permission_recheck_interval_ms,
             cutover_seen_capacity: self.cutover_seen_capacity,
             upload_expires_secs: self.upload_expires_secs,
             download_expires_secs: self.download_expires_secs,
@@ -453,14 +457,16 @@ pub struct AppConfig {
     pub hydra_introspection_url: String,
     pub hydra_client_id: String,
     pub hydra_client_secret: String,
+    pub system_tenant_id: String,
     pub database_url: String,
     pub database_max_connections: u32,
     pub database_acquire_timeout_secs: u64,
     pub nats_url: String,
     pub nats_auth_token: Option<String>,
     pub nats_lease_duration_secs: u64,
-    pub keto_read_addr: String,
-    pub keto_write_addr: String,
+    pub sso_gateway_url: String,
+    pub sso_gateway_permission_url: String,
+    pub sso_gateway_token_url: String,
     pub opensearch_url: String,
     pub opensearch_index_name: String,
     pub s3_endpoint: Option<String>,
@@ -480,7 +486,7 @@ pub struct AppConfig {
     pub registry_broadcast_capacity: usize,
     pub registry_inactive_threshold_secs: u64,
     pub heartbeat_interval_ms: u64,
-    pub keto_recheck_interval_ms: u64,
+    pub permission_recheck_interval_ms: u64,
     pub cutover_seen_capacity: usize,
     pub upload_expires_secs: u64,
     pub download_expires_secs: u64,
@@ -527,18 +533,35 @@ pub async fn run_with_config(
 
     info!("Postgres connected and migrations applied");
 
-    // ── 3b. System migrations (data fixes across Postgres, Keto, OpenSearch) ─
+    // ── 3b. System migrations (data fixes across Postgres, the permission backend, OpenSearch) ─
     let opensearch_client_for_migrations = Arc::new(OpenSearchClient::new(OpenSearchConfig {
         url: config.opensearch_url.clone(),
     }));
-    let keto_for_migrations = Arc::new(KetoClient::new(KetoConfig {
-        grpc_endpoint: config.keto_read_addr.clone(),
-        write_grpc_endpoint: config.keto_write_addr.clone(),
-    }));
+    let permission_config = PermissionClientConfig {
+        base_url: config.sso_gateway_permission_url.clone(),
+        token_url: config.sso_gateway_token_url.clone(),
+        client_id: config.hydra_client_id.clone(),
+        client_secret: config.hydra_client_secret.clone(),
+    };
+    let permission_for_migrations = Arc::new(
+        PermissionClient::new(&permission_config)
+            .context("failed to build permission client for migrations")?,
+    );
+
+    // Register the Kanban permission namespace and authorization model with
+    // the sso-gateway. Idempotent: an identical model is a no-op, a changed
+    // model publishes a new version into the existing store without touching
+    // tuples. Fatal on failure — without the namespace no check can succeed.
+    permission_for_migrations
+        .ensure_kanban_namespace()
+        .await
+        .context("fatal: failed to ensure Kanban permission namespace")?;
+    info!("Kanban permission namespace ensured");
+
     crate::system_migrations::MigrationRunner::new(crate::system_migrations::all_migrations())
         .run_all(&crate::system_migrations::MigrationContext::new(
             pg_pool.clone(),
-            keto_for_migrations,
+            permission_for_migrations,
             opensearch_client_for_migrations,
             config.opensearch_index_name.clone(),
         ))
@@ -608,15 +631,12 @@ pub async fn run_with_config(
 
     info!("BoardSubscriberRegistry constructed");
 
-    // ── 5. Keto client + synthetic readiness tuple ──────────────────────────
-    let keto = Arc::new(KetoClient::new(KetoConfig {
-        grpc_endpoint: config.keto_read_addr,
-        write_grpc_endpoint: config.keto_write_addr,
-    }));
+    // ── 5. Permission client for service handlers ───────────────────────────
+    let permission = Arc::new(
+        PermissionClient::new(&permission_config).context("failed to build permission client")?,
+    );
 
-    ensure_keto_health_tuple(&keto).await?;
-
-    info!("Keto client initialised and health tuple present");
+    info!("Permission client initialised");
 
     // ── 7. Prometheus metrics ───────────────────────────────────────────────
     let metrics = Arc::new(
@@ -658,45 +678,47 @@ pub async fn run_with_config(
     }))
     .add_service(BoardServiceServer::new(BoardServiceImpl {
         pool: pg_pool.clone(),
-        keto: Arc::clone(&keto),
+        permission: Arc::clone(&permission),
         registry: Arc::clone(&board_registry),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-        keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
+        permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
         cutover_seen_capacity: config.cutover_seen_capacity,
     }))
     .add_service(CardServiceServer::new(CardServiceImpl {
         pool: pg_pool.clone(),
-        keto: Arc::clone(&keto),
+        permission: Arc::clone(&permission),
     }))
     .add_service(GithubLinkServiceServer::new(GitHubServiceImpl))
     .add_service(AggregatedBoardServiceServer::new(
         AggregatedBoardServiceImpl {
             pool: pg_pool.clone(),
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             registry: Arc::clone(&board_registry),
             heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-            keto_recheck_interval: Duration::from_millis(config.keto_recheck_interval_ms),
+            permission_recheck_interval: Duration::from_millis(
+                config.permission_recheck_interval_ms,
+            ),
             cutover_seen_capacity: config.cutover_seen_capacity,
         },
     ))
     .add_service(ProjectServiceServer::new(ProjectServiceImpl {
         pool: pg_pool.clone(),
-        keto: Arc::clone(&keto),
+        permission: Arc::clone(&permission),
         registry: Arc::clone(&board_registry),
     }))
     .add_service(SearchServiceServer::new(SearchServiceImpl {
         pool: pg_pool.clone(),
-        keto: Arc::clone(&keto),
+        permission: Arc::clone(&permission),
         opensearch: Arc::clone(&opensearch_client),
         index_name: Some(config.opensearch_index_name.clone()),
     }))
     .add_service(TemplatesServiceServer::new(TemplatesServiceImpl {
         pool: pg_pool.clone(),
-        keto: Arc::clone(&keto),
+        permission: Arc::clone(&permission),
     }))
     .into_axum_router();
 
-    // Public, unauthenticated RPCs (no introspection / Keto middleware).
+    // Public, unauthenticated RPCs (no introspection / permission middleware).
     // We route each method directly to the tonic service so the resulting
     // axum Router has no fallback; this lets us merge it with the main gRPC
     // router (which does have a fallback) without a runtime panic.
@@ -719,22 +741,25 @@ pub async fn run_with_config(
     //   Layer order in axum is last-applied = outermost:
     //     .layer(A).layer(B).layer(C)  →  A wraps B wraps C wraps handler
     //
-    //   We want: tracing → prometheus → IntrospectionLayer → keto_dispatch → routing
-    //   So apply in reverse: keto_dispatch first, then IntrospectionLayer, then
+    //   We want: tracing → prometheus → IntrospectionLayer → permission_dispatch → routing
+    //   So apply in reverse: permission_dispatch first, then IntrospectionLayer, then
     //   prometheus placeholder, then tracing.
 
     let dispatch_state = Arc::new(DispatchState {
-        keto: Arc::clone(&keto),
+        permission_base_url: config.sso_gateway_url.clone(),
     });
 
-    let introspection = IntrospectionLayer::new(IntrospectionClient::new(HydraConfig {
-        introspection_url: config.hydra_introspection_url,
-        client_id: config.hydra_client_id,
-        client_secret: config.hydra_client_secret,
-    }));
+    let auth_state = AuthMiddlewareState::new(Arc::new(
+        SsoGatewaySessionClient::new(IntrospectionConfig {
+            url: config.hydra_introspection_url,
+            client_id: config.hydra_client_id,
+            client_secret: config.hydra_client_secret,
+        })
+        .context("failed to build sso-gateway session client")?,
+    ));
 
     let app_state = AppState {
-        keto: Arc::clone(&keto),
+        sso_gateway_url: config.sso_gateway_url,
         metrics: Arc::clone(&metrics),
     };
 
@@ -749,10 +774,10 @@ pub async fn run_with_config(
     // on their own unauthenticated router, and public RPCs are merged after the
     // auth layers so they remain unauthenticated.
     let grpc_auth = grpc_axum
-        // keto_dispatch (innermost applied = innermost executed)
+        // permission_dispatch (innermost applied = innermost executed)
         .layer(middleware::from_fn_with_state(dispatch_state, dispatch))
-        // IntrospectionLayer — validates Bearer with Hydra, inserts Extension<AuthContext>
-        .layer(introspection)
+        // auth_middleware — validates Bearer with the sso-gateway, inserts Extension<AuthContext>
+        .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
         // Tracing / OTel propagation (outermost)
         .layer(TraceLayer::new_for_http());
 
@@ -815,30 +840,6 @@ fn init_otel_tracing() -> Result<()> {
     Ok(())
 }
 
-// ── Keto health tuple ────────────────────────────────────────────────────────
-
-/// Make sure the synthetic `_kanban_health` readiness tuple exists in Keto.
-///
-/// Reads first and writes only if the tuple is missing. A write failure is
-/// treated as fatal and stops startup.
-async fn ensure_keto_health_tuple(keto: &KetoClient) -> Result<()> {
-    let probe_subject = crate::auth::keto_retry::keto_subject_id("user:_kanban_startup_probe");
-
-    let present = keto
-        .check_permission("_kanban_health", "probe", "health", &probe_subject)
-        .await
-        .context("Keto health-tuple check failed at boot")?;
-
-    if !present {
-        tracing::info!("_kanban_health tuple absent — writing once");
-        keto.grant("_kanban_health", "probe", "health", &probe_subject)
-            .await
-            .context("fatal: failed to write Keto _kanban_health readiness tuple")?;
-    }
-
-    Ok(())
-}
-
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 
 async fn shutdown_signal() {
@@ -860,17 +861,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_ready_returns_ok_when_tuple_present() {
+    async fn healthz_ready_returns_ok_when_sso_gateway_ready() {
         let infra = containers::setup().await;
-
-        // Ensure the synthetic health tuple exists.
-        ensure_keto_health_tuple(&infra.keto)
-            .await
-            .expect("health tuple should be writable");
 
         let metrics = Arc::new(KanbanMetrics::new().unwrap());
         let state = AppState {
-            keto: Arc::clone(&infra.keto),
+            sso_gateway_url: infra.sso_gateway_url.clone(),
             metrics,
         };
 
@@ -884,17 +880,20 @@ mod tests {
         let metrics = Arc::new(KanbanMetrics::new().unwrap());
         // Increment the counter so the metric family is emitted by the text
         // encoder regardless of test ordering.
-        metrics.keto_check_total.with_label_values(&["allow"]).inc();
+        metrics
+            .permission_check_total
+            .with_label_values(&["allow"])
+            .inc();
         let state = AppState {
-            keto: Arc::clone(&infra.keto),
+            sso_gateway_url: infra.sso_gateway_url.clone(),
             metrics,
         };
 
         let (status, body) = metrics_handler(State(state)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            body.contains("kanban_keto_check_total"),
-            "metrics body should contain kanban_keto_check_total: {body}"
+            body.contains("kanban_permission_check_total"),
+            "metrics body should contain kanban_permission_check_total: {body}"
         );
     }
 
@@ -931,7 +930,6 @@ mod tests {
             "DATABASE_URL",
             "HYDRA_",
             "NATS_",
-            "KETO_",
             "OPENSEARCH_URL",
             "KANBAN_",
             "S3_",
@@ -944,6 +942,7 @@ mod tests {
             .collect();
 
         for (k, _) in &snapshot {
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
             unsafe { std::env::remove_var(k) };
         }
 
@@ -951,6 +950,7 @@ mod tests {
 
         for (k, v) in snapshot {
             if let Some(val) = v {
+                // SAFETY: test-only env manipulation serialized through ENV_LOCK.
                 unsafe { std::env::set_var(k, val) };
             }
         }
@@ -972,8 +972,6 @@ mod tests {
             "--nats-url=nats://nats",
             "--nats-auth-token=callout-token",
             "--nats-lease-duration-secs=60",
-            "--keto-read-addr=http://keto-read",
-            "--keto-write-addr=http://keto-write",
             "--opensearch-url=http://opensearch",
             "--opensearch-index-name=custom-index",
             "--s3-endpoint=http://s3",
@@ -993,7 +991,7 @@ mod tests {
             "--registry-broadcast-capacity=512",
             "--registry-inactive-threshold-secs=60",
             "--heartbeat-interval-ms=7000",
-            "--keto-recheck-interval-ms=15000",
+            "--permission-recheck-interval-ms=15000",
             "--cutover-seen-capacity=2048",
             "--upload-expires-secs=600",
             "--download-expires-secs=120",
@@ -1014,8 +1012,7 @@ mod tests {
         assert_eq!(cfg.nats_url, "nats://nats");
         assert_eq!(cfg.nats_auth_token, Some("callout-token".into()));
         assert_eq!(cfg.nats_lease_duration_secs, 60);
-        assert_eq!(cfg.keto_read_addr, "http://keto-read");
-        assert_eq!(cfg.keto_write_addr, "http://keto-write");
+        assert_eq!(cfg.sso_gateway_url, "http://hydra:4445");
         assert_eq!(cfg.opensearch_url, "http://opensearch");
         assert_eq!(cfg.opensearch_index_name, "custom-index");
         assert_eq!(cfg.s3_endpoint, Some("http://s3".into()));
@@ -1035,7 +1032,7 @@ mod tests {
         assert_eq!(cfg.registry_broadcast_capacity, 512);
         assert_eq!(cfg.registry_inactive_threshold_secs, 60);
         assert_eq!(cfg.heartbeat_interval_ms, 7000);
-        assert_eq!(cfg.keto_recheck_interval_ms, 15000);
+        assert_eq!(cfg.permission_recheck_interval_ms, 15000);
         assert_eq!(cfg.cutover_seen_capacity, 2048);
         assert_eq!(cfg.upload_expires_secs, 600);
         assert_eq!(cfg.download_expires_secs, 120);
@@ -1059,8 +1056,7 @@ mod tests {
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
         assert!(cfg.nats_auth_token.is_none());
         assert_eq!(cfg.nats_lease_duration_secs, 30);
-        assert_eq!(cfg.keto_read_addr, "http://localhost:4466");
-        assert_eq!(cfg.keto_write_addr, "http://localhost:4467");
+        assert_eq!(cfg.sso_gateway_url, "http://localhost:4445");
         assert_eq!(cfg.opensearch_url, "http://localhost:9200");
         assert_eq!(cfg.opensearch_index_name, "sunbeam-kanban-cards-v1");
         assert!(cfg.s3_endpoint.is_none());
@@ -1081,7 +1077,7 @@ mod tests {
         assert_eq!(cfg.registry_broadcast_capacity, 256);
         assert_eq!(cfg.registry_inactive_threshold_secs, 30);
         assert_eq!(cfg.heartbeat_interval_ms, 15_000);
-        assert_eq!(cfg.keto_recheck_interval_ms, 30_000);
+        assert_eq!(cfg.permission_recheck_interval_ms, 30_000);
         assert_eq!(cfg.cutover_seen_capacity, 1024);
         assert_eq!(cfg.upload_expires_secs, 900);
         assert_eq!(cfg.download_expires_secs, 300);
@@ -1148,16 +1144,24 @@ mod tests {
             addr: "127.0.0.1:0".parse().unwrap(),
             host: "127.0.0.1".into(),
             hydra_introspection_url: "http://localhost:4445/oauth2/introspect".into(),
-            hydra_client_id: String::new(),
-            hydra_client_secret: String::new(),
+            // Boot provisions the permission namespace fail-fast, so the test
+            // needs the harness-provisioned service credentials.
+            hydra_client_id: std::env::var("HYDRA_CLIENT_ID").unwrap_or_default(),
+            hydra_client_secret: std::env::var("HYDRA_CLIENT_SECRET").unwrap_or_default(),
+            system_tenant_id: std::env::var("KANBAN_SYSTEM_TENANT_ID")
+                .unwrap_or_else(|_| "system".into()),
             database_url: isolated_url.to_string(),
             database_max_connections: 20,
             database_acquire_timeout_secs: 10,
             nats_url: std::env::var("NATS_URL").expect("NATS_URL"),
             nats_auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
             nats_lease_duration_secs: 30,
-            keto_read_addr: std::env::var("KETO_READ_ADDR").expect("KETO_READ_ADDR"),
-            keto_write_addr: std::env::var("KETO_WRITE_ADDR").expect("KETO_WRITE_ADDR"),
+            sso_gateway_url: std::env::var("SSO_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
+            sso_gateway_permission_url: std::env::var("SSO_GATEWAY_PERMISSION_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
+            sso_gateway_token_url: std::env::var("SSO_GATEWAY_TOKEN_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/oauth2/token".into()),
             opensearch_url: std::env::var("OPENSEARCH_URL")
                 .unwrap_or_else(|_| "http://localhost:9200".into()),
             opensearch_index_name: "sunbeam-kanban-cards-v1".into(),
@@ -1180,7 +1184,7 @@ mod tests {
             registry_broadcast_capacity: 256,
             registry_inactive_threshold_secs: 30,
             heartbeat_interval_ms: 15_000,
-            keto_recheck_interval_ms: 30_000,
+            permission_recheck_interval_ms: 30_000,
             cutover_seen_capacity: 1024,
             upload_expires_secs: 900,
             download_expires_secs: 300,

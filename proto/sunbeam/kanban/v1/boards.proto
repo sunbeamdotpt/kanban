@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/boards.proto
 //
-// Auth: every RPC in BoardService requires a valid bearer token. Keto checks
-// are performed by the kanban-local `keto_dispatch` middleware defined in
-// `apps/kanban/src/auth/keto_dispatch.rs`. The per-RPC Keto object is sourced
+// Auth: every RPC in BoardService requires a valid bearer token. Permission checks
+// are performed by the kanban-local `permission_dispatch` middleware defined in
+// `apps/kanban/src/auth/permission_dispatch.rs`. The per-RPC permission object is sourced
 // from the `x-sunbeam-object-id` request header for body-bearing RPCs and from
 // the `board_id` query param for streaming RPCs; see the dispatch matrix for
 // the authoritative mapping.
@@ -189,9 +189,9 @@ message SubscribeBoardResponse {
 
 // BoardService manages Kanban boards, columns, and board-level streaming.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are performed
-// by `keto_dispatch` middleware. Object-id sources are documented in the
-// dispatch matrix at `apps/kanban/src/auth/keto_dispatch.rs`.
+// Auth: every RPC requires a valid bearer token. Permission checks are performed
+// by `permission_dispatch` middleware. Object-id sources are documented in the
+// dispatch matrix at `apps/kanban/src/auth/permission_dispatch.rs`.
 service BoardService {
   // ListBoards returns boards in the given project the caller can view.
   rpc ListBoards(ListBoardsRequest) returns (ListBoardsResponse);
@@ -206,7 +206,7 @@ service BoardService {
   // UpdateBoard requires "edit" on the board (KanbanBoard namespace).
   rpc UpdateBoard(UpdateBoardRequest) returns (UpdateBoardResponse);
 
-  // DeleteBoard requires "administer" on the board.
+  // DeleteBoard requires "manage" on the board.
   rpc DeleteBoard(DeleteBoardRequest) returns (DeleteBoardResponse);
 
   // AddColumn requires "edit" on the board.
@@ -215,14 +215,14 @@ service BoardService {
   // UpdateColumn requires "edit" on the board.
   rpc UpdateColumn(UpdateColumnRequest) returns (UpdateColumnResponse);
 
-  // RemoveColumn requires "administer" on the board.
+  // RemoveColumn requires "edit" on the board.
   rpc RemoveColumn(RemoveColumnRequest) returns (RemoveColumnResponse);
 
   // MoveColumn reorders a column within its board. Requires "edit".
   rpc MoveColumn(MoveColumnRequest) returns (MoveColumnResponse);
 
   // SubscribeBoard streams board events over a server-streaming ConnectRPC
-  // call. JWT checked per-yield; Keto rechecked every 30s or on Heartbeat
+  // call. JWT checked per-yield; permissions rechecked every 30s or on Heartbeat
   // (whichever sooner). Per the MF-6 resume protocol, since_seq=0 means
   // live-tail; non-zero triggers JetStream replay from that sequence.
   rpc SubscribeBoard(SubscribeBoardRequest) returns (stream SubscribeBoardResponse);

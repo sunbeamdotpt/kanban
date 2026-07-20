@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // proto/sunbeam/kanban/v1/projects.proto
 //
-// Auth: every RPC in ProjectService requires a valid bearer token. Keto checks
+// Auth: every RPC in ProjectService requires a valid bearer token. Permission checks
 // are performed by the kanban-local
-// `keto_dispatch` middleware defined in
-// `apps/kanban/src/auth/keto_dispatch.rs`. The per-RPC Keto object is sourced
+// `permission_dispatch` middleware defined in
+// `apps/kanban/src/auth/permission_dispatch.rs`. The per-RPC permission object is sourced
 // from the `x-sunbeam-object-id` request header for body-bearing RPCs and from
 // the `project_id` path/query param for streaming RPCs; see the dispatch matrix
-// in `keto_dispatch.rs` for the authoritative mapping.
+// in `permission_dispatch.rs` for the authoritative mapping.
 
 syntax = "proto3";
 
@@ -48,7 +48,7 @@ message ProjectMember {
   string project_id = 1;
   // Hydra/Kratos subject string (e.g. "user:abc123").
   string subject = 2;
-  // Keto relation name: "owner" | "administer" | "edit" | "view" | "blocked".
+  // Permission role: "owner" | "admin" | "editor" | "viewer".
   string relation = 3;
   string display_name = 4;
   string email = 5;
@@ -82,8 +82,8 @@ message GetProjectResponse {
 }
 
 // ListProjectsRequest has no fields: the server derives the subject from the
-// JWT and calls keto_expand_objects(KanbanProject, view, subject) to return
-// only projects the caller can see. One Keto round-trip, not N.
+// JWT and calls permission_expand_objects(KanbanProject, view, subject) to return
+// only projects the caller can see. One permission-backend round-trip, not N.
 message ListProjectsRequest {}
 
 message ListProjectsResponse {
@@ -115,12 +115,13 @@ message ListMembersResponse {
   repeated ProjectMember members = 1;
 }
 
-// AddMemberRequest — caller must hold "administer" on the project (enforced by
-// keto_dispatch). Writes a Keto tuple KanbanProject:{project_id}#{relation}@User:{subject}.
+// AddMemberRequest — caller must hold "manage" on the project (enforced by
+// the auth dispatch middleware). Writes a permission tuple
+// KanbanProject:{project_id}#{relation}@{subject}.
 message AddMemberRequest {
   string project_id = 1;
   string subject = 2;
-  // Keto relation to grant: "administer" | "edit" | "view".
+  // Role to grant: "admin" | "editor" | "viewer".
   string relation = 3;
 }
 
@@ -152,36 +153,36 @@ message SubscribeProjectResponse {
 
 // ProjectService manages Kanban projects and their membership.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are
-// performed by `keto_dispatch` middleware. The object-id source for each
+// Auth: every RPC requires a valid bearer token. Permission checks are
+// performed by `permission_dispatch` middleware. The object-id source for each
 // RPC is documented in the dispatch matrix at
-// `apps/kanban/src/auth/keto_dispatch.rs`.
+// `apps/kanban/src/auth/permission_dispatch.rs`.
 service ProjectService {
   // ListProjects returns only projects the caller can view, using
-  // keto_expand_objects(KanbanProject, view, subject) — one Keto round-trip.
+  // permission_expand_objects(KanbanProject, view, subject) — one permission-backend round-trip.
   rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
 
   rpc GetProject(GetProjectRequest) returns (GetProjectResponse);
 
-  // CreateProject requires no prior Keto object (the caller becomes owner).
+  // CreateProject requires no prior permission object (the caller becomes owner).
   rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
 
-  // UpdateProject requires "administer" on the project.
+  // UpdateProject requires "edit" on the project.
   rpc UpdateProject(UpdateProjectRequest) returns (UpdateProjectResponse);
 
-  // DeleteProject requires "owner" relation on the project.
+  // DeleteProject requires "manage" on the project.
   rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
 
   rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
 
-  // AddMember requires "administer" relation. Writes Keto tuple atomically
-  // with the project_member_view mirror row.
+  // AddMember requires "manage" on the project. Writes the permission tuple
+  // atomically with the project_members mirror row.
   rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 
-  // RemoveMember requires "administer" relation. Removes Keto tuple.
+  // RemoveMember requires "manage" on the project. Removes the permission tuple.
   rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 
   // SubscribeProject streams project-level events. Cadence: JWT checked
-  // per-yield; Keto rechecked every 30s or on Heartbeat (whichever sooner).
+  // per-yield; permissions rechecked every 30s or on Heartbeat (whichever sooner).
   rpc SubscribeProject(SubscribeProjectRequest) returns (stream SubscribeProjectResponse);
 }

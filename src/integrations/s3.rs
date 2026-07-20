@@ -576,6 +576,7 @@ mod tests {
             "S3_SECRET_KEY",
             "S3_BUCKET",
         ] {
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
             unsafe { std::env::remove_var(key) };
         }
 
@@ -595,10 +596,15 @@ mod tests {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("S3_ENDPOINT", "http://minio:9000") };
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("S3_REGION", "eu-west-1") };
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("S3_ACCESS_KEY", "access") };
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("S3_SECRET_KEY", "secret") };
+        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("S3_BUCKET", "bucket") };
 
         let cfg = S3Config::from_env();
@@ -615,6 +621,7 @@ mod tests {
             "S3_SECRET_KEY",
             "S3_BUCKET",
         ] {
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
             unsafe { std::env::remove_var(key) };
         }
     }

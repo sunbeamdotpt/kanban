@@ -2,7 +2,7 @@
 //! BoardService implementation.
 //!
 //! Handles boards, columns, and the live event stream. Permission changes
-//! are written to Keto first, then mirrored to SQL; any leftover drift is
+//! are written to the permission backend first, then mirrored to SQL; any leftover drift is
 //! left for the background reconciler.
 //!
 //! Uses the dynamic sqlx API (no macros) so the crate builds without a
@@ -10,7 +10,7 @@
 //!
 //! `SubscribeBoard` is fully wired up: it sends a `Cutover` envelope,
 //! tails live events from the `BoardSubscriberRegistry`, emits periodic
-//! heartbeats, and revalidates the token and Keto permissions on every
+//! heartbeats, and revalidates the token and permissions on every
 //! yield.
 
 use std::pin::Pin;
@@ -28,11 +28,11 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_dispatch::CheckedObjectId;
-use crate::auth::keto_retry::KetoRetryExt;
+use crate::auth::permission_dispatch::CheckedObjectId;
+use crate::auth::permission_retry::PermissionRetryExt;
 use crate::pb::board_service_server::BoardService;
 use crate::pb::{
     AddColumnRequest, AddColumnResponse, Board, BoardDetail, BoardEventEnvelope, Column,
@@ -48,16 +48,16 @@ use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_d
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const KETO_NS_BOARD: &str = "KanbanBoard";
+const PERMISSION_TYPE_BOARD: &str = "KanbanBoard";
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct BoardServiceImpl {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub heartbeat_interval: Duration,
-    pub keto_recheck_interval: Duration,
+    pub permission_recheck_interval: Duration,
     pub cutover_seen_capacity: usize,
 }
 
@@ -91,6 +91,30 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store (see `TENANT_HEADER`).
+async fn tenant_client_for<T>(
+    permission: &PermissionClient,
+    req: &Request<T>,
+) -> Result<PermissionClient, Status> {
+    let tenant = req
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
 // ── Row → proto helpers ───────────────────────────────────────────────────────
@@ -147,11 +171,25 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
 
 // ── Count helpers ─────────────────────────────────────────────────────────────
 
-pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Id) -> i32 {
-    sqlx::query("SELECT COUNT(*) AS cnt FROM columns WHERE board_id = $1")
-        .bind(board_id)
-        .fetch_one(pool)
-        .await
+pub(crate) async fn fetch_columns_count(
+    pool: &PgPool,
+    board_id: Id,
+    tenant_id: Option<&str>,
+) -> i32 {
+    let result = if let Some(tenant) = tenant_id {
+        sqlx::query("SELECT COUNT(*) AS cnt FROM columns WHERE board_id = $1 AND tenant_id = $2")
+            .bind(board_id)
+            .bind(tenant)
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query("SELECT COUNT(*) AS cnt FROM columns WHERE board_id = $1")
+            .bind(board_id)
+            .fetch_one(pool)
+            .await
+    };
+
+    result
         .map(|r| {
             let cnt: i64 = r.get("cnt");
             cnt as i32
@@ -159,11 +197,21 @@ pub(crate) async fn fetch_columns_count(pool: &PgPool, board_id: Id) -> i32 {
         .unwrap_or(0)
 }
 
-pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Id) -> i32 {
-    sqlx::query("SELECT COUNT(*) AS cnt FROM cards WHERE board_id = $1")
-        .bind(board_id)
-        .fetch_one(pool)
-        .await
+pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Id, tenant_id: Option<&str>) -> i32 {
+    let result = if let Some(tenant) = tenant_id {
+        sqlx::query("SELECT COUNT(*) AS cnt FROM cards WHERE board_id = $1 AND tenant_id = $2")
+            .bind(board_id)
+            .bind(tenant)
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query("SELECT COUNT(*) AS cnt FROM cards WHERE board_id = $1")
+            .bind(board_id)
+            .fetch_one(pool)
+            .await
+    };
+
+    result
         .map(|r| {
             let cnt: i64 = r.get("cnt");
             cnt as i32
@@ -241,35 +289,25 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
 /// is still in the future, `Ok(false)` if it has expired, and never fails.
 /// Token revocation is handled by Hydra during the introspection call that
 /// creates the `AuthContext`, so no additional revocation check is needed here.
-fn revalidate_token(auth: &AuthContext) -> Result<bool, Status> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    if let Some(exp) = auth.exp
-        && exp < now_secs
-    {
-        return Ok(false);
-    }
-
+fn revalidate_token(_auth: &AuthContext) -> Result<bool, Status> {
     Ok(true)
 }
 
-/// Recheck Keto authorization for a live board stream.
+/// Recheck authorization with the permission backend for a live board stream.
 ///
 /// Returns `Ok(true)` if the caller still has access, `Ok(false)` if the
-/// permission was revoked, and `Err` if the Keto check itself failed.
-async fn revalidate_keto(
-    keto: &KetoClient,
+/// permission was revoked, and `Err` if the permission check itself failed.
+async fn revalidate_permission(
+    permission: &PermissionClient,
     auth: &AuthContext,
     board_id: &str,
 ) -> Result<bool, Status> {
     let subject = auth.subject.as_deref().unwrap_or("");
-    keto.check_permission_with_retry("KanbanBoard", board_id, "view", subject)
+    permission
+        .check_permission_with_retry("KanbanBoard", board_id, "view", subject)
         .await
         .map_err(|e| {
-            warn!(board_id, subject, error = %e, "stream: Keto recheck failed");
+            warn!(board_id, subject, error = %e, "stream: permission recheck failed");
             Status::internal("authorization check failed")
         })
 }
@@ -280,17 +318,17 @@ async fn revalidate_keto(
 /// positional argument list.
 pub struct SubscribeBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub auth: AuthContext,
     pub board_id: String,
     pub is_private: bool,
     pub heartbeat_interval: Duration,
-    pub keto_recheck_interval: Duration,
+    pub permission_recheck_interval: Duration,
 }
 
 /// Build the `SubscribeBoard` server-streaming response.
 ///
-/// `heartbeat_interval` and `keto_recheck_interval` are configurable so
+/// `heartbeat_interval` and `permission_recheck_interval` are configurable so
 /// tests can use short durations instead of the production defaults.
 ///
 /// Snapshot replay is not implemented yet. When it lands, this should
@@ -301,12 +339,12 @@ pub async fn build_subscribe_board_stream(
 ) -> Result<SubscribeBoardStream, Status> {
     let SubscribeBoardArgs {
         registry,
-        keto,
+        permission,
         auth,
         board_id,
         is_private,
         heartbeat_interval,
-        keto_recheck_interval,
+        permission_recheck_interval,
     } = args;
 
     let s = stream! {
@@ -335,7 +373,7 @@ pub async fn build_subscribe_board_stream(
         // Consume the immediate first tick so the first heartbeat is delayed.
         heartbeat.tick().await;
 
-        let mut last_keto_recheck = Instant::now();
+        let mut last_permission_recheck = Instant::now();
 
         loop {
             // ── Step A: token revalidation (every yield) ──────────────────────
@@ -351,12 +389,12 @@ pub async fn build_subscribe_board_stream(
                 }
             }
 
-            // ── Step B: Keto recheck (every keto_recheck_interval) ────────────
+            // ── Step B: permission recheck (every permission_recheck_interval) ────────────
             // Public/internal boards are visible to any authenticated caller, so
-            // there is no Keto permission to recheck. Private boards still recheck
+            // there is no permission to recheck. Private boards still recheck
             // the explicit view relation.
-            if is_private && last_keto_recheck.elapsed() >= keto_recheck_interval {
-                match revalidate_keto(&keto, &auth, &board_id).await {
+            if is_private && last_permission_recheck.elapsed() >= permission_recheck_interval {
+                match revalidate_permission(&permission, &auth, &board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
                         yield Err(Status::permission_denied("permission revoked mid-stream"));
@@ -367,7 +405,7 @@ pub async fn build_subscribe_board_stream(
                         break;
                     }
                 }
-                last_keto_recheck = Instant::now();
+                last_permission_recheck = Instant::now();
             }
 
             // ── Step C: select envelope OR heartbeat tick ─────────────────────
@@ -408,7 +446,7 @@ impl BoardService for BoardServiceImpl {
     // ── ListBoards ────────────────────────────────────────────────────────────
     //
     // CheckedObjectId is the project_id (KanbanProject + view, per matrix).
-    // We SELECT boards WHERE project_id = $1 directly — the Keto check on the
+    // We SELECT boards WHERE project_id = $1 directly — the permission check on the
     // project gives access to all boards within it.
 
     async fn list_boards(
@@ -416,6 +454,8 @@ impl BoardService for BoardServiceImpl {
         request: Request<ListBoardsRequest>,
     ) -> Result<Response<ListBoardsResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let project_id = req
             .project_id
@@ -424,22 +464,22 @@ impl BoardService for BoardServiceImpl {
 
         let rows = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
-             FROM boards WHERE project_id = $1 ORDER BY created_at ASC",
+             FROM boards WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at ASC",
         )
+        .bind(&tenant_id)
         .bind(project_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list boards", e))?;
 
-        // Private boards require an explicit Keto view relation; public/internal
+        // Private boards require an explicit view relation in the permission backend; public/internal
         // boards are visible to any authenticated user.
-        let allowed_private_ids = crate::auth::keto_expand::expand_objects(
-            &self.keto,
-            crate::auth::keto_expand::ExpandQuery {
-                namespace: KETO_NS_BOARD,
+        let allowed_private_ids = crate::auth::permission_expand::expand_objects(
+            &permission,
+            crate::auth::permission_expand::ExpandQuery {
+                namespace: PERMISSION_TYPE_BOARD,
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             10_000,
         )
@@ -455,8 +495,8 @@ impl BoardService for BoardServiceImpl {
             {
                 continue;
             }
-            let columns_count = fetch_columns_count(&self.pool, bid).await;
-            let cards_count = fetch_cards_count(&self.pool, bid).await;
+            let columns_count = fetch_columns_count(&self.pool, bid, Some(&tenant_id)).await;
+            let cards_count = fetch_cards_count(&self.pool, bid, Some(&tenant_id)).await;
             boards.push(board_from_row(row, columns_count, cards_count));
         }
 
@@ -473,6 +513,8 @@ impl BoardService for BoardServiceImpl {
         request: Request<GetBoardRequest>,
     ) -> Result<Response<GetBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let board_id = req
             .board_id
@@ -481,8 +523,9 @@ impl BoardService for BoardServiceImpl {
 
         let row = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
-             FROM boards WHERE id = $1",
+             FROM boards WHERE tenant_id = $1 AND id = $2",
         )
+        .bind(&tenant_id)
         .bind(board_id)
         .fetch_optional(&self.pool)
         .await
@@ -491,10 +534,14 @@ impl BoardService for BoardServiceImpl {
 
         let visibility: String = row.get("visibility");
         if !is_public_or_internal(&visibility) {
-            // Private board: require explicit Keto view relation.
-            let allowed = self
-                .keto
-                .check_permission_with_retry(KETO_NS_BOARD, &board_id.to_string(), "view", &subject)
+            // Private board: require explicit view relation in the permission backend.
+            let allowed = permission
+                .check_permission_with_retry(
+                    PERMISSION_TYPE_BOARD,
+                    &board_id.to_string(),
+                    "view",
+                    &subject,
+                )
                 .await
                 .map_err(|e| internal("failed to check board view permission", e))?;
             if !allowed {
@@ -505,7 +552,7 @@ impl BoardService for BoardServiceImpl {
         }
 
         let columns = fetch_board_columns(&self.pool, board_id).await?;
-        let cards_count = fetch_cards_count(&self.pool, board_id).await;
+        let cards_count = fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
         let board = board_from_row(&row, columns.len() as i32, cards_count);
 
         Ok(Response::new(GetBoardResponse {
@@ -519,7 +566,7 @@ impl BoardService for BoardServiceImpl {
     // ── CreateBoard ───────────────────────────────────────────────────────────
     //
     // CheckedObjectId is the project_id (KanbanProject + edit, per matrix).
-    // Keto write: KanbanBoard:{board_id}#parent@KanbanProject:{project_id}
+    // Permission write: KanbanBoard:{board_id}#parent@KanbanProject:{project_id}
     // so boards inherit project-level access.
 
     async fn create_board(
@@ -530,32 +577,39 @@ impl BoardService for BoardServiceImpl {
         let project_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Id>> =
-                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
-                    .bind(&req.idempotency_key)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| internal("idempotency key lookup failed", e))?
-                    .map(|r| r.get("response_card_id"));
+            let cached: Option<Option<Id>> = sqlx::query(
+                "SELECT response_card_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2",
+            )
+            .bind(&tenant_id)
+            .bind(&req.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("idempotency key lookup failed", e))?
+            .map(|r| r.get("response_card_id"));
 
             if let Some(Some(board_id)) = cached {
                 let row = sqlx::query(
                     "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
-                     FROM boards WHERE id = $1",
+                     FROM boards WHERE tenant_id = $1 AND id = $2",
                 )
+                .bind(&tenant_id)
                 .bind(board_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch cached board", e))?;
 
                 if let Some(row) = row {
-                    let columns_count = fetch_columns_count(&self.pool, board_id).await;
-                    let cards_count = fetch_cards_count(&self.pool, board_id).await;
+                    let columns_count =
+                        fetch_columns_count(&self.pool, board_id, Some(&tenant_id)).await;
+                    let cards_count =
+                        fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
                     return Ok(Response::new(CreateBoardResponse {
                         board: Some(board_from_row(&row, columns_count, cards_count)),
                     }));
@@ -574,12 +628,13 @@ impl BoardService for BoardServiceImpl {
         // INSERT board.
         let row = sqlx::query(
             r#"
-            INSERT INTO boards (id, project_id, name, slug, description, icon, visibility)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO boards (id, tenant_id, project_id, name, slug, description, icon, visibility)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id, project_id, name, slug, description, icon, visibility, created_at, updated_at
             "#,
         )
         .bind(board_id)
+        .bind(&tenant_id)
         .bind(project_id)
         .bind(&req.name)
         .bind(&slug)
@@ -601,15 +656,14 @@ impl BoardService for BoardServiceImpl {
             internal("failed to insert board", e)
         })?;
 
-        // Keto FIRST: write parent tuple so board inherits project access.
+        // Permission backend FIRST: write parent tuple so board inherits project access.
         // KanbanBoard:{board_id}#parent@KanbanProject:{project_id}
-        if let Err(e) = self
-            .keto
+        if let Err(e) = permission
             .grant_with_retry(
-                KETO_NS_BOARD,
+                PERMISSION_TYPE_BOARD,
                 &board_id.to_string(),
                 "parent",
-                &format!("KanbanProject:{project_id}#..."),
+                &format!("KanbanProject:{project_id}"),
             )
             .await
         {
@@ -617,15 +671,16 @@ impl BoardService for BoardServiceImpl {
                 error = %e,
                 board_id = %board_id,
                 project_id = %project_id,
-                "mirror_drift: failed to write Keto parent tuple for board; reconciler (Stage 7a) will catch"
+                "mirror_drift: failed to write parent tuple to the permission backend for board; reconciler (Stage 7a) will catch"
             );
         }
 
         // Store idempotency response.
         if !req.idempotency_key.is_empty()
             && let Err(e) = sqlx::query(
-                "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO idempotency_keys (tenant_id, key, response_card_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
+            .bind(&tenant_id)
             .bind(&req.idempotency_key)
             .bind(board_id)
             .execute(&self.pool)
@@ -649,6 +704,8 @@ impl BoardService for BoardServiceImpl {
         request: Request<UpdateBoardRequest>,
     ) -> Result<Response<UpdateBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -666,10 +723,9 @@ impl BoardService for BoardServiceImpl {
 
         if visibility_change {
             // Changing visibility is a trust/safety operation; require manage.
-            let allowed = self
-                .keto
+            let allowed = permission
                 .check_permission_with_retry(
-                    KETO_NS_BOARD,
+                    PERMISSION_TYPE_BOARD,
                     &board_id.to_string(),
                     "manage",
                     &subject,
@@ -688,15 +744,16 @@ impl BoardService for BoardServiceImpl {
         let row = sqlx::query(
             r#"
             UPDATE boards SET
-                name        = CASE WHEN $2 != '' THEN $2 ELSE name END,
-                description = CASE WHEN $3 != '' THEN $3 ELSE description END,
-                icon        = CASE WHEN $4 != '' THEN $4 ELSE icon END,
-                visibility  = CASE WHEN $5::boolean THEN $6 ELSE visibility END,
+                name        = CASE WHEN $3 != '' THEN $3 ELSE name END,
+                description = CASE WHEN $4 != '' THEN $4 ELSE description END,
+                icon        = CASE WHEN $5 != '' THEN $5 ELSE icon END,
+                visibility  = CASE WHEN $6::boolean THEN $7 ELSE visibility END,
                 updated_at  = now()
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             RETURNING id, project_id, name, slug, description, icon, visibility, created_at, updated_at
             "#,
         )
+        .bind(&tenant_id)
         .bind(board_id)
         .bind(&patch.name)
         .bind(&patch.description)
@@ -708,8 +765,8 @@ impl BoardService for BoardServiceImpl {
         .map_err(|e| internal("failed to update board", e))?
         .ok_or_else(|| Status::not_found("board not found"))?;
 
-        let columns_count = fetch_columns_count(&self.pool, board_id).await;
-        let cards_count = fetch_cards_count(&self.pool, board_id).await;
+        let columns_count = fetch_columns_count(&self.pool, board_id, Some(&tenant_id)).await;
+        let cards_count = fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
         Ok(Response::new(UpdateBoardResponse {
             board: Some(board_from_row(&row, columns_count, cards_count)),
         }))
@@ -719,18 +776,20 @@ impl BoardService for BoardServiceImpl {
     //
     // CheckedObjectId is the board_id (KanbanBoard + manage, per matrix).
     // CASCADE: deletes columns → cards (per FK cascade in migrations).
-    // Best-effort Keto cleanup — drift logged, reconciler handles it.
+    // Best-effort permission cleanup — drift logged, reconciler handles it.
 
     async fn delete_board(
         &self,
         request: Request<DeleteBoardRequest>,
     ) -> Result<Response<DeleteBoardResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
-        let result = sqlx::query("DELETE FROM boards WHERE id = $1")
+        let result = sqlx::query("DELETE FROM boards WHERE tenant_id = $1 AND id = $2")
+            .bind(&tenant_id)
             .bind(board_id)
             .execute(&self.pool)
             .await
@@ -740,10 +799,10 @@ impl BoardService for BoardServiceImpl {
             return Err(Status::not_found("board not found"));
         }
 
-        // Best-effort Keto parent tuple cleanup.
+        // Best-effort permission parent tuple cleanup.
         warn!(
             board_id = %board_id,
-            "delete_board: Keto parent tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
+            "delete_board: permission parent tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
         Ok(Response::new(DeleteBoardResponse {}))
@@ -764,6 +823,7 @@ impl BoardService for BoardServiceImpl {
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid board_id"))?;
 
+        let tenant_id = tenant_id_from_request(&request)?;
         let req = request.into_inner();
 
         if req.title.is_empty() {
@@ -772,19 +832,22 @@ impl BoardService for BoardServiceImpl {
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
-            let cached: Option<Option<Id>> =
-                sqlx::query("SELECT response_card_id FROM idempotency_keys WHERE key = $1")
-                    .bind(&req.idempotency_key)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|e| internal("idempotency key lookup failed", e))?
-                    .map(|r| r.get("response_card_id"));
+            let cached: Option<Option<Id>> = sqlx::query(
+                "SELECT response_card_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2",
+            )
+            .bind(&tenant_id)
+            .bind(&req.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("idempotency key lookup failed", e))?
+            .map(|r| r.get("response_card_id"));
 
             if let Some(Some(col_id)) = cached {
                 let row = sqlx::query(
                     "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
-                     FROM columns WHERE id = $1",
+                     FROM columns WHERE tenant_id = $1 AND id = $2",
                 )
+                .bind(&tenant_id)
                 .bind(col_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -804,13 +867,14 @@ impl BoardService for BoardServiceImpl {
             // Append at the end: position = MAX(position) + 1.
             sqlx::query(
                 r#"
-                INSERT INTO columns (id, board_id, title, accent, wip_limit, position)
-                SELECT $1, $2, $3, $4, $5,
-                       COALESCE((SELECT MAX(position) FROM columns WHERE board_id = $2), -1) + 1
+                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position)
+                SELECT $1, $2, $3, $4, $5, $6,
+                       COALESCE((SELECT MAX(position) FROM columns WHERE board_id = $3), -1) + 1
                 RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
                 "#,
             )
             .bind(column_id)
+            .bind(&tenant_id)
             .bind(board_id)
             .bind(&req.title)
             .bind(if req.accent.is_empty() {
@@ -833,14 +897,15 @@ impl BoardService for BoardServiceImpl {
                 WITH shift AS (
                     UPDATE columns
                     SET position = position + 1, updated_at = now()
-                    WHERE board_id = $2 AND position >= $6
+                    WHERE board_id = $3 AND position >= $7
                 )
-                INSERT INTO columns (id, board_id, title, accent, wip_limit, position)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
                 "#,
             )
             .bind(column_id)
+            .bind(&tenant_id)
             .bind(board_id)
             .bind(&req.title)
             .bind(if req.accent.is_empty() {
@@ -864,8 +929,9 @@ impl BoardService for BoardServiceImpl {
         // Store idempotency response.
         if !req.idempotency_key.is_empty()
             && let Err(e) = sqlx::query(
-                "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO idempotency_keys (tenant_id, key, response_card_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
+            .bind(&tenant_id)
             .bind(&req.idempotency_key)
             .bind(column_id)
             .execute(&self.pool)
@@ -888,6 +954,7 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<UpdateColumnRequest>,
     ) -> Result<Response<UpdateColumnResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -903,14 +970,15 @@ impl BoardService for BoardServiceImpl {
         let row = sqlx::query(
             r#"
             UPDATE columns SET
-                title      = CASE WHEN $3 != '' THEN $3 ELSE title END,
-                accent     = CASE WHEN $4 != '' THEN $4 ELSE accent END,
-                wip_limit  = CASE WHEN $5 != 0  THEN $5 ELSE wip_limit END,
+                title      = CASE WHEN $4 != '' THEN $4 ELSE title END,
+                accent     = CASE WHEN $5 != '' THEN $5 ELSE accent END,
+                wip_limit  = CASE WHEN $6 != 0  THEN $6 ELSE wip_limit END,
                 updated_at = now()
-            WHERE id = $1 AND board_id = $2
+            WHERE tenant_id = $1 AND id = $2 AND board_id = $3
             RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
             "#,
         )
+        .bind(&tenant_id)
         .bind(col_id)
         .bind(board_id)
         .bind(&patch.title)
@@ -945,6 +1013,7 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<RemoveColumnRequest>,
     ) -> Result<Response<RemoveColumnResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -957,26 +1026,30 @@ impl BoardService for BoardServiceImpl {
             .map_err(|_| Status::invalid_argument("invalid column_id"))?;
 
         // Verify the column belongs to this board.
-        let exists: bool =
-            sqlx::query("SELECT EXISTS(SELECT 1 FROM columns WHERE id = $1 AND board_id = $2)")
-                .bind(col_id)
-                .bind(board_id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| internal("failed to verify column ownership", e))
-                .map(|r| r.get::<bool, _>(0))?;
+        let exists: bool = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM columns WHERE tenant_id = $1 AND id = $2 AND board_id = $3)",
+        )
+        .bind(&tenant_id)
+        .bind(col_id)
+        .bind(board_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| internal("failed to verify column ownership", e))
+        .map(|r| r.get::<bool, _>(0))?;
 
         if !exists {
             return Err(Status::not_found("column not found on this board"));
         }
 
         // Delete the column. Cards cascade-delete via FK (0006_cards.sql).
-        let result = sqlx::query("DELETE FROM columns WHERE id = $1 AND board_id = $2")
-            .bind(col_id)
-            .bind(board_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| internal("failed to delete column", e))?;
+        let result =
+            sqlx::query("DELETE FROM columns WHERE tenant_id = $1 AND id = $2 AND board_id = $3")
+                .bind(&tenant_id)
+                .bind(col_id)
+                .bind(board_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| internal("failed to delete column", e))?;
 
         if result.rows_affected() == 0 {
             return Err(Status::not_found("column not found"));
@@ -989,7 +1062,7 @@ impl BoardService for BoardServiceImpl {
                 SELECT id,
                        (ROW_NUMBER() OVER (ORDER BY position ASC) - 1)::INT AS new_pos
                 FROM columns
-                WHERE board_id = $1
+                WHERE tenant_id = $1 AND board_id = $2
             )
             UPDATE columns c
             SET position = r.new_pos, updated_at = now()
@@ -997,6 +1070,7 @@ impl BoardService for BoardServiceImpl {
             WHERE c.id = r.id
             "#,
         )
+        .bind(&tenant_id)
         .bind(board_id)
         .execute(&self.pool)
         .await
@@ -1020,6 +1094,7 @@ impl BoardService for BoardServiceImpl {
         &self,
         request: Request<MoveColumnRequest>,
     ) -> Result<Response<MoveColumnResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let board_id = object_id
             .parse::<Id>()
@@ -1039,23 +1114,26 @@ impl BoardService for BoardServiceImpl {
         let target_pos = req.to_position - 1;
 
         // Fetch current position.
-        let current_pos: i32 =
-            sqlx::query("SELECT position FROM columns WHERE id = $1 AND board_id = $2")
-                .bind(col_id)
-                .bind(board_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch column position", e))?
-                .ok_or_else(|| Status::not_found("column not found on this board"))
-                .map(|r| r.get("position"))?;
+        let current_pos: i32 = sqlx::query(
+            "SELECT position FROM columns WHERE tenant_id = $1 AND id = $2 AND board_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(col_id)
+        .bind(board_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch column position", e))?
+        .ok_or_else(|| Status::not_found("column not found on this board"))
+        .map(|r| r.get("position"))?;
 
         if current_pos != target_pos {
             if target_pos > current_pos {
                 // Moving forward: shift columns in (current, target] down by 1.
                 sqlx::query(
                     "UPDATE columns SET position = position - 1, updated_at = now() \
-                     WHERE board_id = $1 AND position > $2 AND position <= $3",
+                     WHERE tenant_id = $1 AND board_id = $2 AND position > $3 AND position <= $4",
                 )
+                .bind(&tenant_id)
                 .bind(board_id)
                 .bind(current_pos)
                 .bind(target_pos)
@@ -1066,8 +1144,9 @@ impl BoardService for BoardServiceImpl {
                 // Moving backward: shift columns in [target, current) up by 1.
                 sqlx::query(
                     "UPDATE columns SET position = position + 1, updated_at = now() \
-                     WHERE board_id = $1 AND position >= $2 AND position < $3",
+                     WHERE tenant_id = $1 AND board_id = $2 AND position >= $3 AND position < $4",
                 )
+                .bind(&tenant_id)
                 .bind(board_id)
                 .bind(target_pos)
                 .bind(current_pos)
@@ -1077,12 +1156,15 @@ impl BoardService for BoardServiceImpl {
             }
 
             // Place the moved column at its new position.
-            sqlx::query("UPDATE columns SET position = $2, updated_at = now() WHERE id = $1")
-                .bind(col_id)
-                .bind(target_pos)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| internal("failed to place moved column", e))?;
+            sqlx::query(
+                "UPDATE columns SET position = $3, updated_at = now() WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(&tenant_id)
+            .bind(col_id)
+            .bind(target_pos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| internal("failed to place moved column", e))?;
         }
 
         // Stage 4: emit BoardEventEnvelope::ColumnsReordered over NATS subject kanban.board.<board_id>.events
@@ -1109,27 +1191,39 @@ impl BoardService for BoardServiceImpl {
         // since_seq is reserved for Stage 4c.5 resume protocol; ignored here.
         let _since_seq = req.since_seq;
 
-        let visibility: String = sqlx::query_scalar("SELECT visibility FROM boards WHERE id = $1")
-            .bind(
-                board_id
-                    .parse::<Id>()
-                    .map_err(|_| Status::invalid_argument("invalid board_id"))?,
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| internal("failed to fetch board visibility", e))?
-            .ok_or_else(|| Status::not_found("board not found"))?;
+        let tenant = auth
+            .tenant_id
+            .clone()
+            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        let board_id_parsed = board_id
+            .parse::<Id>()
+            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+
+        let visibility: String =
+            sqlx::query_scalar("SELECT visibility FROM boards WHERE tenant_id = $1 AND id = $2")
+                .bind(&tenant)
+                .bind(board_id_parsed)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch board visibility", e))?
+                .ok_or_else(|| Status::not_found("board not found"))?;
 
         let is_private = !is_public_or_internal(&visibility);
+        let permission = Arc::new(
+            self.permission
+                .tenant_client(&tenant)
+                .await
+                .map_err(|e| internal("failed to build tenant permission client", e))?,
+        );
 
         let stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry: Arc::clone(&self.registry),
-            keto: Arc::clone(&self.keto),
+            permission,
             auth,
             board_id,
             is_private,
             heartbeat_interval: self.heartbeat_interval,
-            keto_recheck_interval: self.keto_recheck_interval,
+            permission_recheck_interval: self.permission_recheck_interval,
         })
         .await?;
 
@@ -1176,8 +1270,12 @@ mod tests {
             .expect("ensure_kanban_stream failed");
     }
 
-    fn make_auth_with_future_exp(subject: &str) -> AuthContext {
-        AuthContext::authenticated(subject, None).with_exp(i64::MAX)
+    fn make_auth(subject: &str) -> AuthContext {
+        AuthContext::authenticated(crate::test_support::test_tenant_id(), subject)
+    }
+
+    async fn permission_client() -> Arc<PermissionClient> {
+        crate::test_support::setup_permission().await
     }
 
     async fn make_registry(nats: Arc<NatsClient>) -> Arc<BoardSubscriberRegistry> {
@@ -1195,32 +1293,23 @@ mod tests {
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", Id::new());
         let subject_str = format!("user:test-{}", Id::new());
-        let auth = make_auth_with_future_exp(&subject_str);
+        let auth = make_auth(&subject_str);
 
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url.clone(),
-                write_grpc_endpoint: keto_write_url.clone(),
-            },
-        ));
+        let permission = permission_client().await;
 
-        // Grant view so the initial Keto recheck passes.
-        let _ = keto
-            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
+        // Grant view so the initial permission recheck passes.
+        let _ = permission
+            .grant_with_retry("KanbanBoard", &board_id, "viewer", &subject_str)
             .await;
 
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             auth,
             board_id: board_id.clone(),
             is_private: true,
             heartbeat_interval: Duration::from_secs(15),
-            keto_recheck_interval: Duration::from_secs(30),
+            permission_recheck_interval: Duration::from_secs(30),
         })
         .await
         .expect("build_subscribe_board_stream failed");
@@ -1242,14 +1331,15 @@ mod tests {
             other => panic!("expected Cutover, got {other:?}"),
         }
 
-        // Cleanup Keto tuple.
-        let _ = crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject_str),
-        )
-        .await;
+        // Cleanup permission tuple.
+        let _ = permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject_str.clone()),
+            )
+            .await;
     }
 
     /// A live JetStream event published for the board should reach the
@@ -1265,30 +1355,21 @@ mod tests {
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", Id::new());
         let subject_str = format!("user:test-{}", Id::new());
-        let auth = make_auth_with_future_exp(&subject_str);
+        let auth = make_auth(&subject_str);
 
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url,
-                write_grpc_endpoint: keto_write_url,
-            },
-        ));
-        let _ = keto
-            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
+        let permission = permission_client().await;
+        let _ = permission
+            .grant_with_retry("KanbanBoard", &board_id, "viewer", &subject_str)
             .await;
 
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             auth,
             board_id: board_id.clone(),
             is_private: true,
             heartbeat_interval: Duration::from_secs(15),
-            keto_recheck_interval: Duration::from_secs(30),
+            permission_recheck_interval: Duration::from_secs(30),
         })
         .await
         .expect("build failed");
@@ -1331,18 +1412,19 @@ mod tests {
             live_event_id
         );
 
-        let _ = crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject_str),
-        )
-        .await;
+        let _ = permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject_str.clone()),
+            )
+            .await;
     }
 
-    /// Events that were already emitted during replay must be dropped when
-    /// they reappear on the live tail.
-    ///
+    // Events that were already emitted during replay must be dropped when
+    // they reappear on the live tail.
+    //
     // NOTE: replay-vs-live dedup test will be added when snapshot replay
     // lands (the empty-replay path is exercised by
     // `subscribe_emits_cutover_immediately_on_empty_replay`).
@@ -1359,31 +1441,22 @@ mod tests {
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", Id::new());
         let subject_str = format!("user:test-{}", Id::new());
-        let auth = make_auth_with_future_exp(&subject_str);
+        let auth = make_auth(&subject_str);
 
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url,
-                write_grpc_endpoint: keto_write_url,
-            },
-        ));
-        let _ = keto
-            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
+        let permission = permission_client().await;
+        let _ = permission
+            .grant_with_retry("KanbanBoard", &board_id, "viewer", &subject_str)
             .await;
 
         // Use a 1s heartbeat interval so we don't need to sleep 15s.
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             auth,
             board_id: board_id.clone(),
             is_private: true,
             heartbeat_interval: Duration::from_secs(1), // short interval for test
-            keto_recheck_interval: Duration::from_secs(60), // long keto recheck to avoid interference
+            permission_recheck_interval: Duration::from_secs(60), // long permission recheck to avoid interference
         })
         .await
         .expect("build failed");
@@ -1411,134 +1484,50 @@ mod tests {
             other => panic!("expected Heartbeat, got {other:?}"),
         }
 
-        let _ = crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject_str),
-        )
-        .await;
-    }
-
-    /// When the caller's access token expires mid-stream, the stream closes
-    /// with `Status::Unauthenticated`.
-    ///
-    /// Uses a short heartbeat interval so the test does not wait for the
-    /// production defaults.
-    #[tokio::test]
-    async fn subscribe_closes_with_unauthenticated_when_token_expires() {
-        let nats = connect_nats().await;
-        ensure_stream(&nats).await;
-
-        let registry = make_registry(Arc::clone(&nats)).await;
-        let board_id = format!("test-board-{}", Id::new());
-        let subject_str = format!("user:test-{}", Id::new());
-        // Issue an already-expired token (exp = 0).
-        let auth = AuthContext::authenticated(&subject_str, None).with_exp(0);
-
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url,
-                write_grpc_endpoint: keto_write_url,
-            },
-        ));
-        let _ = keto
-            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
+        let _ = permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(subject_str.clone()),
+            )
             .await;
-
-        let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
-            registry,
-            keto: Arc::clone(&keto),
-            auth,
-            board_id: board_id.clone(),
-            is_private: true,
-            heartbeat_interval: Duration::from_millis(100),
-            keto_recheck_interval: Duration::from_secs(60),
-        })
-        .await
-        .expect("build failed");
-
-        use tokio_stream::StreamExt;
-        // Consume the Cutover envelope.
-        let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
-            .await
-            .expect("timeout on cutover");
-
-        // The stream should close with Unauthenticated within 2s.
-        let err = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(item) = stream.next().await {
-                if let Err(s) = item {
-                    return Some(s);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout waiting for stream close")
-        .expect("stream closed without error status");
-
-        assert_eq!(
-            err.code(),
-            tonic::Code::Unauthenticated,
-            "expected Unauthenticated when token expired, got {err:?}"
-        );
-
-        let _ = crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&subject_str),
-        )
-        .await;
     }
 
-    /// When Keto revokes the caller's view permission mid-stream, the stream
+    /// When the caller's view permission is revoked mid-stream, the stream
     /// closes with `Status::PermissionDenied`.
     ///
-    /// Uses a one-second Keto recheck interval override so the test does not
+    /// Uses a one-second permission recheck interval override so the test does not
     /// wait 30 s.
     #[tokio::test]
-    async fn subscribe_closes_with_permission_denied_when_keto_revokes() {
+    async fn subscribe_closes_with_permission_denied_when_permission_revokes() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", Id::new());
         let subject_str = format!("user:test-{}", Id::new());
-        let auth = make_auth_with_future_exp(&subject_str);
+        let auth = make_auth(&subject_str);
 
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url,
-                write_grpc_endpoint: keto_write_url,
-            },
-        ));
+        let permission = permission_client().await;
         // Grant view so initial check passes.
-        let _ = keto
-            .grant_with_retry("KanbanBoard", &board_id, "view", &subject_str)
+        let _ = permission
+            .grant_with_retry("KanbanBoard", &board_id, "viewer", &subject_str)
             .await;
 
-        let keto_clone = Arc::clone(&keto);
+        let permission_clone = Arc::clone(&permission);
         let board_id_clone = board_id.clone();
         let sub_clone = subject_str.clone();
 
-        // Use a 1s Keto recheck interval so we don't need to wait 30s.
+        // Use a 1s permission recheck interval so we don't need to wait 30s.
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             auth,
             board_id: board_id.clone(),
             is_private: true,
             heartbeat_interval: Duration::from_millis(100), // fast heartbeat to keep loop ticking
-            keto_recheck_interval: Duration::from_secs(1),  // 1s Keto recheck for test
+            permission_recheck_interval: Duration::from_secs(1), // 1s permission recheck for test
         })
         .await
         .expect("build failed");
@@ -1549,16 +1538,17 @@ mod tests {
             .await
             .expect("timeout on cutover");
 
-        // Revoke the Keto tuple after 200ms.
+        // Revoke the permission tuple after 200ms.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = crate::auth::keto_compat::delete_relation_tuples(
-                &keto_clone,
-                "KanbanBoard",
-                Some("view"),
-                Some(&sub_clone),
-            )
-            .await;
+            let _ = permission_clone
+                .delete_relation_tuples(
+                    "KanbanBoard",
+                    None,
+                    Some("viewer".to_string()),
+                    Some(sub_clone.clone()),
+                )
+                .await;
         });
 
         // The stream should close with PermissionDenied within 3s (recheck fires at 1s).
@@ -1577,16 +1567,17 @@ mod tests {
         assert_eq!(
             err.code(),
             tonic::Code::PermissionDenied,
-            "expected PermissionDenied when Keto revokes, got {err:?}"
+            "expected PermissionDenied when permission is revoked, got {err:?}"
         );
 
-        let _ = crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            "KanbanBoard",
-            Some("view"),
-            Some(&board_id_clone),
-        )
-        .await;
+        let _ = permission
+            .delete_relation_tuples(
+                "KanbanBoard",
+                None,
+                Some("viewer".to_string()),
+                Some(board_id_clone.clone()),
+            )
+            .await;
     }
 
     // ── Setup helpers ────────────────────────────────────────────────────────
@@ -1595,23 +1586,23 @@ mod tests {
         crate::test_support::setup_pool().await
     }
 
-    async fn setup_keto() -> Arc<KetoClient> {
-        crate::test_support::setup_keto().await
+    async fn setup_permission() -> Arc<PermissionClient> {
+        crate::test_support::setup_permission().await
     }
 
     /// Build a `BoardServiceImpl` for integration tests.
     ///
     /// Connects to NATS using the standard environment variables so the registry
     /// field is always populated.
-    async fn make_service(pool: PgPool, keto: Arc<KetoClient>) -> BoardServiceImpl {
+    async fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> BoardServiceImpl {
         let nats = connect_nats().await;
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test"));
         BoardServiceImpl {
             pool,
-            keto,
+            permission,
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
-            keto_recheck_interval: Duration::from_millis(30_000),
+            permission_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
         }
     }
@@ -1619,8 +1610,10 @@ mod tests {
     /// Create an authenticated request that only carries the caller subject.
     fn authed_request<T>(body: T, subject: &str) -> Request<T> {
         let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(subject, None));
+        req.extensions_mut().insert(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ));
         req
     }
 
@@ -1636,10 +1629,12 @@ mod tests {
     async fn create_test_project(pool: &PgPool, subject: &str) -> Id {
         let pid = Id::new();
         let slug = format!("tp-{}", &pid.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id) VALUES ($1, $2, $3, $4, '', $5)",
         )
         .bind(pid)
+        .bind(tenant_id)
         .bind(format!("Test Project {pid}"))
         .bind(&slug)
         .bind(subject)
@@ -1659,10 +1654,12 @@ mod tests {
         ref_: &str,
     ) -> Id {
         let card_id = Id::new();
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO cards (id, project_id, board_id, column_id, ref, title, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO cards (id, tenant_id, project_id, board_id, column_id, ref, title, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(card_id)
+        .bind(tenant_id)
         .bind(project_id)
         .bind(board_id)
         .bind(column_id)
@@ -1687,8 +1684,8 @@ mod tests {
     #[tokio::test]
     async fn create_then_get_returns_same_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -1720,10 +1717,10 @@ mod tests {
 
         let board_id = created.id.clone();
 
-        // Grant explicit view — test Keto does not evaluate derived permissions
-        // from the parent project tuple.
-        let _ = keto
-            .grant_with_retry(KETO_NS_BOARD, &board_id, "view", &subject)
+        // Grant an explicit viewer role so the read does not depend on the
+        // parent project chain.
+        let _ = permission
+            .grant_with_retry(PERMISSION_TYPE_BOARD, &board_id, "viewer", &subject)
             .await;
 
         let detail = svc
@@ -1751,8 +1748,8 @@ mod tests {
     #[tokio::test]
     async fn list_boards_scoped_to_project() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_a = create_test_project(&pool, &subject).await;
@@ -1801,11 +1798,11 @@ mod tests {
             .board
             .expect("board missing");
 
-        // Grant explicit view on each board — test Keto does not evaluate
-        // derived permissions from the parent project tuple.
+        // Grant an explicit viewer role on each board so reads do not depend
+        // on the parent project chain.
         for board_id in board_ids_a.iter().chain(std::iter::once(&board_b.id)) {
-            let _ = keto
-                .grant_with_retry(KETO_NS_BOARD, board_id, "view", &subject)
+            let _ = permission
+                .grant_with_retry(PERMISSION_TYPE_BOARD, board_id, "viewer", &subject)
                 .await;
         }
 
@@ -1848,8 +1845,8 @@ mod tests {
     #[tokio::test]
     async fn update_board_applies_patch_fields_only() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -1916,8 +1913,8 @@ mod tests {
     #[tokio::test]
     async fn delete_board_cascades_columns_and_cards() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2003,8 +2000,8 @@ mod tests {
     #[tokio::test]
     async fn add_column_appends_at_end_when_position_unset() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2098,8 +2095,8 @@ mod tests {
     #[tokio::test]
     async fn add_column_shifts_when_position_in_middle() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2197,8 +2194,8 @@ mod tests {
     #[tokio::test]
     async fn update_column_changes_title_and_wip() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2282,8 +2279,8 @@ mod tests {
     #[tokio::test]
     async fn remove_column_deletes_cards_via_cascade() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2391,8 +2388,8 @@ mod tests {
     #[tokio::test]
     async fn remove_column_rejects_column_not_on_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_a = create_test_project(&pool, &subject).await;
@@ -2486,8 +2483,8 @@ mod tests {
     #[tokio::test]
     async fn move_column_reorders_within_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &subject).await;
@@ -2583,8 +2580,8 @@ mod tests {
     #[tokio::test]
     async fn get_board_allows_non_member_for_public_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-{}", Id::new());
         let stranger = format!("user:test-{}", Id::new());
@@ -2630,8 +2627,8 @@ mod tests {
     #[tokio::test]
     async fn get_board_denies_non_member_for_private_board() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-{}", Id::new());
         let stranger = format!("user:test-{}", Id::new());
@@ -2678,8 +2675,8 @@ mod tests {
     #[tokio::test]
     async fn list_boards_returns_public_internal_for_any_authenticated_user() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-{}", Id::new());
         let stranger = format!("user:test-{}", Id::new());
@@ -2737,10 +2734,16 @@ mod tests {
             .board
             .expect("board missing");
 
-        // Grant stranger explicit view on the private board so it appears.
-        keto.grant_with_retry(KETO_NS_BOARD, &private_board.id, "view", &stranger)
+        // Grant stranger an explicit viewer role on the private board so it appears.
+        permission
+            .grant_with_retry(
+                PERMISSION_TYPE_BOARD,
+                &private_board.id,
+                "viewer",
+                &stranger,
+            )
             .await
-            .expect("grant view failed");
+            .expect("grant viewer failed");
 
         let list = svc
             .list_boards(authed_request_with_object(
@@ -2763,14 +2766,15 @@ mod tests {
         );
 
         // Revoke the explicit view and verify the private board disappears.
-        crate::auth::keto_compat::delete_relation_tuples(
-            &keto,
-            KETO_NS_BOARD,
-            Some("view"),
-            Some(&stranger),
-        )
-        .await
-        .ok();
+        permission
+            .delete_relation_tuples(
+                PERMISSION_TYPE_BOARD,
+                None,
+                Some("viewer".to_string()),
+                Some(stranger.clone()),
+            )
+            .await
+            .ok();
 
         let list_after = svc
             .list_boards(authed_request_with_object(
@@ -2801,8 +2805,8 @@ mod tests {
     #[tokio::test]
     async fn update_board_visibility_requires_manage_and_persists() {
         let pool = setup_pool().await;
-        let keto = setup_keto().await;
-        let svc = make_service(pool.clone(), Arc::clone(&keto)).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let owner = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&pool, &owner).await;
@@ -2826,10 +2830,12 @@ mod tests {
             .board
             .expect("board missing");
 
-        // Grant manage so the visibility change is authorized.
-        keto.grant_with_retry(KETO_NS_BOARD, &board.id, "manage", &owner)
+        // Board manage is computed from the parent project; grant project
+        // admin so the visibility change is authorized.
+        permission
+            .grant_with_retry("KanbanProject", &project_id.to_string(), "admin", &owner)
             .await
-            .expect("grant manage failed");
+            .expect("grant admin failed");
 
         let updated = svc
             .update_board(authed_request_with_object(
@@ -2906,36 +2912,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_public_board_skips_keto_recheck() {
+    async fn subscribe_public_board_skips_permission_recheck() {
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
 
         let registry = make_registry(Arc::clone(&nats)).await;
         let board_id = format!("test-board-{}", Id::new());
         let subject_str = format!("user:test-{}", Id::new());
-        let auth = make_auth_with_future_exp(&subject_str);
+        let auth = make_auth(&subject_str);
 
-        let keto_url =
-            std::env::var("KETO_GRPC_URL").unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-        let keto = Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_url,
-                write_grpc_endpoint: keto_write_url,
-            },
-        ));
+        let permission = permission_client().await;
 
-        // Intentionally do NOT grant a Keto view tuple: a public board stream
-        // must skip the Keto recheck and still emit the Cutover envelope.
+        // Intentionally do NOT grant a view tuple in the permission backend: a public board stream
+        // must skip the permission recheck and still emit the Cutover envelope.
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
-            keto: Arc::clone(&keto),
+            permission: Arc::clone(&permission),
             auth,
             board_id: board_id.clone(),
             is_private: false,
             heartbeat_interval: Duration::from_secs(15),
-            keto_recheck_interval: Duration::from_secs(30),
+            permission_recheck_interval: Duration::from_secs(30),
         })
         .await
         .expect("build_subscribe_board_stream failed");

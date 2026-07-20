@@ -5,9 +5,9 @@
 // and downloads. The server generates pre-signed S3-compatible URLs using
 // SigV4 (pure-Rust, ported from apps/kanban-old/server/s3-presign.ts).
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are performed
-// by the kanban-local `keto_dispatch` middleware defined in
-// `apps/kanban/src/auth/keto_dispatch.rs`. Object-id source is card_id via
+// Auth: every RPC requires a valid bearer token. Permission checks are performed
+// by the kanban-local `permission_dispatch` middleware defined in
+// `apps/kanban/src/auth/permission_dispatch.rs`. Object-id source is card_id via
 // the `x-sunbeam-object-id` header; see the dispatch matrix for details.
 
 syntax = "proto3";
@@ -111,9 +111,9 @@ message ListAttachmentsByCardResponse {
 //   2. Client PUTs the file to presigned_url directly (browser → SeaweedFS).
 //   3. Client calls ConfirmUpload(attachment_id) → server verifies HEAD + marks confirmed.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks use the card's
+// Auth: every RPC requires a valid bearer token. Permission checks use the card's
 // parent KanbanBoard object. Download requires "view"; upload/delete requires
-// "edit". See keto_dispatch.rs for the full matrix.
+// "edit". See permission_dispatch.rs for the full matrix.
 service AttachmentService {
   // RequestPresignedUpload creates a pending attachment record and returns a
   // SigV4-signed PUT URL valid for 15 minutes. Requires "edit" on the card's

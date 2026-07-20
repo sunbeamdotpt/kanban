@@ -20,12 +20,12 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
+use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
-use crate::auth::keto_dispatch::CheckedObjectId;
-use crate::auth::keto_expand::{ExpandQuery, expand_objects};
-use crate::auth::keto_retry::KetoRetryExt;
+use crate::auth::permission_dispatch::CheckedObjectId;
+use crate::auth::permission_expand::{ExpandQuery, expand_objects};
+use crate::auth::permission_retry::PermissionRetryExt;
 use crate::pb::aggregated_board_service_server::AggregatedBoardService;
 use crate::pb::{
     AddSourceBoardRequest, AddSourceBoardResponse, AggregatedBoard, AggregatedBoardChunk,
@@ -48,7 +48,7 @@ use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_d
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const KETO_NS: &str = "KanbanAggregatedBoard";
+const PERMISSION_TYPE: &str = "KanbanAggregatedBoard";
 const MAX_AGGREGATES: usize = 10_000;
 const CARD_BATCH_SIZE: usize = 100;
 
@@ -56,10 +56,10 @@ const CARD_BATCH_SIZE: usize = 100;
 
 pub struct AggregatedBoardServiceImpl {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub heartbeat_interval: Duration,
-    pub keto_recheck_interval: Duration,
+    pub permission_recheck_interval: Duration,
     pub cutover_seen_capacity: usize,
 }
 
@@ -84,6 +84,30 @@ fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
         .ok_or_else(|| Status::unauthenticated("missing auth context"))
+}
+
+fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
+    req.extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+}
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store (see `TENANT_HEADER`).
+async fn tenant_client_for<T>(
+    permission: &PermissionClient,
+    req: &Request<T>,
+) -> Result<PermissionClient, Status> {
+    let tenant = req
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
@@ -112,15 +136,17 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
 
 async fn insert_event_log(
     tx: &mut Transaction<'_, Postgres>,
+    tenant_id: &str,
     aggregated_board_id: Id,
     event_type: &str,
     payload: serde_json::Value,
 ) -> Result<(), Status> {
     sqlx::query(
-        "INSERT INTO event_log (id, aggregated_board_id, event_type, payload, created_at)
-         VALUES ($1, $2, $3, $4::jsonb, now())",
+        "INSERT INTO event_log (id, tenant_id, aggregated_board_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, now())",
     )
     .bind(Id::new())
+    .bind(tenant_id)
     .bind(aggregated_board_id)
     .bind(event_type)
     .bind(payload)
@@ -138,13 +164,15 @@ async fn insert_event_log(
 async fn fetch_ordered_source_ids(
     tx: &mut Transaction<'_, Postgres>,
     aggregated_board_id: Id,
+    tenant_id: &str,
 ) -> Result<Vec<Id>, Status> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources \
-         WHERE aggregated_board_id = $1 \
+         WHERE aggregated_board_id = $1 AND tenant_id = $2 \
          ORDER BY position ASC, added_at ASC",
     )
     .bind(aggregated_board_id)
+    .bind(tenant_id)
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| internal("failed to fetch ordered source board ids", e))?;
@@ -155,14 +183,16 @@ async fn fetch_ordered_source_ids(
 async fn apply_source_order(
     tx: &mut Transaction<'_, Postgres>,
     aggregated_board_id: Id,
+    tenant_id: &str,
     ordered_ids: &[Id],
 ) -> Result<(), Status> {
     for (i, board_id) in ordered_ids.iter().enumerate() {
         sqlx::query(
-            "UPDATE aggregated_board_sources SET position = $3 \
-             WHERE aggregated_board_id = $1 AND board_id = $2",
+            "UPDATE aggregated_board_sources SET position = $4 \
+             WHERE aggregated_board_id = $1 AND tenant_id = $2 AND board_id = $3",
         )
         .bind(aggregated_board_id)
+        .bind(tenant_id)
         .bind(board_id)
         .bind(i as i32)
         .execute(&mut **tx)
@@ -175,17 +205,19 @@ async fn apply_source_order(
 async fn fetch_source_boards(
     pool: &PgPool,
     aggregated_board_id: Id,
+    tenant_id: &str,
 ) -> Result<Vec<SourceBoardRef>, Status> {
     let rows = sqlx::query(
         r#"
         SELECT b.id, b.project_id, b.name, b.icon, s.position
         FROM aggregated_board_sources s
         JOIN boards b ON b.id = s.board_id
-        WHERE s.aggregated_board_id = $1
+        WHERE s.aggregated_board_id = $1 AND s.tenant_id = $2
         ORDER BY s.position ASC, s.added_at ASC
         "#,
     )
     .bind(aggregated_board_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(|e| internal("failed to fetch source boards", e))?;
@@ -209,13 +241,18 @@ async fn fetch_source_boards(
         .collect())
 }
 
-async fn fetch_source_board_ids(pool: &PgPool, aggregated_board_id: Id) -> Result<Vec<Id>, Status> {
+async fn fetch_source_board_ids(
+    pool: &PgPool,
+    aggregated_board_id: Id,
+    tenant_id: &str,
+) -> Result<Vec<Id>, Status> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources
-         WHERE aggregated_board_id = $1
+         WHERE aggregated_board_id = $1 AND tenant_id = $2
          ORDER BY position ASC, added_at ASC",
     )
     .bind(aggregated_board_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(|e| internal("failed to fetch source board ids", e))?;
@@ -223,9 +260,10 @@ async fn fetch_source_board_ids(pool: &PgPool, aggregated_board_id: Id) -> Resul
     Ok(rows.iter().map(|r| r.get::<Id, _>("board_id")).collect())
 }
 
-/// Keep only the board ids that are public or internal.
+/// Keep only the board ids that are public or internal within the tenant.
 async fn fetch_public_internal_board_ids(
     pool: &PgPool,
+    tenant_id: &str,
     board_ids: &[Id],
 ) -> Result<std::collections::HashSet<Id>, Status> {
     if board_ids.is_empty() {
@@ -233,9 +271,10 @@ async fn fetch_public_internal_board_ids(
     }
 
     let rows = sqlx::query(
-        "SELECT id FROM boards WHERE id = ANY($1) AND visibility IN ('public', 'internal')",
+        "SELECT id FROM boards WHERE id = ANY($1) AND tenant_id = $2 AND visibility IN ('public', 'internal')",
     )
     .bind(board_ids)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(|e| internal("failed to fetch source board visibilities", e))?;
@@ -249,6 +288,7 @@ async fn fetch_cards_for_boards(
     pool: &PgPool,
     board_ids: &[Id],
     visible_board_ids: &[Id],
+    tenant_id: &str,
 ) -> Result<Vec<Card>, Status> {
     if board_ids.is_empty() {
         return Ok(vec![]);
@@ -261,10 +301,11 @@ async fn fetch_cards_for_boards(
                 position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                 milestone_id, revision, created_at, updated_at \
          FROM cards \
-         WHERE board_id = ANY($1) \
+         WHERE board_id = ANY($1) AND tenant_id = $2 \
          ORDER BY board_id, column_id, position",
     )
     .bind(board_ids)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(|e| internal("failed to fetch aggregate cards", e))?;
@@ -277,13 +318,13 @@ async fn fetch_cards_for_boards(
             continue;
         }
 
-        let labels = fetch_labels(pool, card_id).await;
-        let assignees = fetch_assignees(pool, card_id).await;
-        let checklist = fetch_checklist(pool, card_id).await;
-        let comments_count = fetch_comments_count(pool, card_id).await;
-        let attachments_count = fetch_attachments_count(pool, card_id).await;
-        let depends_on = fetch_dependencies(pool, card_id).await;
-        let dependents = fetch_dependents(pool, card_id).await;
+        let labels = fetch_labels(pool, card_id, tenant_id).await;
+        let assignees = fetch_assignees(pool, card_id, tenant_id).await;
+        let checklist = fetch_checklist(pool, card_id, tenant_id).await;
+        let comments_count = fetch_comments_count(pool, card_id, tenant_id).await;
+        let attachments_count = fetch_attachments_count(pool, card_id, tenant_id).await;
+        let depends_on = fetch_dependencies(pool, card_id, tenant_id).await;
+        let dependents = fetch_dependents(pool, card_id, tenant_id).await;
 
         cards.push(card_from_row(
             row,
@@ -343,31 +384,20 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
     }
 }
 
-fn revalidate_token(auth: &AuthContext) -> Result<bool, Status> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    if let Some(exp) = auth.exp
-        && exp < now_secs
-    {
-        return Ok(false);
-    }
-
+fn revalidate_token(_auth: &AuthContext) -> Result<bool, Status> {
     Ok(true)
 }
 
-async fn revalidate_keto(
-    keto: &KetoClient,
+async fn revalidate_permission(
+    permission: &PermissionClient,
     auth: &AuthContext,
     aggregated_board_id: &str,
 ) -> Result<bool, Status> {
     let subject = auth.subject.as_deref().unwrap_or("");
-    keto.check_permission_with_retry(KETO_NS, aggregated_board_id, "view", subject)
+    permission.check_permission_with_retry(PERMISSION_TYPE, aggregated_board_id, "view", subject)
         .await
         .map_err(|e| {
-            warn!(aggregated_board_id, subject, error = %e, "aggregate stream: Keto recheck failed");
+            warn!(aggregated_board_id, subject, error = %e, "aggregate stream: permission recheck failed");
             Status::internal("authorization check failed")
         })
 }
@@ -385,6 +415,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<CreateAggregatedBoardRequest>,
     ) -> Result<Response<CreateAggregatedBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
 
         if req.name.is_empty() {
@@ -401,11 +433,12 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .map_err(|e| internal("failed to begin transaction", e))?;
 
         let row = sqlx::query(
-            "INSERT INTO aggregated_boards (id, name, description, icon, visibility, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO aggregated_boards (id, tenant_id, name, description, icon, visibility, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              RETURNING id, name, description, icon, visibility, created_at, updated_at",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .bind(&req.name)
         .bind(&req.description)
         .bind(&req.icon)
@@ -421,10 +454,11 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 .parse::<Id>()
                 .map_err(|_| Status::invalid_argument("invalid source_board_id"))?;
             sqlx::query(
-                "INSERT INTO aggregated_board_sources (aggregated_board_id, board_id, position) \
-                 VALUES ($1, $2, $3)",
+                "INSERT INTO aggregated_board_sources (aggregated_board_id, tenant_id, board_id, position) \
+                 VALUES ($1, $2, $3, $4)",
             )
             .bind(aggregated_board_id)
+            .bind(&tenant_id)
             .bind(board_id)
             .bind(position as i32)
             .execute(&mut *tx)
@@ -432,24 +466,35 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .map_err(|e| internal("failed to insert source board", e))?;
         }
 
-        // Keto FIRST: owner tuple.
-        self.keto
-            .grant_with_retry(KETO_NS, &aggregated_board_id.to_string(), "owner", &subject)
+        // Permission backend FIRST: owner tuple.
+        permission
+            .grant_with_retry(
+                PERMISSION_TYPE,
+                &aggregated_board_id.to_string(),
+                "owner",
+                &subject,
+            )
             .await
-            .map_err(|e| internal("failed to write Keto owner tuple", e))?;
+            .map_err(|e| internal("failed to write owner tuple to the permission backend", e))?;
 
-        // Also write a view tuple so ListAggregatedBoards sees it.
-        self.keto
-            .grant_with_retry(KETO_NS, &aggregated_board_id.to_string(), "view", &subject)
+        // Also write a viewer tuple so ListAggregatedBoards sees it.
+        permission
+            .grant_with_retry(
+                PERMISSION_TYPE,
+                &aggregated_board_id.to_string(),
+                "viewer",
+                &subject,
+            )
             .await
-            .map_err(|e| internal("failed to write Keto view tuple", e))?;
+            .map_err(|e| internal("failed to write viewer tuple to the permission backend", e))?;
 
-        // Mirror member row (best-effort after Keto).
+        // Mirror member row (best-effort after the permission write).
         if let Err(e) = sqlx::query(
-            "INSERT INTO aggregated_board_members (aggregated_board_id, subject, relation) \
-             VALUES ($1, $2, 'owner') ON CONFLICT DO NOTHING",
+            "INSERT INTO aggregated_board_members (aggregated_board_id, tenant_id, subject, relation) \
+             VALUES ($1, $2, $3, 'owner') ON CONFLICT DO NOTHING",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .bind(&subject)
         .execute(&mut *tx)
         .await
@@ -457,12 +502,13 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             warn!(
                 error = %e,
                 aggregated_board_id = %aggregated_board_id,
-                "mirror_drift: Keto owner tuple written but aggregated_board_members insert failed"
+                "mirror_drift: owner tuple written to the permission backend but aggregated_board_members insert failed"
             );
         }
 
         insert_event_log(
             &mut tx,
+            &tenant_id,
             aggregated_board_id,
             "AggregatedBoardCreated",
             serde_json::json!({ "aggregated_board_id": aggregated_board_id.to_string() }),
@@ -475,8 +521,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         if !req.idempotency_key.is_empty()
             && let Err(e) = sqlx::query(
-                "INSERT INTO idempotency_keys (key, response_card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO idempotency_keys (tenant_id, key, response_card_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
             )
+            .bind(&tenant_id)
             .bind(&req.idempotency_key)
             .bind(aggregated_board_id)
             .execute(&self.pool)
@@ -496,6 +543,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<GetAggregatedBoardRequest>,
     ) -> Result<Response<Self::GetAggregatedBoardStream>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
         let req = request.into_inner();
         let aggregated_board_id = req
             .aggregated_board_id
@@ -504,9 +553,10 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
-             FROM aggregated_boards WHERE id = $1",
+             FROM aggregated_boards WHERE id = $1 AND tenant_id = $2",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch aggregated board", e))?
@@ -514,10 +564,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let aggregate_visibility: String = row.get("visibility");
         if !is_public_or_internal(&aggregate_visibility) {
-            let allowed = self
-                .keto
+            let allowed = permission
                 .check_permission_with_retry(
-                    KETO_NS,
+                    PERMISSION_TYPE,
                     &aggregated_board_id.to_string(),
                     "view",
                     &subject,
@@ -532,28 +581,29 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         }
 
         let metadata = aggregated_board_from_row(&row);
-        let source_boards = fetch_source_boards(&self.pool, aggregated_board_id).await?;
+        let source_boards =
+            fetch_source_boards(&self.pool, aggregated_board_id, &tenant_id).await?;
         let board_ids: Vec<Id> = source_boards
             .iter()
             .filter_map(|s| s.board_id.parse::<Id>().ok())
             .collect();
 
         // Source boards are visible if public/internal or if private and the
-        // caller has an explicit Keto view relation.
+        // caller has an explicit view relation in the permission backend.
         let allowed_private_ids = expand_objects(
-            &self.keto,
+            &permission,
             ExpandQuery {
                 namespace: "KanbanBoard",
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             10_000,
         )
         .await
-        .map_err(|e| internal("keto expand failed", e))?;
+        .map_err(|e| internal("permission expand failed", e))?;
 
-        let public_internal_ids = fetch_public_internal_board_ids(&self.pool, &board_ids).await?;
+        let public_internal_ids =
+            fetch_public_internal_board_ids(&self.pool, &tenant_id, &board_ids).await?;
 
         let allowed_source_ids: std::collections::HashSet<Id> = board_ids
             .iter()
@@ -565,7 +615,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let visible_board_ids: Vec<Id> = allowed_source_ids.iter().copied().collect();
 
-        let cards = fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_ids).await?;
+        let cards =
+            fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_ids, &tenant_id).await?;
 
         let mut chunks: Vec<AggregatedBoardChunk> = Vec::new();
         chunks.push(AggregatedBoardChunk {
@@ -622,6 +673,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<UpdateAggregatedBoardRequest>,
     ) -> Result<Response<UpdateAggregatedBoardResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -639,9 +691,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         if visibility_change {
             let allowed = self
-                .keto
+                .permission
                 .check_permission_with_retry(
-                    KETO_NS,
+                    PERMISSION_TYPE,
                     &aggregated_board_id.to_string(),
                     "manage",
                     &subject,
@@ -670,7 +722,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 icon        = CASE WHEN $4 != '' THEN $4 ELSE icon END, \
                 visibility  = CASE WHEN $5::boolean THEN $6 ELSE visibility END, \
                 updated_at  = now() \
-             WHERE id = $1 \
+             WHERE id = $1 AND tenant_id = $7 \
              RETURNING id, name, description, icon, visibility, created_at, updated_at",
         )
         .bind(aggregated_board_id)
@@ -679,6 +731,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .bind(&patch.icon)
         .bind(visibility_change)
         .bind(new_visibility)
+        .bind(&tenant_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update aggregated board", e))?
@@ -686,6 +739,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         insert_event_log(
             &mut tx,
+            &tenant_id,
             aggregated_board_id,
             "AggregatedBoardUpdated",
             serde_json::json!({ "aggregated_board_id": aggregated_board_id.to_string() }),
@@ -706,13 +760,15 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<DeleteAggregatedBoardRequest>,
     ) -> Result<Response<DeleteAggregatedBoardResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
             .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
 
-        let result = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1")
+        let result = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1 AND tenant_id = $2")
             .bind(aggregated_board_id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| internal("failed to delete aggregated board", e))?;
@@ -723,7 +779,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         warn!(
             aggregated_board_id = %aggregated_board_id,
-            "delete_aggregated_board: Keto tuple cleanup is best-effort; reconciler will catch any drift"
+            "delete_aggregated_board: permission tuple cleanup is best-effort; reconciler will catch any drift"
         );
 
         Ok(Response::new(DeleteAggregatedBoardResponse {}))
@@ -735,26 +791,29 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         request: Request<ListAggregatedBoardsRequest>,
     ) -> Result<Response<ListAggregatedBoardsResponse>, Status> {
         let subject = subject_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&request)?;
+        let permission = tenant_client_for(&self.permission, &request).await?;
 
-        // Public/internal aggregates are visible to any authenticated user;
-        // private aggregates require an explicit Keto view relation.
+        // Public/internal aggregates are visible to any authenticated user in the
+        // tenant; private aggregates require an explicit view relation in the
+        // permission backend.
         let allowed_private_ids = expand_objects(
-            &self.keto,
+            &permission,
             ExpandQuery {
-                namespace: KETO_NS,
+                namespace: PERMISSION_TYPE,
                 relation: "view",
                 subject: &subject,
-                max_page_size: 256,
             },
             MAX_AGGREGATES,
         )
         .await
-        .map_err(|e| internal("keto expand failed", e))?;
+        .map_err(|e| internal("permission expand failed", e))?;
 
         let rows = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
-             FROM aggregated_boards ORDER BY created_at ASC",
+             FROM aggregated_boards WHERE tenant_id = $1 ORDER BY created_at ASC",
         )
+        .bind(&tenant_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| internal("failed to list aggregated boards", e))?;
@@ -779,6 +838,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<AddSourceBoardRequest>,
     ) -> Result<Response<AddSourceBoardResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -801,9 +861,11 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             req.position
         } else {
             let count_row = sqlx::query(
-                "SELECT COUNT(*) AS cnt FROM aggregated_board_sources WHERE aggregated_board_id = $1",
+                "SELECT COUNT(*) AS cnt FROM aggregated_board_sources \
+                 WHERE aggregated_board_id = $1 AND tenant_id = $2",
             )
             .bind(aggregated_board_id)
+            .bind(&tenant_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to count source boards", e))?;
@@ -816,20 +878,22 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         sqlx::query(
             "UPDATE aggregated_board_sources \
              SET position = position + 1 \
-             WHERE aggregated_board_id = $1 AND position >= $2",
+             WHERE aggregated_board_id = $1 AND tenant_id = $2 AND position >= $3",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .bind(position)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal("failed to shift source board positions", e))?;
 
         sqlx::query(
-            "INSERT INTO aggregated_board_sources (aggregated_board_id, board_id, position) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO aggregated_board_sources (aggregated_board_id, tenant_id, board_id, position) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (aggregated_board_id, board_id) DO UPDATE SET position = EXCLUDED.position",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .bind(board_id)
         .bind(position)
         .execute(&mut *tx)
@@ -838,11 +902,12 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         // Normalise after an upsert so positions stay contiguous and reflect
         // the requested insertion point.
-        let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id).await?;
-        apply_source_order(&mut tx, aggregated_board_id, &ordered).await?;
+        let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id, &tenant_id).await?;
+        apply_source_order(&mut tx, aggregated_board_id, &tenant_id, &ordered).await?;
 
         insert_event_log(
             &mut tx,
+            &tenant_id,
             aggregated_board_id,
             "SourceBoardAdded",
             serde_json::json!({
@@ -856,7 +921,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        let aggregated_board = self
+            .get_aggregate_metadata(aggregated_board_id, &tenant_id)
+            .await?;
         Ok(Response::new(AddSourceBoardResponse {
             aggregated_board: Some(aggregated_board),
         }))
@@ -867,6 +934,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<RemoveSourceBoardRequest>,
     ) -> Result<Response<RemoveSourceBoardResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -886,20 +954,22 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         sqlx::query(
             "DELETE FROM aggregated_board_sources \
-             WHERE aggregated_board_id = $1 AND board_id = $2",
+             WHERE aggregated_board_id = $1 AND tenant_id = $2 AND board_id = $3",
         )
         .bind(aggregated_board_id)
+        .bind(&tenant_id)
         .bind(board_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal("failed to remove source board", e))?;
 
         // Keep positions contiguous after removal.
-        let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id).await?;
-        apply_source_order(&mut tx, aggregated_board_id, &ordered).await?;
+        let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id, &tenant_id).await?;
+        apply_source_order(&mut tx, aggregated_board_id, &tenant_id, &ordered).await?;
 
         insert_event_log(
             &mut tx,
+            &tenant_id,
             aggregated_board_id,
             "SourceBoardRemoved",
             serde_json::json!({
@@ -913,7 +983,9 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        let aggregated_board = self
+            .get_aggregate_metadata(aggregated_board_id, &tenant_id)
+            .await?;
         Ok(Response::new(RemoveSourceBoardResponse {
             aggregated_board: Some(aggregated_board),
         }))
@@ -924,6 +996,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         &self,
         request: Request<MoveSourceBoardRequest>,
     ) -> Result<Response<MoveSourceBoardResponse>, Status> {
+        let tenant_id = tenant_id_from_request(&request)?;
         let object_id = checked_object_id(&request)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
@@ -943,7 +1016,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         // Reorder in-memory and write contiguous positions back. For v1 we
         // accept the small race window; advisory locks are not used.
-        let mut ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id).await?;
+        let mut ordered =
+            fetch_ordered_source_ids(&mut tx, aggregated_board_id, &tenant_id).await?;
         let current_idx = ordered
             .iter()
             .position(|&id| id == board_id)
@@ -951,13 +1025,15 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let board_id_moved = ordered.remove(current_idx);
         let target_idx = (req.to_position as usize).min(ordered.len());
         ordered.insert(target_idx, board_id_moved);
-        apply_source_order(&mut tx, aggregated_board_id, &ordered).await?;
+        apply_source_order(&mut tx, aggregated_board_id, &tenant_id, &ordered).await?;
 
         tx.commit()
             .await
             .map_err(|e| internal("failed to commit transaction", e))?;
 
-        let aggregated_board = self.get_aggregate_metadata(aggregated_board_id).await?;
+        let aggregated_board = self
+            .get_aggregate_metadata(aggregated_board_id, &tenant_id)
+            .await?;
         Ok(Response::new(MoveSourceBoardResponse {
             aggregated_board: Some(aggregated_board),
         }))
@@ -973,20 +1049,26 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .get::<AuthContext>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("missing auth context"))?;
+        let tenant_id = auth
+            .tenant_id
+            .clone()
+            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
         let req = request.into_inner();
         let aggregated_board_id = req.aggregated_board_id;
 
-        let visibility: String =
-            sqlx::query_scalar("SELECT visibility FROM aggregated_boards WHERE id = $1")
-                .bind(
-                    aggregated_board_id
-                        .parse::<Id>()
-                        .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
-                )
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch aggregated board visibility", e))?
-                .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+        let visibility: String = sqlx::query_scalar(
+            "SELECT visibility FROM aggregated_boards WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(
+            aggregated_board_id
+                .parse::<Id>()
+                .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
+        )
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch aggregated board visibility", e))?
+        .ok_or_else(|| Status::not_found("aggregated board not found"))?;
 
         let is_private = !is_public_or_internal(&visibility);
 
@@ -995,21 +1077,31 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             aggregated_board_id
                 .parse::<Id>()
                 .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
+            &tenant_id,
         )
         .await?;
 
         let registry = Arc::clone(&self.registry);
-        let keto = Arc::clone(&self.keto);
+        let tenant = auth
+            .tenant_id
+            .clone()
+            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        let permission = Arc::new(
+            self.permission
+                .tenant_client(&tenant)
+                .await
+                .map_err(|e| internal("failed to build tenant permission client", e))?,
+        );
 
         let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
             registry,
-            keto,
+            permission,
             auth,
             aggregated_board_id,
             source_board_ids,
             is_private,
             heartbeat_interval: self.heartbeat_interval,
-            keto_recheck_interval: self.keto_recheck_interval,
+            permission_recheck_interval: self.permission_recheck_interval,
             cutover_seen_capacity: self.cutover_seen_capacity,
         })
         .await?;
@@ -1024,12 +1116,14 @@ impl AggregatedBoardServiceImpl {
     async fn get_aggregate_metadata(
         &self,
         aggregated_board_id: Id,
+        tenant_id: &str,
     ) -> Result<AggregatedBoard, Status> {
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
-             FROM aggregated_boards WHERE id = $1",
+             FROM aggregated_boards WHERE id = $1 AND tenant_id = $2",
         )
         .bind(aggregated_board_id)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch aggregated board", e))?
@@ -1044,13 +1138,13 @@ impl AggregatedBoardServiceImpl {
 /// Configuration passed to `build_subscribe_aggregated_board_stream`.
 pub struct SubscribeAggregatedBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub auth: AuthContext,
     pub aggregated_board_id: String,
     pub source_board_ids: Vec<Id>,
     pub is_private: bool,
     pub heartbeat_interval: Duration,
-    pub keto_recheck_interval: Duration,
+    pub permission_recheck_interval: Duration,
     pub cutover_seen_capacity: usize,
 }
 
@@ -1059,13 +1153,13 @@ pub async fn build_subscribe_aggregated_board_stream(
 ) -> Result<SubscribeAggregatedBoardStream, Status> {
     let SubscribeAggregatedBoardArgs {
         registry,
-        keto,
+        permission,
         auth,
         aggregated_board_id,
         source_board_ids,
         is_private,
         heartbeat_interval,
-        keto_recheck_interval,
+        permission_recheck_interval,
         cutover_seen_capacity,
     } = args;
 
@@ -1132,7 +1226,7 @@ pub async fn build_subscribe_aggregated_board_stream(
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
 
-        let mut last_keto_recheck = Instant::now();
+        let mut last_permission_recheck = Instant::now();
 
         loop {
             match revalidate_token(&auth) {
@@ -1147,8 +1241,8 @@ pub async fn build_subscribe_aggregated_board_stream(
                 }
             }
 
-            if is_private && last_keto_recheck.elapsed() >= keto_recheck_interval {
-                match revalidate_keto(&keto, &auth, &aggregated_board_id).await {
+            if is_private && last_permission_recheck.elapsed() >= permission_recheck_interval {
+                match revalidate_permission(&permission, &auth, &aggregated_board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
                         yield Err(Status::permission_denied("permission revoked mid-stream"));
@@ -1159,7 +1253,7 @@ pub async fn build_subscribe_aggregated_board_stream(
                         break;
                     }
                 }
-                last_keto_recheck = Instant::now();
+                last_permission_recheck = Instant::now();
             }
 
             tokio::select! {
@@ -1207,7 +1301,8 @@ mod tests {
         let mut req = Request::new(body);
         req.extensions_mut()
             .insert(sunbeam_g2v::middleware::auth::AuthContext::authenticated(
-                subject, None,
+                crate::test_support::test_tenant_id(),
+                subject,
             ));
         req
     }
@@ -1226,10 +1321,10 @@ mod tests {
         ));
         AggregatedBoardServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
-            keto_recheck_interval: Duration::from_millis(30_000),
+            permission_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
         }
     }
@@ -1241,10 +1336,10 @@ mod tests {
         ));
         BoardServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
-            keto_recheck_interval: Duration::from_millis(30_000),
+            permission_recheck_interval: Duration::from_millis(30_000),
             cutover_seen_capacity: 1024,
         }
     }
@@ -1252,17 +1347,19 @@ mod tests {
     fn make_card_service(infra: &containers::TestInfra) -> CardServiceImpl {
         CardServiceImpl {
             pool: infra.pool.clone(),
-            keto: Arc::clone(&infra.keto),
+            permission: Arc::clone(&infra.permission),
         }
     }
 
     async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Id {
         let pid = Id::new();
         let slug = format!("tp-{}", &pid.to_string()[18..26]);
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO projects (id, name, slug, description, owner_id) VALUES ($1, $2, $3, '', $4)",
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id) VALUES ($1, $2, $3, $4, '', $5)",
         )
         .bind(pid)
+        .bind(tenant_id)
         .bind(format!("Test Project {pid}"))
         .bind(&slug)
         .bind(subject)
@@ -1273,14 +1370,18 @@ mod tests {
     }
 
     async fn cleanup_project(pool: &sqlx::PgPool, project_id: Id) {
-        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+        let tenant_id = crate::test_support::test_tenant_id();
+        let _ = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
             .bind(project_id)
             .execute(pool)
             .await;
     }
 
     async fn cleanup_aggregated_board(pool: &sqlx::PgPool, aggregated_board_id: Id) {
-        let _ = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1")
+        let tenant_id = crate::test_support::test_tenant_id();
+        let _ = sqlx::query("DELETE FROM aggregated_boards WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
             .bind(aggregated_board_id)
             .execute(pool)
             .await;
@@ -1330,19 +1431,22 @@ mod tests {
             .expect("board missing");
         let board_id = board.id.parse::<Id>().expect("board id is ulid");
 
-        // BoardService only writes the parent tuple; test Keto does not evaluate
-        // derived permissions, so grant the creator an explicit view tuple.
-        svc.keto
-            .grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
+        // BoardService only writes the parent tuple; grant the creator an
+        // explicit viewer role so reads do not depend on the parent chain.
+        svc.permission
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "viewer", subject)
             .await
-            .expect("grant board view failed");
+            .expect("grant board viewer failed");
 
         // BoardService does not create a default column; add one directly so
         // card creation tests have a target column.
+        let tenant_id = crate::test_support::test_tenant_id();
         sqlx::query(
-            "INSERT INTO columns (id, board_id, title, position) VALUES ($1, $2, 'todo', 0)",
+            "INSERT INTO columns (id, tenant_id, board_id, title, position) \
+             VALUES ($1, $2, $3, 'todo', 0)",
         )
         .bind(Id::new())
+        .bind(tenant_id)
         .bind(board_id)
         .execute(&svc.pool)
         .await
@@ -1351,15 +1455,15 @@ mod tests {
         board_id
     }
 
-    /// Grant an explicit `view` tuple on a board in tests.
+    /// Grant an explicit `viewer` role on a board in tests.
     ///
-    /// The Keto instance used in tests does not evaluate derived permissions,
-    /// so tests that read a board must grant `view` directly instead of relying
-    /// on the project parent.
-    async fn grant_board_view(keto: &KetoClient, board_id: Id, subject: &str) {
-        keto.grant_with_retry("KanbanBoard", &board_id.to_string(), "view", subject)
+    /// Board reads normally compute `view` from the parent project; tests
+    /// grant the role directly so they do not depend on the parent chain.
+    async fn grant_board_view(permission: &PermissionClient, board_id: Id, subject: &str) {
+        permission
+            .grant_with_retry("KanbanBoard", &board_id.to_string(), "viewer", subject)
             .await
-            .expect("grant board view failed");
+            .expect("grant board viewer failed");
     }
 
     /// Drain a `GetAggregatedBoard` stream into a vector of chunks.
@@ -1633,7 +1737,7 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
         let project_id = create_test_project(&infra.pool, &subject).await;
         let board_id = create_source_board(&board_svc, project_id, "Cards Board", &subject).await;
-        grant_board_view(&infra.keto, board_id, &subject).await;
+        grant_board_view(&infra.permission, board_id, &subject).await;
 
         // Find the default column created by BoardService.
         let board_detail = board_svc
@@ -1751,7 +1855,7 @@ mod tests {
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
-        // ListAggregatedBoards performs its own Keto expansion; a subject with
+        // ListAggregatedBoards performs its own permission expansion; a subject with
         // no tuples should see nothing even though the service is called
         // directly (no middleware gating this RPC in tests).
         let list = agg_svc
@@ -1936,12 +2040,12 @@ mod tests {
             .aggregated_board
             .expect("aggregated_board missing");
 
-        // Grant one stranger explicit view on the private aggregate.
+        // Grant one stranger explicit viewer on the private aggregate.
         infra
-            .keto
-            .grant_with_retry(KETO_NS, &private_agg.id, "view", &viewer)
+            .permission
+            .grant_with_retry(PERMISSION_TYPE, &private_agg.id, "viewer", &viewer)
             .await
-            .expect("grant view failed");
+            .expect("grant viewer failed");
 
         let list = agg_svc
             .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &viewer))
@@ -2023,17 +2127,17 @@ mod tests {
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
-        // Grant edit (middleware) and manage (handler-level visibility check).
+        // Grant editor (middleware) and admin (handler-level visibility check).
         infra
-            .keto
-            .grant_with_retry(KETO_NS, &agg_id, "edit", &owner)
+            .permission
+            .grant_with_retry(PERMISSION_TYPE, &agg_id, "editor", &owner)
             .await
-            .expect("grant edit failed");
+            .expect("grant editor failed");
         infra
-            .keto
-            .grant_with_retry(KETO_NS, &agg_id, "manage", &owner)
+            .permission
+            .grant_with_retry(PERMISSION_TYPE, &agg_id, "admin", &owner)
             .await
-            .expect("grant manage failed");
+            .expect("grant admin failed");
 
         let updated = agg_svc
             .update_aggregated_board(authed_request_with_object(
@@ -2266,12 +2370,15 @@ mod tests {
             .await
             .expect("delete failed");
 
-        let count: i64 = sqlx::query("SELECT COUNT(*) FROM aggregated_boards WHERE id = $1")
-            .bind(created.id.parse::<Id>().unwrap())
-            .fetch_one(&infra.pool)
-            .await
-            .unwrap()
-            .get(0);
+        let tenant_id = crate::test_support::test_tenant_id();
+        let count: i64 =
+            sqlx::query("SELECT COUNT(*) FROM aggregated_boards WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(created.id.parse::<Id>().unwrap())
+                .fetch_one(&infra.pool)
+                .await
+                .unwrap()
+                .get(0);
         assert_eq!(count, 0, "aggregated board must be deleted");
     }
 
@@ -2320,12 +2427,12 @@ mod tests {
             .aggregated_board
             .expect("aggregated_board missing");
 
-        // Grant edit so the update request passes middleware.
+        // Grant editor so the update request passes middleware.
         infra
-            .keto
-            .grant_with_retry(KETO_NS, &created.id, "edit", &owner)
+            .permission
+            .grant_with_retry(PERMISSION_TYPE, &created.id, "editor", &owner)
             .await
-            .expect("grant edit failed");
+            .expect("grant editor failed");
 
         let updated = agg_svc
             .update_aggregated_board(authed_request_with_object(
@@ -2387,12 +2494,12 @@ mod tests {
             .aggregated_board
             .expect("aggregated_board missing");
 
-        // Grant view so the subscribe request passes the middleware check.
+        // Grant viewer so the subscribe request passes the middleware check.
         infra
-            .keto
-            .grant_with_retry(KETO_NS, &created.id, "view", &owner)
+            .permission
+            .grant_with_retry(PERMISSION_TYPE, &created.id, "viewer", &owner)
             .await
-            .expect("grant view failed");
+            .expect("grant viewer failed");
 
         let mut req = Request::new(SubscribeAggregatedBoardRequest {
             aggregated_board_id: created.id.clone(),
@@ -2400,7 +2507,8 @@ mod tests {
         });
         req.extensions_mut()
             .insert(sunbeam_g2v::middleware::auth::AuthContext::authenticated(
-                &owner, None,
+                crate::test_support::test_tenant_id(),
+                &owner,
             ));
 
         let mut stream = agg_svc
@@ -2450,13 +2558,16 @@ mod tests {
 
         let stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
             registry,
-            keto: Arc::clone(&infra.keto),
-            auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(&owner, None),
+            permission: Arc::clone(&infra.permission),
+            auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(
+                crate::test_support::test_tenant_id(),
+                &owner,
+            ),
             aggregated_board_id: Id::new().to_string(),
             source_board_ids: vec![board_id],
             is_private: false,
             heartbeat_interval: Duration::from_millis(10),
-            keto_recheck_interval: Duration::from_millis(100),
+            permission_recheck_interval: Duration::from_millis(100),
             cutover_seen_capacity: 16,
         })
         .await

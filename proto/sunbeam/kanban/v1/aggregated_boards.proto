@@ -6,9 +6,9 @@
 // delegated to the existing BoardService / CardService RPCs against the
 // source board carried in each card/column.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are performed by
-// the kanban-local `keto_dispatch` middleware. Object IDs come from the
-// `x-sunbeam-object-id` header; see `keto_dispatch.rs` for the mapping.
+// Auth: every RPC requires a valid bearer token. Permission checks are performed by
+// the kanban-local `permission_dispatch` middleware. Object IDs come from the
+// `x-sunbeam-object-id` header; see `permission_dispatch.rs` for the mapping.
 
 syntax = "proto3";
 
@@ -178,7 +178,7 @@ message SubscribeAggregatedBoardResponse {
 // call BoardService / CardService using the source board_id carried in each
 // card/column.
 service AggregatedBoardService {
-  // CreateAggregatedBoard requires a valid bearer token; no prior Keto object.
+  // CreateAggregatedBoard requires a valid bearer token; no prior permission object.
   rpc CreateAggregatedBoard(CreateAggregatedBoardRequest) returns (CreateAggregatedBoardResponse);
 
   // GetAggregatedBoard streams metadata, source boards, columns, and card
@@ -193,7 +193,7 @@ service AggregatedBoardService {
   rpc DeleteAggregatedBoard(DeleteAggregatedBoardRequest) returns (DeleteAggregatedBoardResponse);
 
   // ListAggregatedBoards returns aggregates the caller can view, post-filtered
-  // via keto_expand_objects(KanbanAggregatedBoard, view, subject).
+  // via permission_expand_objects(KanbanAggregatedBoard, view, subject).
   rpc ListAggregatedBoards(ListAggregatedBoardsRequest) returns (ListAggregatedBoardsResponse);
 
   // AddSourceBoard includes a board in the aggregate.

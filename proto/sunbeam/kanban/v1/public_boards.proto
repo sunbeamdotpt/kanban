@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Sunbeam Kanban — Public read-only board access.
 //
-// These RPCs are intentionally NOT protected by JwtLayer or keto_dispatch.
+// These RPCs are intentionally NOT protected by JwtLayer or permission_dispatch.
 // They are mounted on a separate Axum router so unauthenticated clients can
 // read public boards. Every handler must verify that the requested board's
 // visibility is exactly PUBLIC before returning it.
@@ -36,6 +36,10 @@ message ListPublicBoardsResponse {
 //
 // These RPCs do not require a bearer token. Callers must not send credentials
 // expecting them to be honoured; the routes skip the auth middleware stack.
+//
+// Public boards are scoped by their unique board/project IDs; the requests do
+// not carry a tenant_id. This keeps public URLs tenant-agnostic while relying
+// on random ULID identifiers to prevent cross-tenant collisions.
 service PublicBoardService {
   // GetPublicBoard returns a board only if its visibility is PUBLIC.
   rpc GetPublicBoard(GetPublicBoardRequest) returns (GetPublicBoardResponse);

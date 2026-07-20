@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::auth::permission_client::PermissionClient;
 use crate::integrations::opensearch::OpenSearchClient;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
 
 /// Shared resources available to startup migrations.
 #[derive(Clone, Debug)]
 pub struct MigrationContext {
     pub pool: PgPool,
-    pub keto: Arc<KetoClient>,
+    pub permission: Arc<PermissionClient>,
     pub opensearch: Arc<OpenSearchClient>,
     pub opensearch_index_name: String,
 }
@@ -20,13 +20,13 @@ pub struct MigrationContext {
 impl MigrationContext {
     pub fn new(
         pool: PgPool,
-        keto: Arc<KetoClient>,
+        permission: Arc<PermissionClient>,
         opensearch: Arc<OpenSearchClient>,
         opensearch_index_name: String,
     ) -> Self {
         Self {
             pool,
-            keto,
+            permission,
             opensearch,
             opensearch_index_name,
         }

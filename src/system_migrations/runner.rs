@@ -137,12 +137,7 @@ mod tests {
 
         let ctx = MigrationContext::new(
             pool.clone(),
-            Arc::new(sunbeam_g2v::middleware::auth::keto::KetoClient::new(
-                sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                    grpc_endpoint: "http://localhost:4466".to_string(),
-                    write_grpc_endpoint: "http://localhost:4467".to_string(),
-                },
-            )),
+            crate::test_support::setup_permission().await,
             Arc::new(crate::integrations::opensearch::OpenSearchClient::new(
                 crate::integrations::opensearch::OpenSearchConfig {
                     url: "http://localhost:9200".to_string(),

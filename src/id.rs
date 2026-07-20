@@ -150,6 +150,34 @@ fn format_uuid(value: u128) -> String {
     )
 }
 
+impl sqlx::Type<sqlx::Postgres> for Id {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("TEXT")
+    }
+}
+
+impl sqlx::postgres::PgHasArrayType for Id {
+    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_name("TEXT[]")
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Postgres> for Id {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <String as sqlx::Encode<sqlx::Postgres>>::encode(self.to_string(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Id {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        s.parse::<Id>().map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,33 +210,5 @@ mod tests {
         assert!(Id::is_ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(!Id::is_ulid("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!Id::is_ulid("short"));
-    }
-}
-
-impl sqlx::Type<sqlx::Postgres> for Id {
-    fn type_info() -> sqlx::postgres::PgTypeInfo {
-        sqlx::postgres::PgTypeInfo::with_name("TEXT")
-    }
-}
-
-impl sqlx::postgres::PgHasArrayType for Id {
-    fn array_type_info() -> sqlx::postgres::PgTypeInfo {
-        sqlx::postgres::PgTypeInfo::with_name("TEXT[]")
-    }
-}
-
-impl<'q> sqlx::Encode<'q, sqlx::Postgres> for Id {
-    fn encode_by_ref(
-        &self,
-        buf: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <String as sqlx::Encode<sqlx::Postgres>>::encode(self.to_string(), buf)
-    }
-}
-
-impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Id {
-    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
-        let s = <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
-        s.parse::<Id>().map_err(Into::into)
     }
 }

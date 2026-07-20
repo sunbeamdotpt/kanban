@@ -364,9 +364,9 @@ message ListCommentsResponse {
 
 // CardService manages cards, checklists, assignments, comments, and dependencies.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are performed
-// by the kanban-local `keto_dispatch` middleware defined in
-// `apps/kanban/src/auth/keto_dispatch.rs`. The Keto object for each RPC is
+// Auth: every RPC requires a valid bearer token. Permission checks are performed
+// by the kanban-local `permission_dispatch` middleware defined in
+// `apps/kanban/src/auth/permission_dispatch.rs`. The permission object for each RPC is
 // the card's parent KanbanBoard; the object id is provided via the
 // `x-sunbeam-object-id` request header. See the dispatch matrix for the
 // authoritative relation per RPC.

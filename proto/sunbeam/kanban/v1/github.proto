@@ -6,9 +6,9 @@
 // on the kanban service. State sync is display-only in v1; auto-status
 // updates are a v2 follow-up.
 //
-// Auth: every RPC requires a valid bearer token. Keto checks are performed by
-// the kanban-local `keto_dispatch` middleware. Object-id source is card_id or
-// link_id via `x-sunbeam-object-id`; see keto_dispatch.rs for details.
+// Auth: every RPC requires a valid bearer token. Permission checks are performed by
+// the kanban-local `permission_dispatch` middleware. Object-id source is card_id or
+// link_id via `x-sunbeam-object-id`; see permission_dispatch.rs for details.
 
 syntax = "proto3";
 
@@ -131,7 +131,7 @@ message ResyncLinkResponse {
 // automatic webhook-driven sync is a v2 item.
 //
 // Auth: every RPC requires a valid bearer token. Link/Unlink requires "edit"
-// on the card's board. List/Search/Resync requires "view". See keto_dispatch.rs.
+// on the card's board. List/Search/Resync requires "view". See permission_dispatch.rs.
 service GithubLinkService {
   // LinkIssue creates a GitHubLink between a card and a GitHub issue/PR.
   // Performs an initial sync of title/state from GitHub on creation.
