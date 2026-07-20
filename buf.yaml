@@ -4,9 +4,9 @@ modules:
   - path: proto
     name: buf.build/sunbeamdotpt/kanban
     excludes:
-      # Vendored Ory Keto protos; kept for the Rust tonic-prost build but not
-      # part of the published Sunbeam Kanban module.
-      - proto/ory
+      # IAM is provided by buf.build/sunbeamdotpt/sso-gateway and is not
+      # published here.
+      - proto/iam
 lint:
   use:
     - STANDARD

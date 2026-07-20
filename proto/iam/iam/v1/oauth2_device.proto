@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package iam.v1;
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// DeviceAuthorizationRequest initiates an OAuth 2.0 Device Authorization Grant
+// (RFC 8628) on behalf of a client.
+message DeviceAuthorizationRequest {
+  // OAuth2 client identifier.
+  string client_id = 1;
+  // OAuth2 scopes requested by the device.
+  repeated string scope = 2;
+}
+
+// DeviceAuthorizationResponse contains the information needed to display the
+// user code and verification URI on a constrained device.
+message DeviceAuthorizationResponse {
+  // Device verification code.
+  string device_code = 1;
+  // Short user-facing code to be entered on the authorization server.
+  string user_code = 2;
+  // URI where the user enters the user code.
+  string verification_uri = 3;
+  // Optional URI that already embeds the user code.
+  string verification_uri_complete = 4;
+  // Lifetime of the device_code and user_code in seconds.
+  int32 expires_in = 5;
+  // Minimum polling interval in seconds.
+  int32 interval = 6;
+}
+
+// DeviceTokenRequest polls for tokens after a device authorization request.
+message DeviceTokenRequest {
+  // OAuth2 client identifier.
+  string client_id = 1;
+  // Device verification code returned by AuthorizeDevice.
+  string device_code = 2;
+}
+
+// DeviceTokenResponse is the OAuth2 token response for the device grant.
+message DeviceTokenResponse {
+  // Access token issued by the authorization server.
+  string access_token = 1;
+  // Type of the token, typically "Bearer".
+  string token_type = 2;
+  // Lifetime of the access token in seconds.
+  int32 expires_in = 3;
+  // Refresh token, if issued.
+  string refresh_token = 4;
+  // Scopes granted by the authorization server.
+  string scope = 5;
+  // ID token, if the "openid" scope was requested and granted.
+  string id_token = 6;
+}
+
+// OAuth2DeviceService exposes OAuth 2.0 Device Authorization Grant endpoints
+// through a gateway-owned, Ory-agnostic Connect-RPC contract.
+service OAuth2DeviceService {
+  // AuthorizeDevice initiates the device authorization flow.
+  rpc AuthorizeDevice(DeviceAuthorizationRequest) returns (DeviceAuthorizationResponse);
+  // GetDeviceToken polls for tokens using the device code.
+  rpc GetDeviceToken(DeviceTokenRequest) returns (DeviceTokenResponse);
+}

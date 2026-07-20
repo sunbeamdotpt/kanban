@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package iam.v1;
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// PageRequest carries pagination parameters for list RPCs.
+message PageRequest {
+  // Maximum number of items to return in a single page.
+  uint32 page_size = 1;
+  // Opaque token returned by a previous list call to fetch the next page.
+  string page_token = 2;
+}
+
+// PageResponse carries pagination metadata returned by list RPCs.
+message PageResponse {
+  // Token to pass to the next list request; empty when there are no more pages.
+  string next_page_token = 1;
+  // Total number of items available across all pages.
+  uint32 total_size = 2;
+}

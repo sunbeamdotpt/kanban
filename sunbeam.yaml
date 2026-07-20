@@ -22,9 +22,7 @@ deps:
     - postgres
     - nats
     - opensearch
-    - keto
-    - hydra
-    - kratos
+    - sso-gateway
 tenant:
   namespace: kanban
 outputs:

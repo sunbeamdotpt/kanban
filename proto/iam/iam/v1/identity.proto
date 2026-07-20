@@ -1,0 +1,325 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// Identity is an end-user account within a tenant.
+message Identity {
+  // Gateway identifier for the identity.
+  string id = 1;
+  // Tenant that owns the identity.
+  string tenant_id = 2;
+  // Identifier of the identity schema used by this identity.
+  string schema_id = 3;
+  // Identity traits, such as email and username, as defined by the schema.
+  google.protobuf.Struct traits = 4;
+  // Timestamp when the identity was created.
+  google.protobuf.Timestamp created_at = 5;
+  // Timestamp when the identity was last updated.
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// Session represents an authenticated session for an identity.
+message Session {
+  // Gateway identifier for the session.
+  string id = 1;
+  // Identity that the session belongs to.
+  string identity_id = 2;
+  // Tenant that owns the session.
+  string tenant_id = 3;
+  // Whether the session is currently active.
+  bool active = 4;
+  // Timestamp when the session expires.
+  google.protobuf.Timestamp expires_at = 5;
+  // Timestamp when the session was authenticated.
+  google.protobuf.Timestamp authenticated_at = 6;
+}
+
+// Flow is an administrative view of a Kratos self-service flow.
+message Flow {
+  // Gateway identifier for the flow.
+  string id = 1;
+  // Type of flow, e.g. login, registration, settings, recovery, verification.
+  string type = 2;
+  // Tenant that owns the flow.
+  string tenant_id = 3;
+  // Identity associated with the flow, if any.
+  string identity_id = 4;
+  // Timestamp when the flow expires.
+  google.protobuf.Timestamp expires_at = 5;
+  // UI payload for rendering the flow.
+  google.protobuf.Struct ui = 6;
+}
+
+// CreateIdentityRequest is the input for creating a new identity.
+message CreateIdentityRequest {
+  // Identifier of the identity schema to use.
+  string schema_id = 1;
+  // Identity traits, such as email and username, as defined by the schema.
+  google.protobuf.Struct traits = 2;
+  // Initial password for the identity.
+  string password = 3;
+}
+
+// GetIdentityRequest identifies an identity to fetch.
+message GetIdentityRequest {
+  // Gateway identifier for the identity.
+  string id = 1;
+}
+
+// ListIdentitiesRequest is the input for paginating identities.
+message ListIdentitiesRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListIdentitiesResponse is the output of a paginated identity list.
+message ListIdentitiesResponse {
+  // Identities on the current page.
+  repeated Identity identities = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// UpdateIdentityRequest is the input for updating an existing identity.
+message UpdateIdentityRequest {
+  // Gateway identifier for the identity.
+  string id = 1;
+  // Identifier of the identity schema to use.
+  string schema_id = 2;
+  // Updated identity traits.
+  google.protobuf.Struct traits = 3;
+}
+
+// DeleteIdentityRequest identifies an identity to delete.
+message DeleteIdentityRequest {
+  // Gateway identifier for the identity.
+  string id = 1;
+}
+
+// IdentitySchema is a tenant-specific Kratos identity schema registration.
+message IdentitySchema {
+  // Gateway identifier for the schema registration.
+  string id = 1;
+  // Tenant that owns the schema registration.
+  string tenant_id = 2;
+  // External identifier used to reference the schema.
+  string schema_id = 3;
+  // JSON Schema document describing the identity traits.
+  google.protobuf.Struct schema_json = 4;
+  // Whether this is the default schema for the tenant.
+  bool is_default = 5;
+  // Timestamp when the schema was created.
+  google.protobuf.Timestamp created_at = 6;
+  // Timestamp when the schema was last updated.
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+// CreateIdentitySchemaRequest is the input for registering an identity schema.
+message CreateIdentitySchemaRequest {
+  // External identifier used to reference the schema.
+  string schema_id = 1;
+  // JSON Schema document describing the identity traits.
+  google.protobuf.Struct schema_json = 2;
+  // Whether this should become the default schema for the tenant.
+  bool is_default = 3;
+}
+
+// GetIdentitySchemaRequest identifies an identity schema to fetch.
+message GetIdentitySchemaRequest {
+  // External identifier used to reference the schema.
+  string schema_id = 1;
+}
+
+// ListIdentitySchemasRequest is the input for paginating identity schemas.
+message ListIdentitySchemasRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListIdentitySchemasResponse is the output of a paginated identity schema list.
+message ListIdentitySchemasResponse {
+  // Identity schemas on the current page.
+  repeated IdentitySchema schemas = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// UpdateIdentitySchemaRequest is the input for updating an identity schema.
+message UpdateIdentitySchemaRequest {
+  // External identifier used to reference the schema.
+  string schema_id = 1;
+  // Updated JSON Schema document.
+  google.protobuf.Struct schema_json = 2;
+  // Whether this should become the default schema for the tenant.
+  bool is_default = 3;
+}
+
+// DeleteIdentitySchemaRequest identifies an identity schema to delete.
+message DeleteIdentitySchemaRequest {
+  // External identifier used to reference the schema.
+  string schema_id = 1;
+}
+
+// SetDefaultIdentitySchemaRequest promotes an identity schema to default.
+message SetDefaultIdentitySchemaRequest {
+  // External identifier used to reference the schema.
+  string schema_id = 1;
+}
+
+// CreateLoginFlowRequest is the input for creating a browser login flow.
+message CreateLoginFlowRequest {
+  // URL to redirect the user to after the flow completes.
+  string return_to = 1;
+  // Requested authenticator assurance level.
+  string aal = 2;
+  // Whether to refresh the existing session.
+  bool refresh = 3;
+  // Organization identifier for the flow.
+  string organization = 4;
+  // Method to trigger, e.g. password or oidc.
+  string via = 5;
+  // OAuth2 login challenge when this flow is part of a consent flow.
+  string login_challenge = 6;
+  // Identity schema to use for the flow.
+  string identity_schema = 7;
+}
+
+// CreateRegistrationFlowRequest is the input for creating a browser registration flow.
+message CreateRegistrationFlowRequest {
+  // URL to redirect the user to after the flow completes.
+  string return_to = 1;
+  // OAuth2 login challenge when this flow is part of a consent flow.
+  string login_challenge = 2;
+  // Identity schema to use for the flow.
+  string identity_schema = 3;
+}
+
+// GetSessionRequest identifies a session to fetch.
+message GetSessionRequest {
+  // Gateway identifier for the session.
+  string id = 1;
+}
+
+// CreateRecoveryLinkRequest creates a recovery link for an identity.
+message CreateRecoveryLinkRequest {
+  // Gateway identifier for the identity.
+  string identity_id = 1;
+  // Optional lifetime in seconds. When zero, the upstream default is used.
+  int64 expires_in_seconds = 2;
+}
+
+// RecoveryLink is a gateway-hosted recovery URL created by the admin API.
+message RecoveryLink {
+  // Gateway URL the user should visit to recover the account.
+  string recovery_link = 1;
+  // Opaque recovery token.
+  string recovery_token = 2;
+  // Flow identifier included in the magic link so the UI can exchange the
+  // token with SubmitRecoveryToken.
+  string flow = 3;
+  // Timestamp when the link expires.
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// GetVerificationMessageRequest fetches a verification message for an identity.
+message GetVerificationMessageRequest {
+  // Gateway identifier for the identity.
+  string identity_id = 1;
+  // Optional gateway identifier for a specific message. When empty, the latest
+  // verification message for the identity is returned.
+  string message_id = 2;
+}
+
+// VerificationMessage is a gateway view of a Kratos courier message containing
+// a verification link.
+message VerificationMessage {
+  // Gateway identifier for the message.
+  string id = 1;
+  // Delivery channel, e.g. email.
+  string type = 2;
+  // Message subject.
+  string subject = 3;
+  // Raw message body.
+  string body = 4;
+  // Delivery status, e.g. queued or sent.
+  string status = 5;
+  // Recipient address, e.g. an email address.
+  string recipient = 6;
+  // Timestamp when the message was sent.
+  google.protobuf.Timestamp sent_at = 7;
+  // Gateway URL extracted from the body that the user should visit.
+  string link = 8;
+  // Flow identifier included in the magic link so the UI can exchange the
+  // token with SubmitVerificationToken.
+  string flow = 9;
+}
+
+// ListSessionsRequest is the input for paginating an identity's sessions.
+message ListSessionsRequest {
+  // Identity whose sessions should be listed.
+  string identity_id = 1;
+  // Pagination parameters.
+  PageRequest page = 2;
+}
+
+// ListSessionsResponse is the output of a paginated session list.
+message ListSessionsResponse {
+  // Sessions on the current page.
+  repeated Session sessions = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// DeleteSessionRequest identifies a session to delete.
+message DeleteSessionRequest {
+  // Gateway identifier for the session.
+  string id = 1;
+}
+
+// IdentityService manages identities, identity schemas, flows, and sessions.
+service IdentityService {
+  // CreateIdentity creates a new end-user identity.
+  rpc CreateIdentity(CreateIdentityRequest) returns (Identity);
+  // GetIdentity retrieves an existing identity.
+  rpc GetIdentity(GetIdentityRequest) returns (Identity);
+  // ListIdentities returns a paginated list of identities.
+  rpc ListIdentities(ListIdentitiesRequest) returns (ListIdentitiesResponse);
+  // UpdateIdentity modifies an existing identity.
+  rpc UpdateIdentity(UpdateIdentityRequest) returns (Identity);
+  // DeleteIdentity removes an identity.
+  rpc DeleteIdentity(DeleteIdentityRequest) returns (google.protobuf.Empty);
+  // CreateIdentitySchema registers a new identity schema for the tenant.
+  rpc CreateIdentitySchema(CreateIdentitySchemaRequest) returns (IdentitySchema);
+  // GetIdentitySchema retrieves an existing identity schema.
+  rpc GetIdentitySchema(GetIdentitySchemaRequest) returns (IdentitySchema);
+  // ListIdentitySchemas returns a paginated list of identity schemas.
+  rpc ListIdentitySchemas(ListIdentitySchemasRequest) returns (ListIdentitySchemasResponse);
+  // UpdateIdentitySchema modifies an existing identity schema.
+  rpc UpdateIdentitySchema(UpdateIdentitySchemaRequest) returns (IdentitySchema);
+  // DeleteIdentitySchema removes an identity schema.
+  rpc DeleteIdentitySchema(DeleteIdentitySchemaRequest) returns (google.protobuf.Empty);
+  // SetDefaultIdentitySchema promotes a schema to the tenant default.
+  rpc SetDefaultIdentitySchema(SetDefaultIdentitySchemaRequest) returns (IdentitySchema);
+  // CreateLoginFlow creates a browser login flow.
+  rpc CreateLoginFlow(CreateLoginFlowRequest) returns (Flow);
+  // CreateRegistrationFlow creates a browser registration flow.
+  rpc CreateRegistrationFlow(CreateRegistrationFlowRequest) returns (Flow);
+  // GetSession retrieves an existing session.
+  rpc GetSession(GetSessionRequest) returns (Session);
+  // ListSessions returns a paginated list of sessions for an identity.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // DeleteSession revokes a session.
+  rpc DeleteSession(DeleteSessionRequest) returns (google.protobuf.Empty);
+  // CreateRecoveryLink creates a recovery link for an identity.
+  rpc CreateRecoveryLink(CreateRecoveryLinkRequest) returns (RecoveryLink);
+  // GetVerificationMessage returns the latest verification message for an identity,
+  // including the gateway-hosted verification link extracted from the message body.
+  rpc GetVerificationMessage(GetVerificationMessageRequest) returns (VerificationMessage);
+}

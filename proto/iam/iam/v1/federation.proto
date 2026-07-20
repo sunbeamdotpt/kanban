@@ -1,0 +1,196 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "iam/v1/identity.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// DiscoverLoginMethodRequest asks the gateway how a user should authenticate.
+message DiscoverLoginMethodRequest {
+  // Email address used for home realm discovery.
+  string email = 1;
+  // URL to redirect the browser back to after authentication.
+  string return_to = 2;
+}
+
+// OidcRedirect contains the URL to redirect a browser to an OIDC provider.
+message OidcRedirect {
+  // Authorization URL including query parameters.
+  string authorization_url = 1;
+  // Opaque state value sent to the provider.
+  string state = 2;
+}
+
+// OAuth2Redirect contains the URL to redirect a browser to an OAuth2 provider.
+message OAuth2Redirect {
+  // Authorization URL including query parameters.
+  string authorization_url = 1;
+  // Opaque state value sent to the provider.
+  string state = 2;
+}
+
+// SelectTenantRedirect routes the browser to the tenant selection page.
+message SelectTenantRedirect {
+  // URL of the tenant selection page.
+  string redirect_url = 1;
+}
+
+// SamlRedirect contains the URL and payload to redirect a browser to a SAML IdP.
+message SamlRedirect {
+  // URL of the SAML identity provider SSO endpoint.
+  string sso_url = 1;
+  // Base64-encoded SAML authentication request.
+  string saml_request = 2;
+  // Opaque relay state returned to the ACS endpoint.
+  string relay_state = 3;
+}
+
+// DiscoverLoginMethodResponse describes how the caller should authenticate.
+message DiscoverLoginMethodResponse {
+  // One of the supported authentication methods.
+  oneof method {
+    // Redirect to an OIDC identity provider.
+    OidcRedirect oidc = 1;
+    // Redirect to an OAuth2 identity provider.
+    OAuth2Redirect oauth2 = 2;
+    // Redirect to a SAML identity provider.
+    SamlRedirect saml = 3;
+    // Redirect to the tenant selection page.
+    SelectTenantRedirect select_tenant = 4;
+  }
+}
+
+// InitiateOidcLoginRequest starts an OIDC login through a configured connection.
+message InitiateOidcLoginRequest {
+  // Gateway identifier of the OIDC tenant connection.
+  string connection_id = 1;
+  // URL to redirect the browser back to after authentication.
+  string return_to = 2;
+}
+
+// InitiateOidcLoginResponse returns the browser redirect for OIDC.
+message InitiateOidcLoginResponse {
+  // Authorization URL including query parameters.
+  string authorization_url = 1;
+  // Opaque state value sent to the provider.
+  string state = 2;
+}
+
+// InitiateOAuth2LoginRequest starts an OAuth2 login through a configured connection.
+message InitiateOAuth2LoginRequest {
+  // Gateway identifier of the OAuth2 tenant connection.
+  string connection_id = 1;
+  // URL to redirect the browser back to after authentication.
+  string return_to = 2;
+}
+
+// InitiateOAuth2LoginResponse returns the browser redirect for OAuth2.
+message InitiateOAuth2LoginResponse {
+  // Authorization URL including query parameters.
+  string authorization_url = 1;
+  // Opaque state value sent to the provider.
+  string state = 2;
+}
+
+// OpenIDConfiguration exposes the OIDC discovery document.
+message OpenIDConfiguration {
+  // OIDC issuer identifier.
+  string issuer = 1;
+  // URL of the OAuth2 authorization endpoint.
+  string authorization_endpoint = 2;
+  // URL of the OAuth2 token endpoint.
+  string token_endpoint = 3;
+  // URL of the OIDC userinfo endpoint.
+  string userinfo_endpoint = 4;
+  // URL of the JSON Web Key Set endpoint.
+  string jwks_uri = 5;
+  // Response types supported by the authorization server.
+  repeated string response_types_supported = 6;
+  // Grant types supported by the authorization server.
+  repeated string grant_types_supported = 7;
+  // Subject identifier types supported.
+  repeated string subject_types_supported = 8;
+  // Signing algorithms supported for ID tokens.
+  repeated string id_token_signing_alg_values_supported = 9;
+  // Scopes supported by the authorization server.
+  repeated string scopes_supported = 10;
+}
+
+// JSONWebKey represents a single public key in a JWKS.
+message JSONWebKey {
+  // Key type, e.g. RSA or EC.
+  string kty = 1;
+  // Intended use of the key, e.g. sig or enc.
+  string use = 2;
+  // Key identifier.
+  string kid = 3;
+  // Algorithm intended for use with the key.
+  string alg = 4;
+  // RSA modulus.
+  string n = 5;
+  // RSA public exponent.
+  string e = 6;
+  // EC x coordinate.
+  string x = 7;
+  // EC y coordinate.
+  string y = 8;
+  // EC curve name.
+  string crv = 9;
+}
+
+// JSONWebKeySet is a collection of JSON Web Keys.
+message JSONWebKeySet {
+  // Public keys exposed by the gateway.
+  repeated JSONWebKey keys = 1;
+}
+
+// GetOpenIDConfigurationRequest fetches the OIDC discovery document.
+message GetOpenIDConfigurationRequest {}
+
+// GetJSONWebKeysRequest fetches the public signing keys.
+message GetJSONWebKeysRequest {}
+
+// SamlLoginResponse is returned when a SAML login is initiated.
+message SamlLoginResponse {
+  // URL to redirect the browser to for authentication.
+  string redirect_url = 1;
+  // Identifier for the SAML authentication request.
+  string request_id = 2;
+}
+
+// InitiateSamlLoginRequest starts a SAML login via an external provider.
+message InitiateSamlLoginRequest {
+  // Gateway identifier of the SAML provider.
+  string provider_id = 1;
+  // Opaque state returned to the ACS endpoint.
+  string relay_state = 2;
+}
+
+// AcceptSamlAssertionRequest validates an incoming SAML assertion.
+message AcceptSamlAssertionRequest {
+  // Gateway identifier of the SAML provider.
+  string provider_id = 1;
+  // Base64-encoded SAML assertion from the identity provider.
+  string encoded_assertion = 2;
+  // Opaque state from the authentication request.
+  string relay_state = 3;
+}
+
+// FederationService exposes OIDC discovery, JWKS, and upstream login flows.
+service FederationService {
+  // DiscoverLoginMethod uses home realm discovery to decide how a user should authenticate.
+  rpc DiscoverLoginMethod(DiscoverLoginMethodRequest) returns (DiscoverLoginMethodResponse);
+  // InitiateOidcLogin redirects the browser to an external OIDC identity provider.
+  rpc InitiateOidcLogin(InitiateOidcLoginRequest) returns (InitiateOidcLoginResponse);
+  // InitiateOAuth2Login redirects the browser to an external OAuth2 identity provider.
+  rpc InitiateOAuth2Login(InitiateOAuth2LoginRequest) returns (InitiateOAuth2LoginResponse);
+  // GetOpenIDConfiguration returns the OIDC discovery document.
+  rpc GetOpenIDConfiguration(GetOpenIDConfigurationRequest) returns (OpenIDConfiguration);
+  // GetJSONWebKeys returns the public signing keys.
+  rpc GetJSONWebKeys(GetJSONWebKeysRequest) returns (JSONWebKeySet);
+  // InitiateSamlLogin redirects the browser to an external SAML identity provider.
+  rpc InitiateSamlLogin(InitiateSamlLoginRequest) returns (SamlLoginResponse);
+  // AcceptSamlAssertion validates a SAML assertion and creates a session.
+  rpc AcceptSamlAssertion(AcceptSamlAssertionRequest) returns (Session);
+}

@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// ScimUser is the gateway's view of a SCIM user.
+message ScimUser {
+  // Gateway identifier for the user.
+  string id = 1;
+  // SCIM userName attribute.
+  string user_name = 2;
+  // SCIM name attribute as a structured object.
+  google.protobuf.Struct name = 3;
+  // SCIM emails attribute as a list of structured objects.
+  repeated google.protobuf.Struct emails = 4;
+  // Whether the user account is active.
+  bool active = 5;
+  // Group identifiers the user belongs to.
+  repeated string groups = 6;
+  // SCIM meta attribute as a structured object.
+  google.protobuf.Struct meta = 7;
+}
+
+// ScimGroup is the gateway's view of a SCIM group.
+message ScimGroup {
+  // Gateway identifier for the group.
+  string id = 1;
+  // Display name of the group.
+  string display_name = 2;
+  // Members of the group.
+  repeated ScimMember members = 3;
+  // SCIM meta attribute as a structured object.
+  google.protobuf.Struct meta = 4;
+}
+
+// ScimMember is a member reference inside a SCIM group.
+message ScimMember {
+  // Identifier of the member.
+  string value = 1;
+  // Display name of the member.
+  string display = 2;
+  // Type of the member, e.g. User or Group.
+  string type = 3;
+}
+
+// ScimListUsersRequest is the input for paginating SCIM users.
+message ScimListUsersRequest {
+  // SCIM filter expression.
+  string filter = 1;
+  // Pagination parameters.
+  PageRequest page = 2;
+}
+
+// ScimListUsersResponse is the output of a paginated SCIM user list.
+message ScimListUsersResponse {
+  // Users on the current page.
+  repeated ScimUser users = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// ScimGetUserRequest identifies a SCIM user to fetch.
+message ScimGetUserRequest {
+  // Gateway identifier for the user.
+  string id = 1;
+}
+
+// ScimCreateUserRequest is the input for creating a SCIM user.
+message ScimCreateUserRequest {
+  // SCIM user to create.
+  ScimUser user = 1;
+}
+
+// ScimUpdateUserRequest is the input for updating a SCIM user.
+message ScimUpdateUserRequest {
+  // Gateway identifier for the user.
+  string id = 1;
+  // Updated SCIM user data.
+  ScimUser user = 2;
+}
+
+// ScimDeleteUserRequest identifies a SCIM user to delete.
+message ScimDeleteUserRequest {
+  // Gateway identifier for the user.
+  string id = 1;
+}
+
+// ScimListGroupsRequest is the input for paginating SCIM groups.
+message ScimListGroupsRequest {
+  // SCIM filter expression.
+  string filter = 1;
+  // Pagination parameters.
+  PageRequest page = 2;
+}
+
+// ScimListGroupsResponse is the output of a paginated SCIM group list.
+message ScimListGroupsResponse {
+  // Groups on the current page.
+  repeated ScimGroup groups = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// ScimGetGroupRequest identifies a SCIM group to fetch.
+message ScimGetGroupRequest {
+  // Gateway identifier for the group.
+  string id = 1;
+}
+
+// ScimCreateGroupRequest is the input for creating a SCIM group.
+message ScimCreateGroupRequest {
+  // SCIM group to create.
+  ScimGroup group = 1;
+}
+
+// ScimUpdateGroupRequest is the input for updating a SCIM group.
+message ScimUpdateGroupRequest {
+  // Gateway identifier for the group.
+  string id = 1;
+  // Updated SCIM group data.
+  ScimGroup group = 2;
+}
+
+// ScimDeleteGroupRequest identifies a SCIM group to delete.
+message ScimDeleteGroupRequest {
+  // Gateway identifier for the group.
+  string id = 1;
+}
+
+// ScimService exposes SCIM 2.0 user and group provisioning.
+service ScimService {
+  // ListUsers returns a paginated list of SCIM users.
+  rpc ListUsers(ScimListUsersRequest) returns (ScimListUsersResponse);
+  // GetUser retrieves a SCIM user by identifier.
+  rpc GetUser(ScimGetUserRequest) returns (ScimUser);
+  // CreateUser creates a new SCIM user.
+  rpc CreateUser(ScimCreateUserRequest) returns (ScimUser);
+  // UpdateUser replaces an existing SCIM user.
+  rpc UpdateUser(ScimUpdateUserRequest) returns (ScimUser);
+  // DeleteUser removes a SCIM user.
+  rpc DeleteUser(ScimDeleteUserRequest) returns (google.protobuf.Empty);
+  // ListGroups returns a paginated list of SCIM groups.
+  rpc ListGroups(ScimListGroupsRequest) returns (ScimListGroupsResponse);
+  // GetGroup retrieves a SCIM group by identifier.
+  rpc GetGroup(ScimGetGroupRequest) returns (ScimGroup);
+  // CreateGroup creates a new SCIM group.
+  rpc CreateGroup(ScimCreateGroupRequest) returns (ScimGroup);
+  // UpdateGroup replaces an existing SCIM group.
+  rpc UpdateGroup(ScimUpdateGroupRequest) returns (ScimGroup);
+  // DeleteGroup removes a SCIM group.
+  rpc DeleteGroup(ScimDeleteGroupRequest) returns (google.protobuf.Empty);
+}

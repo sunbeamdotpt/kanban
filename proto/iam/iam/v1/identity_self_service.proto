@@ -1,0 +1,512 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/identity.proto";
+import "iam/v1/oauth2_consent.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// BrowserIdentity is the gateway's view of an identity inside a browser session.
+// It is intentionally separate from the admin Identity message in identity.proto.
+message BrowserIdentity {
+  // Gateway identifier for the identity.
+  string id = 1;
+  // Identity traits, such as email and username.
+  google.protobuf.Struct traits = 2;
+  // Verifiable addresses, e.g. email or phone.
+  repeated VerifiableAddress verifiable_addresses = 3;
+  // Recovery addresses used for account recovery.
+  repeated RecoveryAddress recovery_addresses = 4;
+  // Timestamp when the identity was created.
+  google.protobuf.Timestamp created_at = 5;
+  // Timestamp when the identity was last updated.
+  google.protobuf.Timestamp updated_at = 6;
+  // Identifier of the identity schema used by this identity.
+  string schema_id = 7;
+}
+
+// VerifiableAddress is an address that can be verified by the identity owner.
+message VerifiableAddress {
+  // Gateway identifier for the address.
+  string id = 1;
+  // Address value, e.g. an email address.
+  string value = 2;
+  // Whether the address has been verified.
+  bool verified = 3;
+  // Delivery channel, e.g. email or sms.
+  string via = 4;
+  // Status of the address, e.g. pending or completed.
+  string status = 5;
+  // Timestamp when the address was verified.
+  google.protobuf.Timestamp verified_at = 6;
+  // Timestamp when the address was created.
+  google.protobuf.Timestamp created_at = 7;
+  // Timestamp when the address was last updated.
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// RecoveryAddress is an address used for account recovery.
+message RecoveryAddress {
+  // Gateway identifier for the address.
+  string id = 1;
+  // Address value, e.g. an email address.
+  string value = 2;
+  // Delivery channel, e.g. email.
+  string via = 3;
+  // Timestamp when the address was created.
+  google.protobuf.Timestamp created_at = 4;
+  // Timestamp when the address was last updated.
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// BrowserSession is the gateway's view of an authenticated session.
+// It is intentionally separate from the admin Session message in identity.proto.
+message BrowserSession {
+  // Gateway identifier for the session.
+  string id = 1;
+  // Identity that the session belongs to.
+  string identity_id = 2;
+  // Tenant that owns the session.
+  string tenant_id = 3;
+  // Whether the session is currently active.
+  bool active = 4;
+  // Timestamp when the session expires.
+  google.protobuf.Timestamp expires_at = 5;
+  // Timestamp when the session was authenticated.
+  google.protobuf.Timestamp authenticated_at = 6;
+  // Timestamp when the session was issued.
+  google.protobuf.Timestamp issued_at = 7;
+  // Current authenticator assurance level of the session.
+  string authenticator_assurance_level = 8;
+  // Snapshot of the identity traits at session creation.
+  google.protobuf.Struct identity_traits = 9;
+  // Full identity object associated with the session.
+  BrowserIdentity identity = 10;
+}
+
+// SelfServiceFlow is the gateway's opaque representation of a Kratos self-service
+// flow (login, registration, settings, recovery, verification).
+message SelfServiceFlow {
+  // Gateway identifier for the flow.
+  string id = 1;
+  // Type of flow, e.g. login, registration, settings, recovery, verification.
+  string type = 2;
+  // Current state of the flow, e.g. choose_method or sent_email.
+  string state = 3;
+  // Timestamp when the flow expires.
+  google.protobuf.Timestamp expires_at = 4;
+  // Timestamp when the flow was issued.
+  google.protobuf.Timestamp issued_at = 5;
+  // URL to redirect the user to after the flow completes.
+  string return_to = 6;
+  // URL the flow was initiated from.
+  string request_url = 7;
+  // Currently active method in the flow, if any.
+  string active_method = 8;
+  // Identity schema identifier used for the flow.
+  string identity_schema_id = 9;
+  // OAuth2 login request embedded in the flow, if any.
+  OAuth2LoginRequest oauth2_login_request = 10;
+  // UI container rendered for the flow.
+  UiContainer ui = 11;
+  // Whether the session should be refreshed.
+  bool refresh = 12;
+  // Requested authenticator assurance level.
+  string requested_aal = 13;
+}
+
+// UiContainer carries the action, method, nodes and messages rendered by the UI.
+message UiContainer {
+  // Form action URL.
+  string action = 1;
+  // HTTP method for the form action.
+  string method = 2;
+  // UI nodes inside the container.
+  repeated UiNode nodes = 3;
+  // Messages displayed at the container level.
+  repeated UiMessage messages = 4;
+}
+
+// UiNode is a single UI element inside a flow container.
+message UiNode {
+  // Type of node, e.g. input or text.
+  string type = 1;
+  // Logical group the node belongs to.
+  string group = 2;
+  // Messages attached to this node.
+  repeated UiMessage messages = 3;
+  // Metadata such as labels and titles.
+  UiNodeMeta meta = 4;
+  // Render attributes depending on the node type.
+  oneof attributes {
+    // Attributes for an input node.
+    UiNodeInputAttributes input = 5;
+    // Attributes for a text node.
+    UiNodeTextAttributes text = 6;
+    // Attributes for an anchor node.
+    UiNodeAnchorAttributes anchor = 7;
+    // Attributes for an image node.
+    UiNodeImageAttributes image = 8;
+    // Attributes for a script node.
+    UiNodeScriptAttributes script = 9;
+  }
+}
+
+// UiText is a translatable text element.
+message UiText {
+  // Message identifier used for translation lookups.
+  string id = 1;
+  // Default human-readable text.
+  string text = 2;
+  // Message type, e.g. info or error.
+  string type = 3;
+  // Context values for message interpolation.
+  google.protobuf.Struct context = 4;
+}
+
+// UiNodeMeta contains metadata for a UI node.
+message UiNodeMeta {
+  // Label text element.
+  UiText label = 1;
+  // Identifier of the label text.
+  string label_id = 2;
+  // Raw label text.
+  string label_text = 3;
+  // Brand identifier for styling.
+  string brand = 4;
+  // Name of the node.
+  string name = 5;
+  // Title of the node.
+  string title = 6;
+}
+
+// UiNodeInputAttributes describes an HTML input element.
+message UiNodeInputAttributes {
+  // Name of the input.
+  string name = 1;
+  // HTML input type, e.g. text or password.
+  string type = 2;
+  // Current value of the input.
+  string value = 3;
+  // Whether the input is required.
+  bool required = 4;
+  // Whether the input is disabled.
+  bool disabled = 5;
+  // Autocomplete hint for the input.
+  string autocomplete = 6;
+  // Node type discriminator.
+  string node_type = 7;
+  // Label text element.
+  UiText label = 8;
+  // Pattern constraint for the input value.
+  string pattern = 9;
+  // Maximum length constraint.
+  int64 maxlength = 10;
+  // Minimum length constraint.
+  int64 minlength = 11;
+  // Placeholder text.
+  string placeholder = 12;
+  // Click handler for the input.
+  string onclick = 13;
+  // Source URL for script or image inputs.
+  string src = 14;
+  // Cryptographic nonce for script inputs.
+  string nonce = 15;
+  // Cross-origin setting for script inputs.
+  string crossorigin = 16;
+  // Subresource integrity hash for script inputs.
+  string integrity = 17;
+  // Whether the script should load asynchronously.
+  bool async = 18;
+  // Referrer policy for script inputs.
+  string referrerpolicy = 19;
+  // Whether multiple values are accepted.
+  bool multiple = 20;
+  // Step value for numeric inputs.
+  string step = 21;
+}
+
+// UiNodeTextAttributes describes a text node.
+message UiNodeTextAttributes {
+  // Node type discriminator.
+  string node_type = 1;
+  // Text content of the node.
+  UiText text = 2;
+}
+
+// UiNodeAnchorAttributes describes an HTML anchor element.
+message UiNodeAnchorAttributes {
+  // Target URL.
+  string href = 1;
+  // Anchor title.
+  string title = 2;
+  // Anchor identifier.
+  string id = 3;
+  // Node type discriminator.
+  string node_type = 4;
+}
+
+// UiNodeImageAttributes describes an HTML image element.
+message UiNodeImageAttributes {
+  // Image source URL.
+  string src = 1;
+  // Image width in pixels.
+  int64 width = 2;
+  // Image height in pixels.
+  int64 height = 3;
+  // Image identifier.
+  string id = 4;
+  // Node type discriminator.
+  string node_type = 5;
+}
+
+// UiNodeScriptAttributes describes an HTML script element.
+message UiNodeScriptAttributes {
+  // Script source URL.
+  string src = 1;
+  // Whether the script should load asynchronously.
+  bool async = 2;
+  // Referrer policy for the script.
+  string referrerpolicy = 3;
+  // Cross-origin setting for the script.
+  string crossorigin = 4;
+  // Subresource integrity hash.
+  string integrity = 5;
+  // MIME type of the script.
+  string type = 6;
+  // Script identifier.
+  string id = 7;
+  // Cryptographic nonce.
+  string nonce = 8;
+  // Node type discriminator.
+  string node_type = 9;
+}
+
+// UiMessage is a user-facing message inside a flow.
+message UiMessage {
+  // Message identifier used for translation lookups.
+  string id = 1;
+  // Default human-readable text.
+  string text = 2;
+  // Message type, e.g. info or error.
+  string type = 3;
+  // Context values for message interpolation.
+  google.protobuf.Struct context = 4;
+}
+
+// OAuth2LoginRequest surfaces the OIDC login request embedded in a login flow.
+message OAuth2LoginRequest {
+  // OAuth2 consent challenge.
+  string challenge = 1;
+  // OAuth2 client identifier.
+  string client_id = 2;
+  // Human-readable client name.
+  string client_name = 3;
+  // Scopes requested by the client.
+  repeated string requested_scope = 4;
+  // Audiences requested for the access token.
+  repeated string requested_access_token_audience = 5;
+  // Subject of the login request, if known.
+  string subject = 6;
+  // Whether the login step can be skipped.
+  bool skip = 7;
+  // OAuth2 client metadata.
+  iam.v1.OAuth2Client client = 8;
+}
+
+// LogoutFlow is returned when a browser logout flow is created.
+message LogoutFlow {
+  // Gateway identifier for the logout flow.
+  string id = 1;
+  // URL to redirect the browser to in order to complete logout.
+  string logout_url = 2;
+  // Logout token used to complete the flow.
+  string logout_token = 3;
+}
+
+// FlowError is the gateway's view of a Kratos flow error.
+message FlowError {
+  // Gateway identifier for the error.
+  string id = 1;
+  // Human-readable error summary.
+  string error = 2;
+  // Timestamp when the error was created.
+  google.protobuf.Timestamp created_at = 3;
+  // Timestamp when the error expires.
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+// ToSessionRequest retrieves the current browser session.
+message ToSessionRequest {
+  // Optional explicit session token. When empty, the gateway uses the request cookies.
+  string session_token = 1;
+}
+
+// GetFlowRequest identifies a self-service flow to fetch.
+message GetFlowRequest {
+  // Gateway identifier for the flow.
+  string id = 1;
+}
+
+// SubmitFlowRequest submits user input to a self-service flow.
+message SubmitFlowRequest {
+  // Gateway identifier for the flow.
+  string id = 1;
+  // User-provided form body as structured JSON.
+  google.protobuf.Struct body = 2;
+}
+
+// CreateLoginFlowRequest and CreateRegistrationFlowRequest are defined in identity.proto.
+
+// CreateSettingsFlowRequest is the input for creating a settings flow.
+message CreateSettingsFlowRequest {
+  // URL to redirect the user to after the flow completes.
+  string return_to = 1;
+}
+
+// CreateRecoveryFlowRequest is the input for creating a recovery flow.
+message CreateRecoveryFlowRequest {
+  // URL to redirect the user to after the flow completes.
+  string return_to = 1;
+}
+
+// CreateLogoutFlowRequest is the input for creating a logout flow.
+message CreateLogoutFlowRequest {
+  // URL to redirect the user to after logout completes.
+  string return_to = 1;
+}
+
+// SubmitLogoutFlowRequest completes a browser logout flow.
+message SubmitLogoutFlowRequest {
+  // Gateway identifier for the logout flow.
+  string id = 1;
+  // Logout token returned when the flow was created.
+  string token = 2;
+  // URL to redirect the user to after logout completes.
+  string return_to = 3;
+}
+
+// CreateVerificationFlowRequest is the input for creating a verification flow.
+message CreateVerificationFlowRequest {
+  // URL to redirect the user to after the flow completes.
+  string return_to = 1;
+}
+
+// SubmitRecoveryTokenRequest validates a recovery magic link token.
+message SubmitRecoveryTokenRequest {
+  // Recovery token from the magic link.
+  string token = 1;
+  // Flow identifier from the magic link. Kratos v25.4.0 requires this when
+  // validating a recovery token through the JSON-facing code path.
+  string flow = 2;
+}
+
+// SubmitRecoveryTokenResponse returns where the browser should be redirected
+// after the recovery token has been exchanged with Kratos.
+message SubmitRecoveryTokenResponse {
+  // URL the UI should redirect the browser to (typically a privileged settings
+  // flow on the configured UI_PUBLIC_URL).
+  string redirect_to = 1;
+}
+
+// SubmitVerificationTokenRequest validates a verification magic link token.
+message SubmitVerificationTokenRequest {
+  // Verification token from the magic link.
+  string token = 1;
+  // Flow identifier from the magic link. Kratos v25.4.0 requires this when
+  // validating a verification token through the JSON-facing code path.
+  string flow = 2;
+}
+
+// SubmitVerificationTokenResponse returns where the browser should be redirected
+// after the verification token has been exchanged with Kratos.
+message SubmitVerificationTokenResponse {
+  // URL the UI should redirect the browser to.
+  string redirect_to = 1;
+}
+
+// GetFlowErrorRequest fetches the error associated with a flow.
+message GetFlowErrorRequest {
+  // Gateway identifier for the error.
+  string id = 1;
+}
+
+// WebAuthnJsResponse returns the WebAuthn JavaScript bundle.
+message WebAuthnJsResponse {
+  // JavaScript content.
+  string content = 1;
+}
+
+// TenantCapabilities describes which optional gateway features are enabled for
+// the caller's tenant. The UI can query this instead of inspecting environment
+// variables or Ory URLs.
+message TenantCapabilities {
+  // Whether OAuth2 consent handling is configured for this tenant.
+  bool oauth2_consent_enabled = 1;
+}
+
+// GetTenantCapabilitiesRequest retrieves the capabilities for the caller's tenant.
+message GetTenantCapabilitiesRequest {}
+
+// GetTenantCapabilitiesResponse returns the tenant capabilities.
+message GetTenantCapabilitiesResponse {
+  // Capabilities for the caller's tenant.
+  TenantCapabilities capabilities = 1;
+}
+
+// IdentitySelfService exposes browser-facing Kratos self-service flows through
+// a gateway-owned, Ory-agnostic contract.
+service IdentitySelfService {
+  // ToSession returns the current browser session.
+  rpc ToSession(ToSessionRequest) returns (BrowserSession);
+  // GetLoginFlow retrieves a login flow by identifier.
+  rpc GetLoginFlow(GetFlowRequest) returns (SelfServiceFlow);
+  // GetRegistrationFlow retrieves a registration flow by identifier.
+  rpc GetRegistrationFlow(GetFlowRequest) returns (SelfServiceFlow);
+  // GetSettingsFlow retrieves a settings flow by identifier.
+  rpc GetSettingsFlow(GetFlowRequest) returns (SelfServiceFlow);
+  // GetRecoveryFlow retrieves a recovery flow by identifier.
+  rpc GetRecoveryFlow(GetFlowRequest) returns (SelfServiceFlow);
+  // GetVerificationFlow retrieves a verification flow by identifier.
+  rpc GetVerificationFlow(GetFlowRequest) returns (SelfServiceFlow);
+  // SubmitLoginFlow submits credentials to a login flow.
+  rpc SubmitLoginFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  // SubmitRegistrationFlow submits data to a registration flow.
+  rpc SubmitRegistrationFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  // SubmitSettingsFlow submits changes to a settings flow.
+  rpc SubmitSettingsFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  // SubmitRecoveryFlow submits recovery data to a recovery flow.
+  rpc SubmitRecoveryFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  // SubmitVerificationFlow submits verification data to a verification flow.
+  rpc SubmitVerificationFlow(SubmitFlowRequest) returns (SelfServiceFlow);
+  // CreateLoginFlow creates a new browser login flow.
+  rpc CreateLoginFlow(CreateLoginFlowRequest) returns (SelfServiceFlow);
+  // CreateRegistrationFlow creates a new browser registration flow.
+  rpc CreateRegistrationFlow(CreateRegistrationFlowRequest) returns (SelfServiceFlow);
+  // CreateSettingsFlow creates a new browser settings flow.
+  rpc CreateSettingsFlow(CreateSettingsFlowRequest) returns (SelfServiceFlow);
+  // CreateRecoveryFlow creates a new browser recovery flow.
+  rpc CreateRecoveryFlow(CreateRecoveryFlowRequest) returns (SelfServiceFlow);
+  // CreateLogoutFlow creates a new browser logout flow.
+  rpc CreateLogoutFlow(CreateLogoutFlowRequest) returns (LogoutFlow);
+  // SubmitLogoutFlow completes a logout flow.
+  rpc SubmitLogoutFlow(SubmitLogoutFlowRequest) returns (google.protobuf.Empty);
+  // CreateVerificationFlow creates a new browser verification flow.
+  rpc CreateVerificationFlow(CreateVerificationFlowRequest) returns (SelfServiceFlow);
+  // SubmitRecoveryToken validates a recovery magic link token and returns the
+  // Kratos redirect target.
+  rpc SubmitRecoveryToken(SubmitRecoveryTokenRequest) returns (SubmitRecoveryTokenResponse);
+  // SubmitVerificationToken validates a verification magic link token and
+  // returns the Kratos redirect target.
+  rpc SubmitVerificationToken(SubmitVerificationTokenRequest) returns (SubmitVerificationTokenResponse);
+  // GetFlowError retrieves the error for a flow.
+  rpc GetFlowError(GetFlowErrorRequest) returns (FlowError);
+  // GetWebAuthnJavaScript returns the WebAuthn JavaScript bundle.
+  rpc GetWebAuthnJavaScript(google.protobuf.Empty) returns (WebAuthnJsResponse);
+  // GetTenantCapabilities returns the optional features enabled for the caller's tenant.
+  rpc GetTenantCapabilities(GetTenantCapabilitiesRequest) returns (GetTenantCapabilitiesResponse);
+}

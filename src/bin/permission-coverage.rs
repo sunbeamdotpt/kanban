@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! CI coverage check for the Keto dispatch matrix.
+//! CI coverage check for the permission dispatch matrix.
 //!
 //! Reads every `proto/sunbeam/kanban/v1/*.proto` file, builds the expected set
 //! of RPC method paths, and compares it against the dispatch matrix exported by
-//! `kanban::auth::keto_dispatch`. Exits 0 when they match; otherwise it lists
+//! `kanban::auth::permission_dispatch`. Exits 0 when they match; otherwise it lists
 //! missing or extra matrix entries.
 //!
 //! Run with:
-//!   cargo run -p kanban --bin keto-coverage
+//!   cargo run -p kanban --bin permission-coverage
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,9 +25,9 @@ fn run() -> i32 {
 
     let expected: HashSet<String> = scan_proto_methods(&proto_dir)
         .into_iter()
-        .filter(|m| !kanban::auth::keto_dispatch::BYPASSED_METHODS.contains(&m.as_str()))
+        .filter(|m| !kanban::auth::permission_dispatch::BYPASSED_METHODS.contains(&m.as_str()))
         .collect();
-    let actual: HashSet<String> = kanban::auth::keto_dispatch::matrix()
+    let actual: HashSet<String> = kanban::auth::permission_dispatch::matrix()
         .iter()
         .map(|e| e.method.to_string())
         .collect();
@@ -51,11 +51,11 @@ fn run() -> i32 {
 
     let ok = missing.is_empty() && extra.is_empty();
 
-    println!("keto-coverage: proto methods = {}", expected.len());
-    println!("keto-coverage: matrix entries = {}", actual.len());
+    println!("permission-coverage: proto methods = {}", expected.len());
+    println!("permission-coverage: matrix entries = {}", actual.len());
 
     if missing.is_empty() {
-        println!("keto-coverage: no missing entries");
+        println!("permission-coverage: no missing entries");
     } else {
         println!("\nMISSING from matrix ({}):", missing.len());
         for m in &missing {
@@ -64,7 +64,7 @@ fn run() -> i32 {
     }
 
     if extra.is_empty() {
-        println!("keto-coverage: no extra entries");
+        println!("permission-coverage: no extra entries");
     } else {
         println!(
             "\nEXTRA in matrix ({}) (no matching proto RPC):",
@@ -77,13 +77,13 @@ fn run() -> i32 {
 
     if ok {
         println!(
-            "\nketo-coverage: OK — matrix covers all {} RPCs",
+            "\npermission-coverage: OK — matrix covers all {} RPCs",
             expected.len()
         );
         0
     } else {
         eprintln!(
-            "\nketo-coverage: FAIL — {} missing, {} extra",
+            "\npermission-coverage: FAIL — {} missing, {} extra",
             missing.len(),
             extra.len()
         );
@@ -116,7 +116,7 @@ fn workspace_root() -> std::path::PathBuf {
             Some(p) => candidate = p,
             None => {
                 eprintln!(
-                    "keto-coverage: could not locate sunbeam.workspace.yaml or \
+                    "permission-coverage: could not locate sunbeam.workspace.yaml or \
                      local proto dir; falling back to CARGO_MANIFEST_DIR"
                 );
                 return manifest;
@@ -133,7 +133,7 @@ fn scan_proto_methods(dir: &Path) -> HashSet<String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("keto-coverage: cannot read proto dir {dir:?}: {err}");
+            eprintln!("permission-coverage: cannot read proto dir {dir:?}: {err}");
             process::exit(2);
         }
     };
@@ -147,7 +147,7 @@ fn scan_proto_methods(dir: &Path) -> HashSet<String> {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(err) => {
-                eprintln!("keto-coverage: cannot read {path:?}: {err}");
+                eprintln!("permission-coverage: cannot read {path:?}: {err}");
                 process::exit(2);
             }
         };
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn scan_proto_methods_ignores_non_proto_files() {
         let tmp = std::env::temp_dir().join(format!(
-            "keto-coverage-test-{}",
+            "permission-coverage-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

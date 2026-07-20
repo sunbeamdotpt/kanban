@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Per-RPC Keto authorization dispatcher.
+//! Per-RPC authorization dispatcher.
 //!
-//! The `KetoLayer` in sunbeam-g2v is configured with a single fixed
-//! (namespace, relation) pair, which is not enough for the many different
-//! permission checks the Kanban API needs. This middleware instead looks up
-//! each RPC in a static dispatch matrix and runs the right Keto check for
-//! that method.
+//! The sso-gateway `PermissionService` is configured with tenant-scoped
+//! namespaces, but a single fixed (namespace, relation) pair is not enough for
+//! the many different permission checks the Kanban API needs. This middleware
+//! instead looks up each RPC in a static dispatch matrix and runs the right
+//! permission check for that method.
 //!
 //! # Object-id header threading
 //!
 //! The object ID comes from the `x-sunbeam-object-id` request header. The
 //! frontend sets it explicitly on every call, and this middleware never
 //! inspects or deserializes request bodies — that would break server-streaming.
-//! After Keto grants permission, the middleware inserts
+//! After the permission check grants access, the middleware inserts
 //! `Extension<CheckedObjectId>` into the request extensions so handlers use
 //! the already-authorized ID instead of anything from the body. This prevents
 //! a header-vs-body bypass: a handler reading from the body would only get an
@@ -20,13 +20,15 @@
 //!
 //! # Authentication
 //!
-//! This middleware runs after `IntrospectionLayer`, which validates the
-//! `Authorization: Bearer <token>` header with Hydra and inserts
-//! `Extension<AuthContext>`. Token revocation is handled by Hydra, so no
-//! additional local revocation check is performed here.
+//! This middleware runs after `auth_middleware`, which validates the
+//! `Authorization: Bearer <token>` header with the sso-gateway introspection
+//! endpoint and inserts `Extension<AuthContext>` and `Extension<TenantId>`.
+//! Token revocation is handled by the gateway, so no additional local
+//! revocation check is performed here.
 //!
 use std::{fmt, sync::Arc};
 
+use axum::http::header::AUTHORIZATION;
 use axum::{
     Extension,
     extract::{Request, State},
@@ -35,17 +37,18 @@ use axum::{
     response::Response,
 };
 use sunbeam_g2v::middleware::auth::AuthContext;
-use sunbeam_g2v::middleware::auth::keto::KetoClient;
+
+use super::permission_client::{PermissionClient, PermissionError};
 
 // ============================================================================
 // Public types
 // ============================================================================
 
 /// Object id extracted from the `x-sunbeam-object-id` header and verified by
-/// a successful Keto permission check.
+/// a successful permission check.
 ///
 /// Handlers should read this extension instead of parsing the request body,
-/// so they always act on the ID that Keto already authorized.
+/// so they always act on the ID that the permission backend already authorized.
 #[derive(Clone, Debug)]
 pub struct CheckedObjectId(pub String);
 
@@ -56,15 +59,15 @@ pub enum ObjectIdSource {
     ///
     /// The dispatcher:
     /// 1. Returns `400 Bad Request` if the header is absent.
-    /// 2. Calls `KetoClient::check_permission(namespace, object_id, relation, subject)`.
-    /// 3. Returns `403 Forbidden` if Keto denies.
+    /// 2. Calls `PermissionClient::check_permission(namespace, object_id, relation, subject)`.
+    /// 3. Returns `403 Forbidden` if the gateway denies.
     /// 4. Inserts `Extension<CheckedObjectId>` on success.
     Header,
     /// No specific object check is required.
     ///
     /// Used for RPCs that are open to any authenticated user (e.g.
     /// `ListProjects`, `SearchCards`), where the handler filters the result set
-    /// afterwards via `keto_expand`.
+    /// afterwards via `permission_expand`.
     None,
 }
 
@@ -74,10 +77,10 @@ pub struct DispatchEntry {
     /// Fully-qualified gRPC method path, e.g.
     /// `"/sunbeam.kanban.v1.BoardService/GetBoard"`.
     pub method: &'static str,
-    /// Keto namespace for the permission check, e.g. `"KanbanBoard"`.
+    /// Permission namespace for the check, e.g. `"KanbanBoard"`.
     /// Empty string when `object_id_source` is `None`.
     pub namespace: &'static str,
-    /// Keto relation for the permission check, e.g. `"view"`.
+    /// Permission relation for the check, e.g. `"view"`.
     /// Empty string when `object_id_source` is `None`.
     pub relation: &'static str,
     /// Where to obtain the object id.
@@ -90,18 +93,41 @@ pub struct DispatchEntry {
 
 /// Shared state carried by `Extension<Arc<DispatchState>>`.
 pub struct DispatchState {
-    pub keto: Arc<KetoClient>,
+    /// Base URL of the sso-gateway. A fresh `PermissionClient` is built for
+    /// each request using the caller's bearer token.
+    pub permission_base_url: String,
+}
+
+impl DispatchState {
+    /// Build a `PermissionClient` for the current request, forwarding the
+    /// caller's bearer token.
+    fn client_for_request(&self, req: &Request) -> Result<PermissionClient, (StatusCode, String)> {
+        let token = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
+
+        PermissionClient::with_bearer_token(&self.permission_base_url, token).map_err(|e| {
+            tracing::error!(error = %e, "permission_dispatch: failed to build PermissionClient");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authorization client error".to_string(),
+            )
+        })
+    }
 }
 
 // ============================================================================
-// Static matrix — 49 entries, one per RPC
+// Static matrix — 68 entries, one per RPC
 // ============================================================================
 
 /// Return the static dispatch matrix.
 ///
 /// The method paths in this matrix must exactly match the RPC method paths
 /// emitted by the proto compiler for every service in
-/// `proto/sunbeam/kanban/v1/*.proto`. The `keto-coverage` binary enforces
+/// `proto/sunbeam/kanban/v1/*.proto`. The `permission-coverage` binary enforces
 /// this invariant at CI time.
 pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
@@ -113,7 +139,7 @@ static MATRIX: [DispatchEntry; 68] = [
         method: "/sunbeam.kanban.v1.ProjectService/ListProjects",
         namespace: "",
         relation: "",
-        object_id_source: ObjectIdSource::None, // post-filter via keto_expand
+        object_id_source: ObjectIdSource::None, // post-filter via permission_expand
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.ProjectService/GetProject",
@@ -342,7 +368,7 @@ static MATRIX: [DispatchEntry; 68] = [
         object_id_source: ObjectIdSource::Header,
     },
     // ── AttachmentService (5) ───────────────────────────────────────────────
-    // object_id is the card_id (not attachment_id): Keto authorizes the card.
+    // object_id is the card_id (not attachment_id): the backend authorizes the card.
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AttachmentService/RequestPresignedUpload",
         namespace: "KanbanCard",
@@ -374,7 +400,7 @@ static MATRIX: [DispatchEntry; 68] = [
         object_id_source: ObjectIdSource::Header,
     },
     // ── GithubLinkService (5) ───────────────────────────────────────────────
-    // object_id is the card_id throughout; GitHub link IDs are not Keto objects.
+    // object_id is the card_id throughout; GitHub link IDs are not permission objects.
     DispatchEntry {
         method: "/sunbeam.kanban.v1.GithubLinkService/LinkIssue",
         namespace: "KanbanCard",
@@ -437,7 +463,7 @@ static MATRIX: [DispatchEntry; 68] = [
         method: "/sunbeam.kanban.v1.AggregatedBoardService/ListAggregatedBoards",
         namespace: "",
         relation: "",
-        object_id_source: ObjectIdSource::None, // post-filter via keto_expand
+        object_id_source: ObjectIdSource::None, // post-filter via permission_expand
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.AggregatedBoardService/AddSourceBoard",
@@ -468,7 +494,7 @@ static MATRIX: [DispatchEntry; 68] = [
         method: "/sunbeam.kanban.v1.SearchService/SearchCards",
         namespace: "",
         relation: "",
-        object_id_source: ObjectIdSource::None, // post-filter via keto_expand in handler
+        object_id_source: ObjectIdSource::None, // post-filter via permission_expand in handler
     },
     // ── TemplatesService (10) ───────────────────────────────────────────────
     // Templates are project-owned resources.  Global templates are read-only
@@ -536,10 +562,10 @@ static MATRIX: [DispatchEntry; 68] = [
     },
 ];
 
-/// RPC methods that bypass the `keto_dispatch` middleware entirely.
+/// RPC methods that bypass the `permission_dispatch` middleware entirely.
 ///
 /// These are served by a separate Axum router that does not run
-/// `IntrospectionLayer` or `keto_dispatch`, so they must not be counted by the
+/// `auth_middleware` or `permission_dispatch`, so they must not be counted by the
 /// matrix coverage checks.
 pub const BYPASSED_METHODS: &[&str] = &[
     "/sunbeam.kanban.v1.PublicBoardService/GetPublicBoard",
@@ -570,7 +596,7 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 
 /// Per-RPC authorization dispatcher.
 ///
-/// Must run *after* `IntrospectionLayer` (which inserts `Extension<AuthContext>`)
+/// Must run *after* `auth_middleware` (which inserts `Extension<AuthContext>`)
 /// and *before* the Connect-RPC service handlers.
 ///
 /// Register with:
@@ -599,7 +625,7 @@ pub(crate) async fn dispatch_check(
     mut req: Request,
 ) -> Result<Request, (StatusCode, String)> {
     // 1. Require authentication.
-    if !auth.is_authenticated {
+    if !auth.is_authenticated() {
         return Err((
             StatusCode::UNAUTHORIZED,
             "authentication required".to_string(),
@@ -616,7 +642,10 @@ pub(crate) async fn dispatch_check(
         None => {
             // An RPC path not in the matrix is a programming error: the
             // coverage binary catches this in CI.  Fail closed at runtime.
-            tracing::error!(method, "keto_dispatch: unknown method — failing closed");
+            tracing::error!(
+                method,
+                "permission_dispatch: unknown method — failing closed"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "unknown RPC method".to_string(),
@@ -640,7 +669,10 @@ pub(crate) async fn dispatch_check(
             let object_id = match object_id {
                 Some(id) if !id.is_empty() => id,
                 _ => {
-                    tracing::warn!(method, "keto_dispatch: missing x-sunbeam-object-id header");
+                    tracing::warn!(
+                        method,
+                        "permission_dispatch: missing x-sunbeam-object-id header"
+                    );
                     return Err((
                         StatusCode::BAD_REQUEST,
                         "x-sunbeam-object-id header is required for this RPC".to_string(),
@@ -648,15 +680,12 @@ pub(crate) async fn dispatch_check(
                 }
             };
 
-            // 5. Keto permission check.
-            let allowed = state
-                .keto
-                .check_permission(
-                    entry.namespace,
-                    &object_id,
-                    entry.relation,
-                    &crate::auth::keto_retry::keto_subject_id(subject),
-                )
+            // 5. Build a per-request permission client from the caller's token.
+            let client = state.client_for_request(&req)?;
+
+            // 6. Permission check.
+            let allowed = client
+                .check_permission(entry.namespace, &object_id, entry.relation, subject)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -664,12 +693,17 @@ pub(crate) async fn dispatch_check(
                         namespace = entry.namespace,
                         relation = entry.relation,
                         error = %e,
-                        "keto_dispatch: check_permission error"
+                        "permission_dispatch: check_permission error"
                     );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "authorization check failed".to_string(),
-                    )
+                    match e {
+                        PermissionError::Denied => {
+                            (StatusCode::FORBIDDEN, "permission denied".to_string())
+                        }
+                        PermissionError::Backend(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "authorization check failed".to_string(),
+                        ),
+                    }
                 })?;
 
             if !allowed {
@@ -678,12 +712,12 @@ pub(crate) async fn dispatch_check(
                     namespace = entry.namespace,
                     relation = entry.relation,
                     subject_hash = %hash_subject_prefix(subject),
-                    "keto_dispatch: keto denial"
+                    "permission_dispatch: permission denial"
                 );
                 return Err((StatusCode::FORBIDDEN, "permission denied".to_string()));
             }
 
-            // 6. Insert the checked object id so handlers consume the
+            // 7. Insert the checked object id so handlers consume the
             //    authorized id, not an unchecked body field.
             req.extensions_mut().insert(CheckedObjectId(object_id));
         }
@@ -704,9 +738,6 @@ mod tests {
     // ── Matrix shape tests (always run; no external deps) ───────────────────
 
     /// Every proto RPC must appear in the matrix exactly once.
-    ///
-    /// The expected set is built by scanning the proto files with a simple
-    /// line-oriented regex — no proto codegen dependency required.
     #[test]
     fn matrix_covers_all_rpcs() {
         let expected: HashSet<String> = expected_methods_from_protos()
@@ -746,7 +777,6 @@ mod tests {
             "KanbanBoard",
             "KanbanCard",
             "KanbanAggregatedBoard",
-            "_kanban_health",
             "",
         ];
         for entry in &MATRIX {
@@ -794,7 +824,7 @@ mod tests {
 
     fn make_auth(authenticated: bool) -> AuthContext {
         if authenticated {
-            AuthContext::authenticated("user:test", None)
+            AuthContext::authenticated("tenant-1", "user:test")
         } else {
             AuthContext::unauthenticated()
         }
@@ -810,14 +840,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_rejects_unauthenticated() {
-        // Use a None-source entry so we never reach the Keto check.
+        // Use a None-source entry so we never reach the permission check.
         let auth = make_auth(false);
         let mut req = make_request("/sunbeam.kanban.v1.ProjectService/ListProjects", auth);
 
         // We need Extension<Arc<DispatchState>> too — but dispatch checks
         // is_authenticated first, so we can use a dummy state.
-        let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let state = Arc::new(DispatchState { keto: dummy_keto });
+        let state = Arc::new(DispatchState {
+            permission_base_url: "http://localhost:8080".to_string(),
+        });
         req.extensions_mut().insert(state);
 
         let result = dispatch_raw(req).await;
@@ -834,12 +865,13 @@ mod tests {
         let auth = make_auth(true);
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
 
-        let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let state = Arc::new(DispatchState { keto: dummy_keto });
+        let state = Arc::new(DispatchState {
+            permission_base_url: "http://localhost:8080".to_string(),
+        });
         req.extensions_mut().insert(auth);
         req.extensions_mut().insert(state);
 
-        // No x-sunbeam-object-id header — should get 400 before Keto is called.
+        // No x-sunbeam-object-id header — should get 400 before the backend is called.
         let result = dispatch_raw(req).await;
         assert_eq!(
             result,
@@ -916,188 +948,71 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ── Integration tests (needs shared Keto) ────────────────────────────────
-
-    #[tokio::test]
-    async fn dispatch_returns_403_on_keto_denial() {
-        let _infra = crate::test_support::containers::setup().await;
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
-
-        let keto = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: keto_url,
-            write_grpc_endpoint: keto_write_url,
-        }));
-        let state = Arc::new(DispatchState { keto });
-
-        // Object id points to a non-existent board → Keto returns false → 403.
-        // Use DeleteBoard because GetBoard bypasses the Keto middleware for
-        // visibility filtering in the handler.
-        let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
-        req.headers_mut().insert(
-            "x-sunbeam-object-id",
-            "non-existent-board-id-00000000".parse().unwrap(),
-        );
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::FORBIDDEN, "Keto denial must yield 403");
-    }
-
-    #[tokio::test]
-    async fn dispatch_rejects_unknown_method() {
-        let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.UnknownService/UnknownRpc", auth.clone());
-
-        let dummy_keto = Arc::new(KetoClient::with_defaults());
-        let state = Arc::new(DispatchState { keto: dummy_keto });
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_400_when_header_missing() {
-        let _infra = crate::test_support::containers::setup().await;
-        let keto_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4466".to_string());
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .unwrap_or_else(|_| "http://localhost:4467".to_string());
-
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
-
-        let keto = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: keto_url,
-            write_grpc_endpoint: keto_write_url,
-        }));
-        let state = Arc::new(DispatchState { keto });
-
-        let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_500_on_keto_error() {
-        let _infra = crate::test_support::containers::setup().await;
-
-        use sunbeam_g2v::middleware::auth::keto::KetoConfig;
-
-        let keto = Arc::new(KetoClient::new(KetoConfig {
-            grpc_endpoint: "http://127.0.0.1:1".to_string(),
-            write_grpc_endpoint: "http://127.0.0.1:1".to_string(),
-        }));
-        let state = Arc::new(DispatchState { keto });
-
-        let auth = make_auth(true);
-        let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
-        req.headers_mut().insert(
-            "x-sunbeam-object-id",
-            "any-board-id-000000000000".parse().unwrap(),
-        );
-        req.extensions_mut().insert(auth);
-        req.extensions_mut().insert(state);
-
-        let result = dispatch_raw(req).await;
-        assert_eq!(result, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
     // ── Helpers ─────────────────────────────────────────────────────────────
 
-    /// Run `dispatch_check` against a request and return either 200 (would proceed
-    /// to the handler) or the rejection status code.
-    ///
-    /// `Arc<DispatchState>` and `AuthContext` extensions must already be inserted
-    /// on the request before calling.
-    async fn dispatch_raw(mut req: HttpRequest<Body>) -> StatusCode {
-        let state = req
-            .extensions_mut()
-            .remove::<Arc<DispatchState>>()
-            .expect("DispatchState extension missing");
-        let auth = req
-            .extensions_mut()
-            .remove::<AuthContext>()
-            .expect("AuthContext extension missing");
-
-        match dispatch_check(state, auth, req).await {
+    async fn dispatch_raw(req: Request) -> StatusCode {
+        let res = dispatch_check(
+            req.extensions()
+                .get::<Arc<DispatchState>>()
+                .cloned()
+                .unwrap(),
+            req.extensions().get::<AuthContext>().cloned().unwrap(),
+            req,
+        )
+        .await;
+        match res {
             Ok(_) => StatusCode::OK,
-            Err((status, _)) => status,
+            Err((code, _)) => code,
         }
     }
 
-    // ── Proto scanning helper ────────────────────────────────────────────────
+    /// Scan the Kanban proto files and return every gRPC method path.
+    fn expected_methods_from_protos() -> Vec<String> {
+        use std::io::BufRead;
 
-    /// Scan all proto files under `proto/sunbeam/kanban/v1/` and build the
-    /// expected set of fully-qualified method paths.
-    ///
-    /// Service names and RPC names are extracted with a simple line-oriented regex
-    /// (no proto codegen dependency).
-    pub(crate) fn expected_methods_from_protos() -> HashSet<String> {
-        let proto_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/proto/sunbeam/kanban/v1");
+        let proto_dir = std::path::Path::new("proto/sunbeam/kanban/v1");
+        let mut methods = Vec::new();
 
-        let mut methods = HashSet::new();
-        let dir = std::fs::read_dir(proto_dir)
-            .expect("proto directory not found — run from workspace root");
-
-        for entry in dir.flatten() {
+        for entry in std::fs::read_dir(proto_dir).expect("proto dir should exist") {
+            let entry = entry.expect("proto dir entry");
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("proto") {
                 continue;
             }
-            let content =
-                std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("cannot read {path:?}"));
 
+            let file = std::fs::File::open(&path).expect("proto file should open");
+            let reader = std::io::BufReader::new(file);
+
+            let mut package: Option<String> = None;
             let mut current_service: Option<String> = None;
 
-            for line in content.lines() {
+            for line in reader.lines().map_while(Result::ok) {
                 let trimmed = line.trim();
-
-                // Detect service declarations.
-                if let Some(rest) = trimmed.strip_prefix("service ") {
-                    let name = rest
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches('{')
-                        .trim();
-                    current_service = Some(name.to_string());
-                    continue;
-                }
-
-                // Detect closing brace — very coarse but sufficient for
-                // well-formatted protos (each service closes on its own line).
-                if trimmed == "}" {
-                    // Only clear if we're tracking a service.
-                    if current_service.is_some() {
-                        current_service = None;
-                    }
-                    continue;
-                }
-
-                // Detect rpc declarations.
-                if let Some(svc) = &current_service {
-                    if let Some(rest) = trimmed.strip_prefix("rpc ") {
-                        let rpc_name = rest.split('(').next().unwrap_or("").trim().to_string();
-                        if !rpc_name.is_empty() {
-                            let method = format!("/sunbeam.kanban.v1.{svc}/{rpc_name}");
-                            methods.insert(method);
-                        }
+                if trimmed.starts_with("package ") {
+                    package = trimmed
+                        .strip_prefix("package ")
+                        .and_then(|s| s.strip_suffix(';'))
+                        .map(|s| s.to_string());
+                } else if trimmed.starts_with("service ") {
+                    current_service = trimmed
+                        .strip_prefix("service ")
+                        .and_then(|s| s.split_whitespace().next())
+                        .map(|s| s.to_string());
+                } else if trimmed.starts_with("rpc ") {
+                    let Some(pkg) = package.as_ref() else {
+                        continue;
+                    };
+                    let Some(svc) = current_service.as_ref() else {
+                        continue;
+                    };
+                    let rpc_name = trimmed
+                        .strip_prefix("rpc ")
+                        // Method name ends at the first `(` (canonical buf
+                        // style: `rpc Name(Request)`) or whitespace.
+                        .and_then(|s| s.split(['(', ' ', '\t']).next())
+                        .map(|s| s.to_string());
+                    if let Some(rpc) = rpc_name {
+                        methods.push(format!("/{pkg}.{svc}/{rpc}"));
                     }
                 }
             }

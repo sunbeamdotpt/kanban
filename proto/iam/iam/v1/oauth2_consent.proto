@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// OAuth2Client surfaces the client metadata relevant to consent/logout decisions.
+message OAuth2Client {
+  // OAuth2 client identifier.
+  string client_id = 1;
+  // Human-readable client name.
+  string client_name = 2;
+  // Client homepage URI.
+  string client_uri = 3;
+  // URI of the client logo.
+  string logo_uri = 4;
+  // Allowed OAuth2 redirect URIs.
+  repeated string redirect_uris = 5;
+  // Whether the user is never prompted for consent.
+  bool skip_consent = 6;
+  // Whether the user is never prompted for logout consent.
+  bool skip_logout_consent = 7;
+  // Allowed OAuth2 grant types.
+  repeated string grant_types = 8;
+  // Allowed OAuth2 response types.
+  repeated string response_types = 9;
+  // OAuth2 scope string.
+  string scope = 10;
+  // URI of the client privacy policy.
+  string policy_uri = 11;
+  // URI of the client terms of service.
+  string tos_uri = 12;
+  // URI of the client's JWKS document.
+  string jwks_uri = 13;
+  // Arbitrary client metadata.
+  google.protobuf.Struct metadata = 14;
+}
+
+// ConsentRequest is the gateway's view of a Hydra OAuth2 consent request.
+message ConsentRequest {
+  // OAuth2 consent challenge.
+  string challenge = 1;
+  // OAuth2 client identifier.
+  string client_id = 2;
+  // Human-readable client name.
+  string client_name = 3;
+  // Subject asked to give consent.
+  string subject = 4;
+  // Whether the consent step can be skipped.
+  bool skip = 5;
+  // Scopes requested by the client.
+  repeated string requested_scope = 6;
+  // Audiences requested for the access token.
+  repeated string requested_access_token_audience = 7;
+  // OIDC context of the consent request.
+  google.protobuf.Struct oidc_context = 8;
+  // OAuth2 client metadata.
+  OAuth2Client client = 9;
+}
+
+// AcceptConsentRequest is the input for accepting a consent request.
+message AcceptConsentRequest {
+  // OAuth2 consent challenge.
+  string challenge = 1;
+  // Scopes granted by the user.
+  repeated string grant_scope = 2;
+  // Audiences granted for the access token.
+  repeated string grant_access_token_audience = 3;
+  // Whether to remember the consent decision.
+  bool remember = 4;
+  // Seconds to remember the consent decision.
+  int64 remember_for = 5;
+  // Session data to include in the access and ID tokens.
+  google.protobuf.Struct session = 6;
+}
+
+// RejectConsentRequest is the input for rejecting a consent request.
+message RejectConsentRequest {
+  // OAuth2 consent challenge.
+  string challenge = 1;
+  // OAuth2 error code.
+  string error = 2;
+  // Human-readable error description.
+  string error_description = 3;
+  // Hint for resolving the error.
+  string error_hint = 4;
+  // HTTP status code to return.
+  int32 status_code = 5;
+}
+
+// ConsentResponse is returned after accepting or rejecting a consent request.
+message ConsentResponse {
+  // URL to redirect the browser to.
+  string redirect_to = 1;
+}
+
+// LogoutRequest is the gateway's view of a Hydra OIDC logout request.
+message LogoutRequest {
+  // OAuth2 logout challenge.
+  string challenge = 1;
+  // Subject being logged out.
+  string subject = 2;
+  // OAuth2 client identifier, if the request came from a client.
+  string client_id = 3;
+  // Original request URL.
+  string request_url = 4;
+  // URI to redirect the browser to after logout.
+  string post_logout_redirect_uri = 5;
+  // OAuth2 client metadata, if the request came from a client.
+  OAuth2Client client = 6;
+}
+
+// AcceptLogoutRequest is the input for accepting a logout request.
+message AcceptLogoutRequest {
+  // OAuth2 logout challenge.
+  string challenge = 1;
+}
+
+// RejectLogoutRequest is the input for rejecting a logout request.
+message RejectLogoutRequest {
+  // OAuth2 logout challenge.
+  string challenge = 1;
+  // OAuth2 error code.
+  string error = 2;
+  // Human-readable error description.
+  string error_description = 3;
+  // Hint for resolving the error.
+  string error_hint = 4;
+  // HTTP status code to return.
+  int32 status_code = 5;
+}
+
+// LogoutResponse is returned after accepting or rejecting a logout request.
+message LogoutResponse {
+  // URL to redirect the browser to.
+  string redirect_to = 1;
+}
+
+// GetChallengeRequest identifies a consent or logout challenge.
+message GetChallengeRequest {
+  // OAuth2 challenge value.
+  string challenge = 1;
+}
+
+// OAuth2ConsentService exposes Hydra consent and logout request handling
+// through a gateway-owned, Ory-agnostic Connect-RPC contract.
+service OAuth2ConsentService {
+  // GetConsentRequest retrieves a consent request by challenge.
+  rpc GetConsentRequest(GetChallengeRequest) returns (ConsentRequest);
+  // AcceptConsent accepts a consent request and returns the redirect URL.
+  rpc AcceptConsent(AcceptConsentRequest) returns (ConsentResponse);
+  // RejectConsent rejects a consent request and returns the redirect URL.
+  rpc RejectConsent(RejectConsentRequest) returns (ConsentResponse);
+  // GetLogoutRequest retrieves a logout request by challenge.
+  rpc GetLogoutRequest(GetChallengeRequest) returns (LogoutRequest);
+  // AcceptLogout accepts a logout request and returns the redirect URL.
+  rpc AcceptLogout(AcceptLogoutRequest) returns (LogoutResponse);
+  // RejectLogout rejects a logout request and returns the redirect URL.
+  rpc RejectLogout(RejectLogoutRequest) returns (LogoutResponse);
+}

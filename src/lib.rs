@@ -13,9 +13,9 @@
 
 pub mod auth;
 pub mod config;
+pub mod iam_proto;
 pub mod id;
 pub mod integrations;
-pub mod keto_proto;
 pub mod pb;
 pub mod realtime;
 pub mod server;

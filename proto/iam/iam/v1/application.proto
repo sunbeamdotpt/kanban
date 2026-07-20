@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
+
+// Application is an OAuth2/OIDC client registered for a tenant.
+message Application {
+  // Gateway identifier for the application.
+  string id = 1;
+  // Tenant that owns the application.
+  string tenant_id = 2;
+  // Human-readable name of the application.
+  string name = 3;
+  // Allowed OAuth2 redirect URIs.
+  repeated string redirect_uris = 4;
+  // Allowed OAuth2 grant types.
+  repeated string grant_types = 5;
+  // Allowed OAuth2 response types.
+  repeated string response_types = 6;
+  // OAuth2 scopes the client may request.
+  repeated string scope = 7;
+  // Client authentication method used at the token endpoint.
+  string token_endpoint_auth_method = 8;
+  // Timestamp when the application was created.
+  google.protobuf.Timestamp created_at = 9;
+  // Timestamp when the application was last updated.
+  google.protobuf.Timestamp updated_at = 10;
+  // Current OAuth2 client secret; only exposed immediately after rotation.
+  string client_secret = 11;
+  // When true, the application's client credentials may target any tenant
+  // via the x-tenant-id header. Only the system tenant may create or enable
+  // cross-tenant applications.
+  bool cross_tenant = 12;
+}
+
+// ApplicationSecret contains the credentials returned after secret rotation.
+message ApplicationSecret {
+  // OAuth2 client identifier.
+  string client_id = 1;
+  // Newly generated OAuth2 client secret.
+  string client_secret = 2;
+}
+
+// CreateApplicationRequest is the input for creating a new application.
+message CreateApplicationRequest {
+  // Human-readable name of the application.
+  string name = 1;
+  // Allowed OAuth2 redirect URIs.
+  repeated string redirect_uris = 2;
+  // Allowed OAuth2 grant types.
+  repeated string grant_types = 3;
+  // Allowed OAuth2 response types.
+  repeated string response_types = 4;
+  // OAuth2 scopes the client may request.
+  repeated string scope = 5;
+  // Client authentication method used at the token endpoint.
+  string token_endpoint_auth_method = 6;
+  // When true, the application's client credentials may target any tenant
+  // via the x-tenant-id header. Only the system tenant may create
+  // cross-tenant applications.
+  bool cross_tenant = 7;
+}
+
+// GetApplicationRequest identifies an application to fetch.
+message GetApplicationRequest {
+  // Gateway identifier for the application.
+  string id = 1;
+}
+
+// ListApplicationsRequest is the input for paginating applications.
+message ListApplicationsRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListApplicationsResponse is the output of a paginated application list.
+message ListApplicationsResponse {
+  // Applications on the current page.
+  repeated Application applications = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// UpdateApplicationRequest is the input for updating an existing application.
+message UpdateApplicationRequest {
+  // Gateway identifier for the application.
+  string id = 1;
+  // Human-readable name of the application.
+  string name = 2;
+  // Allowed OAuth2 redirect URIs.
+  repeated string redirect_uris = 3;
+  // Allowed OAuth2 grant types.
+  repeated string grant_types = 4;
+  // Allowed OAuth2 response types.
+  repeated string response_types = 5;
+  // OAuth2 scopes the client may request.
+  repeated string scope = 6;
+  // Client authentication method used at the token endpoint.
+  string token_endpoint_auth_method = 7;
+  // When set, toggles whether the application's client credentials may target
+  // any tenant via the x-tenant-id header. Only the system tenant may enable
+  // cross-tenant applications; omitting this field leaves the flag unchanged.
+  google.protobuf.BoolValue cross_tenant = 8;
+}
+
+// DeleteApplicationRequest identifies an application to delete.
+message DeleteApplicationRequest {
+  // Gateway identifier for the application.
+  string id = 1;
+}
+
+// RotateSecretRequest identifies an application whose secret should be rotated.
+message RotateSecretRequest {
+  // Gateway identifier for the application.
+  string id = 1;
+}
+
+// ApplicationService manages OAuth2/OIDC client applications for tenants.
+service ApplicationService {
+  // CreateApplication registers a new OAuth2 client.
+  rpc CreateApplication(CreateApplicationRequest) returns (Application);
+  // GetApplication retrieves an existing OAuth2 client.
+  rpc GetApplication(GetApplicationRequest) returns (Application);
+  // ListApplications returns a paginated list of OAuth2 clients.
+  rpc ListApplications(ListApplicationsRequest) returns (ListApplicationsResponse);
+  // UpdateApplication modifies an existing OAuth2 client.
+  rpc UpdateApplication(UpdateApplicationRequest) returns (Application);
+  // DeleteApplication removes an OAuth2 client.
+  rpc DeleteApplication(DeleteApplicationRequest) returns (google.protobuf.Empty);
+  // RotateSecret generates a new client secret for the application.
+  rpc RotateSecret(RotateSecretRequest) returns (ApplicationSecret);
+}

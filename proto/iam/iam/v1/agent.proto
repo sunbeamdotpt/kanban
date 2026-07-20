@@ -1,0 +1,222 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
+
+// Agent is a gateway-owned non-human identity. Agents are not Kratos
+// identities; each agent authenticates with the OAuth2 client_credentials
+// grant against a Hydra client the gateway manages on its behalf.
+message Agent {
+  // Gateway identifier for the agent.
+  string id = 1;
+  // Tenant that owns the agent.
+  string tenant_id = 2;
+  // Human-readable name of the agent.
+  string name = 3;
+  // Gateway identity that owns the agent; empty when the agent is tenant-owned.
+  string owner_identity_id = 4;
+  // Lifecycle status: "active" or "disabled". A disabled agent cannot mint
+  // new tokens and its existing act-tokens fail introspection immediately.
+  string status = 5;
+  // Timestamp when the agent was created.
+  google.protobuf.Timestamp created_at = 6;
+  // Timestamp when the agent was last updated.
+  google.protobuf.Timestamp updated_at = 7;
+  // OAuth2 client secret; only present immediately after creation or rotation.
+  string client_secret = 8;
+}
+
+// AgentSecret contains the credentials returned after secret rotation.
+message AgentSecret {
+  // Gateway identifier for the agent.
+  string agent_id = 1;
+  // Newly generated OAuth2 client secret.
+  string client_secret = 2;
+}
+
+// CreateAgentRequest is the input for creating a new agent.
+message CreateAgentRequest {
+  // Human-readable name of the agent.
+  string name = 1;
+  // OAuth2 scopes the agent's client may request. Include "agent:act" if the
+  // agent should be allowed to mint on-behalf-of tokens.
+  repeated string scope = 2;
+}
+
+// GetAgentRequest identifies an agent to fetch.
+message GetAgentRequest {
+  // Gateway identifier for the agent.
+  string id = 1;
+}
+
+// ListAgentsRequest is the input for paginating agents.
+message ListAgentsRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListAgentsResponse is the output of a paginated agent list.
+message ListAgentsResponse {
+  // Agents on the current page.
+  repeated Agent agents = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// UpdateAgentRequest is the input for updating an existing agent. Empty
+// fields leave the corresponding attribute unchanged.
+message UpdateAgentRequest {
+  // Gateway identifier for the agent.
+  string id = 1;
+  // Human-readable name of the agent.
+  string name = 2;
+  // Desired lifecycle status: "active" or "disabled"; empty leaves the
+  // current status unchanged.
+  string status = 3;
+}
+
+// DeleteAgentRequest identifies an agent to delete.
+message DeleteAgentRequest {
+  // Gateway identifier for the agent.
+  string id = 1;
+}
+
+// RotateAgentSecretRequest identifies an agent whose secret should be rotated.
+message RotateAgentSecretRequest {
+  // Gateway identifier for the agent.
+  string id = 1;
+}
+
+// AgentDelegation is a pre-authorized grant allowing an agent to act on
+// behalf of a user with a bounded scope set until expiry.
+message AgentDelegation {
+  // Gateway identifier for the delegation grant.
+  string id = 1;
+  // Tenant the delegation belongs to.
+  string tenant_id = 2;
+  // Agent allowed to act on behalf of the user.
+  string agent_id = 3;
+  // User granting the delegation.
+  string user_identity_id = 4;
+  // Scopes the agent may exercise as the user.
+  repeated string scope = 5;
+  // Timestamp after which the delegation no longer mints or validates tokens.
+  google.protobuf.Timestamp expires_at = 6;
+  // Timestamp when the delegation was revoked; unset while the grant is live.
+  google.protobuf.Timestamp revoked_at = 7;
+  // Timestamp when the delegation was created.
+  google.protobuf.Timestamp created_at = 8;
+}
+
+// CreateAgentDelegationRequest is the input for granting a delegation. The
+// authenticated caller is the delegating user.
+message CreateAgentDelegationRequest {
+  // Gateway identifier of the agent to authorize.
+  string agent_id = 1;
+  // Scopes the agent may exercise as the caller.
+  repeated string scope = 2;
+  // Timestamp when the delegation expires.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// ListAgentDelegationsRequest is the input for paginating delegations.
+message ListAgentDelegationsRequest {
+  // When set, lists delegations for this agent (requires agent:read or
+  // agent:admin). When empty, lists delegations granted by the caller.
+  string agent_id = 1;
+  // Pagination parameters.
+  PageRequest page = 2;
+}
+
+// ListAgentDelegationsResponse is the output of a paginated delegation list.
+message ListAgentDelegationsResponse {
+  // Delegations on the current page.
+  repeated AgentDelegation delegations = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// RevokeAgentDelegationRequest identifies a delegation to revoke. Revocation
+// takes effect immediately: minting stops and existing act-tokens fail
+// introspection.
+message RevokeAgentDelegationRequest {
+  // Gateway identifier for the delegation grant.
+  string id = 1;
+}
+
+// MintAgentActTokenRequest is the input for minting an on-behalf-of token.
+// Called by the agent itself with its client-credentials token.
+message MintAgentActTokenRequest {
+  // Gateway identifier of the delegation grant to mint against.
+  string delegation_id = 1;
+}
+
+// AgentActToken is an opaque on-behalf-of access token.
+message AgentActToken {
+  // Opaque bearer token; presented to the gateway or downstream services.
+  string access_token = 1;
+  // Seconds until the token expires.
+  uint32 expires_in = 2;
+}
+
+// IntrospectAgentActTokenRequest is the input for introspecting an
+// on-behalf-of token.
+message IntrospectAgentActTokenRequest {
+  // The opaque bearer token to introspect.
+  string token = 1;
+}
+
+// AgentActTokenIntrospection is the RFC 7662-shaped result of introspecting
+// an on-behalf-of token.
+message AgentActTokenIntrospection {
+  // Whether the token is currently usable.
+  bool active = 1;
+  // Subject (user) the agent acts for; present when active.
+  string sub = 2;
+  // Agent performing the action; present when active.
+  string act = 3;
+  // Tenant the token belongs to; present when active.
+  string tenant_id = 4;
+  // Scopes granted to the token; present when active.
+  repeated string scope = 5;
+  // Token expiry; present when active.
+  google.protobuf.Timestamp exp = 6;
+}
+
+// AgentService manages non-human identities and their delegation grants.
+service AgentService {
+  // CreateAgent registers a new agent and its client-credentials OAuth2
+  // client. The client secret is returned exactly once.
+  rpc CreateAgent(CreateAgentRequest) returns (Agent);
+  // GetAgent retrieves an existing agent.
+  rpc GetAgent(GetAgentRequest) returns (Agent);
+  // ListAgents returns a paginated list of the tenant's agents.
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  // UpdateAgent renames an agent or disables/enables it. Disabling an agent
+  // immediately invalidates its act-tokens and stops new token minting.
+  rpc UpdateAgent(UpdateAgentRequest) returns (Agent);
+  // DeleteAgent removes the agent, its delegations, and its OAuth2 client.
+  rpc DeleteAgent(DeleteAgentRequest) returns (google.protobuf.Empty);
+  // RotateAgentSecret generates a new client secret for the agent.
+  rpc RotateAgentSecret(RotateAgentSecretRequest) returns (AgentSecret);
+  // CreateAgentDelegation pre-authorizes an agent to act on behalf of the
+  // authenticated caller.
+  rpc CreateAgentDelegation(CreateAgentDelegationRequest) returns (AgentDelegation);
+  // ListAgentDelegations lists grants made by the caller, or grants for a
+  // given agent with agent:read/agent:admin.
+  rpc ListAgentDelegations(ListAgentDelegationsRequest) returns (ListAgentDelegationsResponse);
+  // RevokeAgentDelegation revokes a grant. The delegating user or an
+  // agent:admin caller may revoke.
+  rpc RevokeAgentDelegation(RevokeAgentDelegationRequest) returns (AgentDelegation);
+  // MintAgentActToken mints a short-lived on-behalf-of token against a live
+  // delegation. Called by the agent itself; requires the agent:act scope.
+  rpc MintAgentActToken(MintAgentActTokenRequest) returns (AgentActToken);
+  // IntrospectAgentActToken validates an on-behalf-of token and returns its
+  // claims. Any authenticated caller in the token's tenant may introspect.
+  rpc IntrospectAgentActToken(IntrospectAgentActTokenRequest) returns (AgentActTokenIntrospection);
+}

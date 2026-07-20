@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// Tenant is an isolated organization in the gateway.
+message Tenant {
+  // Gateway identifier for the tenant.
+  string id = 1;
+  // URL-safe identifier for the tenant.
+  string slug = 2;
+  // Human-readable display name.
+  string display_name = 3;
+  // Timestamp when the tenant was created.
+  google.protobuf.Timestamp created_at = 4;
+  // Tenant-specific settings as key-value pairs.
+  map<string, string> settings = 5;
+}
+
+// CreateTenantRequest is the input for creating a new tenant.
+message CreateTenantRequest {
+  // URL-safe identifier for the tenant.
+  string slug = 1;
+  // Human-readable display name.
+  string display_name = 2;
+  // Initial tenant-specific settings.
+  map<string, string> settings = 3;
+}
+
+// GetTenantRequest identifies a tenant to fetch.
+message GetTenantRequest {
+  // Gateway identifier for the tenant.
+  string id = 1;
+}
+
+// ListTenantsRequest is the input for paginating tenants.
+message ListTenantsRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListTenantsResponse is the output of a paginated tenant list.
+message ListTenantsResponse {
+  // Tenants on the current page.
+  repeated Tenant tenants = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// TenantService manages tenants.
+service TenantService {
+  // CreateTenant creates a new tenant.
+  rpc CreateTenant(CreateTenantRequest) returns (Tenant);
+  // GetTenant retrieves an existing tenant.
+  rpc GetTenant(GetTenantRequest) returns (Tenant);
+  // ListTenants returns a paginated list of tenants.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+}

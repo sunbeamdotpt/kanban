@@ -1,0 +1,296 @@
+syntax = "proto3";
+
+package iam.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "iam/v1/common.proto";
+
+option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+
+// RelationTuple is a single permission relation stored for a tenant.
+message RelationTuple {
+  // Gateway identifier for the tuple.
+  string id = 1;
+  // Tenant that owns the tuple.
+  string tenant_id = 2;
+  // Namespace of the object.
+  string namespace = 3;
+  // Identifier of the object.
+  string object = 4;
+  // Relation between the object and the subject.
+  string relation = 5;
+  // Direct subject identifier, if the subject is a concrete identity.
+  string subject_id = 6;
+  // Namespace of a subject set, if the subject is a set.
+  string subject_set_namespace = 7;
+  // Object of a subject set, if the subject is a set.
+  string subject_set_object = 8;
+  // Relation of a subject set, if the subject is a set.
+  string subject_set_relation = 9;
+  // Timestamp when the tuple was created.
+  google.protobuf.Timestamp created_at = 10;
+}
+
+// CheckPermissionRequest asks whether a subject has a relation on an object.
+message CheckPermissionRequest {
+  // Namespace of the object.
+  string namespace = 1;
+  // Identifier of the object.
+  string object = 2;
+  // Relation to check.
+  string relation = 3;
+  // Direct subject identifier.
+  string subject_id = 4;
+  // Evaluation context for conditions (OpenFGA only).
+  google.protobuf.Struct context = 5;
+  // Contextual tuples used only for this evaluation (OpenFGA only).
+  repeated RelationTupleKey contextual_tuples = 6;
+  // Consistency preference: "" | "minimize_latency" | "higher_consistency".
+  string consistency = 7;
+}
+
+// CheckPermissionResponse is the result of a permission check.
+message CheckPermissionResponse {
+  // Whether the subject is allowed the requested relation.
+  bool allowed = 1;
+}
+
+// CreateRelationTupleRequest is the input for creating a relation tuple.
+message CreateRelationTupleRequest {
+  // Namespace of the object.
+  string namespace = 1;
+  // Identifier of the object.
+  string object = 2;
+  // Relation between the object and the subject.
+  string relation = 3;
+  // Direct subject identifier.
+  string subject_id = 4;
+}
+
+// DeleteRelationTupleRequest identifies a relation tuple to delete.
+message DeleteRelationTupleRequest {
+  // Gateway identifier for the tuple.
+  string id = 1;
+}
+
+// ExpandPermissionsRequest expands all tuples for an object relation.
+message ExpandPermissionsRequest {
+  // Namespace of the object.
+  string namespace = 1;
+  // Identifier of the object.
+  string object = 2;
+  // Relation to expand.
+  string relation = 3;
+  // Evaluation context for conditions (OpenFGA only).
+  google.protobuf.Struct context = 4;
+  // Contextual tuples used only for this evaluation (OpenFGA only).
+  repeated RelationTupleKey contextual_tuples = 5;
+  // Consistency preference: "" | "minimize_latency" | "higher_consistency".
+  string consistency = 6;
+}
+
+// ExpandPermissionsResponse is the result of expanding a permission tree.
+message ExpandPermissionsResponse {
+  // Relation tuples included in the expansion.
+  repeated RelationTuple tuples = 1;
+  // String representation of the permission tree.
+  string tree = 2;
+}
+
+// ExpandObjectsRequest expands all objects a subject has a relation on.
+message ExpandObjectsRequest {
+  // Namespace of the objects.
+  string namespace = 1;
+  // Relation to expand.
+  string relation = 2;
+  // Direct subject identifier.
+  string subject_id = 3;
+  // Namespace of a subject set, if the subject is a set.
+  string subject_set_namespace = 4;
+  // Object of a subject set, if the subject is a set.
+  string subject_set_object = 5;
+  // Relation of a subject set, if the subject is a set.
+  string subject_set_relation = 6;
+  // Maximum depth to traverse when resolving subject sets.
+  int32 max_depth = 7;
+  // Evaluation context for conditions (OpenFGA only).
+  google.protobuf.Struct context = 8;
+  // Contextual tuples used only for this evaluation (OpenFGA only).
+  repeated RelationTupleKey contextual_tuples = 9;
+  // Consistency preference: "" | "minimize_latency" | "higher_consistency".
+  string consistency = 10;
+}
+
+// ExpandObjectsResponse is the result of expanding objects for a subject.
+message ExpandObjectsResponse {
+  // Object identifiers the subject has the relation on.
+  repeated string objects = 1;
+  // String representation of the expansion tree.
+  string tree = 2;
+}
+
+// ListRelationTuplesRequest is the input for paginating relation tuples.
+message ListRelationTuplesRequest {
+  // Filter by namespace.
+  string namespace = 1;
+  // Filter by object.
+  string object = 2;
+  // Filter by relation.
+  string relation = 3;
+  // Pagination parameters.
+  PageRequest page = 4;
+}
+
+// ListRelationTuplesResponse is the output of a paginated tuple list.
+message ListRelationTuplesResponse {
+  // Relation tuples on the current page.
+  repeated RelationTuple tuples = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// PermissionNamespace is a permission namespace registered for a tenant.
+//
+// A namespace bundles an OpenFGA store and its (versioned) authorization
+// model. The model may define many object types; every type resolves back to
+// this namespace for tuple and check operations.
+message PermissionNamespace {
+  // Tenant that owns the namespace.
+  string tenant_id = 1;
+  // Logical name of the namespace.
+  string namespace = 2;
+  // Full OpenFGA authorization model JSON
+  // (schema_version, type_definitions, optional conditions).
+  google.protobuf.Struct model = 3;
+  // Object types defined by the current model.
+  repeated string types = 4;
+  // Timestamp when the namespace was registered.
+  google.protobuf.Timestamp created_at = 5;
+  // Timestamp when the model was last changed.
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// EnsurePermissionNamespaceRequest registers or updates a namespace model.
+message EnsurePermissionNamespaceRequest {
+  // Logical name of the namespace.
+  string namespace = 1;
+  // Full OpenFGA authorization model JSON
+  // (schema_version, type_definitions, optional conditions).
+  google.protobuf.Struct model = 2;
+}
+
+// GetPermissionNamespaceRequest identifies a namespace to fetch.
+message GetPermissionNamespaceRequest {
+  // Logical name of the namespace.
+  string namespace = 1;
+}
+
+// ListPermissionNamespacesRequest is the input for listing namespaces.
+message ListPermissionNamespacesRequest {
+  // Pagination parameters.
+  PageRequest page = 1;
+}
+
+// ListPermissionNamespacesResponse is the output of a namespace list.
+message ListPermissionNamespacesResponse {
+  // Namespaces registered for the tenant.
+  repeated PermissionNamespace namespaces = 1;
+  // Pagination metadata.
+  PageResponse page = 2;
+}
+
+// DeletePermissionNamespaceRequest identifies a namespace to delete.
+message DeletePermissionNamespaceRequest {
+  // Logical name of the namespace.
+  string namespace = 1;
+}
+
+// RelationTupleKey identifies a single relation tuple for writes.
+message RelationTupleKey {
+  // Namespace (object type) of the object.
+  string namespace = 1;
+  // Identifier of the object.
+  string object = 2;
+  // Relation between the object and the subject.
+  string relation = 3;
+  // Subject: "user:<id>", a userset "<type>:<id>#<relation>", a wildcard
+  // "<type>:*", or a bare gateway identifier (treated as a user).
+  string subject_id = 4;
+  // Optional OpenFGA condition name attached to the tuple.
+  string condition = 5;
+  // Optional context evaluated with the condition.
+  google.protobuf.Struct condition_context = 6;
+}
+
+// WriteRelationTuplesRequest is the input for a batch tuple write.
+message WriteRelationTuplesRequest {
+  // Tuples to create.
+  repeated RelationTupleKey writes = 1;
+  // Tuples to delete.
+  repeated RelationTupleKey deletes = 2;
+}
+
+// WriteRelationTuplesResponse summarizes a batch tuple write.
+message WriteRelationTuplesResponse {
+  // Number of tuples created.
+  int32 written = 1;
+  // Number of tuples deleted.
+  int32 deleted = 2;
+}
+
+// ListUsersRequest lists the subjects that have a relation on an object.
+message ListUsersRequest {
+  // Namespace of the object.
+  string namespace = 1;
+  // Identifier of the object.
+  string object = 2;
+  // Relation to evaluate.
+  string relation = 3;
+  // Optional subject filters, e.g. ["user", "team#member"].
+  repeated string user_type_filters = 4;
+  // Evaluation context for conditions (OpenFGA only).
+  google.protobuf.Struct context = 5;
+  // Contextual tuples used only for this evaluation (OpenFGA only).
+  repeated RelationTupleKey contextual_tuples = 6;
+  // Consistency preference: "" | "minimize_latency" | "higher_consistency".
+  string consistency = 7;
+}
+
+// ListUsersResponse lists the subjects that have a relation on an object.
+message ListUsersResponse {
+  // Canonical subjects: "type:id", "type:id#relation", or "type:*".
+  repeated string users = 1;
+}
+
+// PermissionService manages relation tuples and checks permissions.
+service PermissionService {
+  // CheckPermission returns whether a subject has a relation on an object.
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  // CreateRelationTuple creates a new relation tuple.
+  rpc CreateRelationTuple(CreateRelationTupleRequest) returns (RelationTuple);
+  // DeleteRelationTuple removes a relation tuple.
+  rpc DeleteRelationTuple(DeleteRelationTupleRequest) returns (google.protobuf.Empty);
+  // ExpandPermissions returns the expanded permission tree for an object relation.
+  rpc ExpandPermissions(ExpandPermissionsRequest) returns (ExpandPermissionsResponse);
+  // ExpandObjects returns the objects a subject has a relation on.
+  rpc ExpandObjects(ExpandObjectsRequest) returns (ExpandObjectsResponse);
+  // ListRelationTuples returns a paginated list of relation tuples.
+  rpc ListRelationTuples(ListRelationTuplesRequest) returns (ListRelationTuplesResponse);
+  // EnsurePermissionNamespace registers a namespace, or publishes a new
+  // authorization model version when the model changed. The OpenFGA store is
+  // created exactly once; existing tuples are never affected by model updates.
+  rpc EnsurePermissionNamespace(EnsurePermissionNamespaceRequest) returns (PermissionNamespace);
+  // GetPermissionNamespace retrieves a registered namespace.
+  rpc GetPermissionNamespace(GetPermissionNamespaceRequest) returns (PermissionNamespace);
+  // ListPermissionNamespaces returns the namespaces registered for a tenant.
+  rpc ListPermissionNamespaces(ListPermissionNamespacesRequest) returns (ListPermissionNamespacesResponse);
+  // DeletePermissionNamespace removes a namespace, its OpenFGA store, and all
+  // of its relation tuples.
+  rpc DeletePermissionNamespace(DeletePermissionNamespaceRequest) returns (google.protobuf.Empty);
+  // WriteRelationTuples creates and/or deletes relation tuples in one batch.
+  rpc WriteRelationTuples(WriteRelationTuplesRequest) returns (WriteRelationTuplesResponse);
+  // ListUsers returns the subjects that have a relation on an object.
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
