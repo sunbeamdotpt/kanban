@@ -49,13 +49,6 @@ pub fn live_tail_consumer_name(board_id: &str, pod_id: &str, stream_id: &str) ->
     format!("kanban-board-{board_id}-{pod_id}-{stream_id}")
 }
 
-/// Ephemeral consumer name for replay-from-resume-token (one per RPC).
-///
-/// Format: `kanban-replay-{board_id}-{replay_id}`.
-pub fn replay_consumer_name(board_id: &str, replay_id: &str) -> String {
-    format!("kanban-replay-{board_id}-{replay_id}")
-}
-
 // ── StreamConfig ──────────────────────────────────────────────────────────────
 
 /// Configuration for the `KANBAN_BOARD_EVENTS` JetStream stream.
@@ -131,6 +124,9 @@ impl std::str::FromStr for Storage {
     }
 }
 
+/// Test helper: returns a default `StreamConfig` for tests that need to
+/// idempotently ensure the `KANBAN_BOARD_EVENTS` stream exists.
+#[cfg(test)]
 pub fn default_config() -> StreamConfig {
     StreamConfig {
         name: STREAM_NAME,
