@@ -1,0 +1,208 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user"
+    },
+    {
+      "type": "agent"
+    },
+    {
+      "type": "KanbanProject",
+      "relations": {
+        "owner": { "this": {} },
+        "admin": { "this": {} },
+        "editor": { "this": {} },
+        "viewer": { "this": {} },
+        "view": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } },
+              { "computedUserset": { "relation": "editor" } },
+              { "computedUserset": { "relation": "viewer" } }
+            ]
+          }
+        },
+        "edit": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } },
+              { "computedUserset": { "relation": "editor" } }
+            ]
+          }
+        },
+        "manage": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } }
+            ]
+          }
+        },
+        "delete": { "computedUserset": { "relation": "owner" } }
+      },
+      "metadata": {
+        "relations": {
+          "owner": { "directly_related_user_types": [{ "type": "user" }] },
+          "admin": { "directly_related_user_types": [{ "type": "user" }] },
+          "editor": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] },
+          "viewer": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] }
+        }
+      }
+    },
+    {
+      "type": "KanbanBoard",
+      "relations": {
+        "parent": { "this": {} },
+        "viewer": { "this": {} },
+        "editor": { "this": {} },
+        "view": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "viewer" } },
+              { "computedUserset": { "relation": "editor" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "parent" },
+                  "computedUserset": { "relation": "view" }
+                }
+              }
+            ]
+          }
+        },
+        "edit": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "editor" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "parent" },
+                  "computedUserset": { "relation": "edit" }
+                }
+              }
+            ]
+          }
+        },
+        "manage": {
+          "tupleToUserset": {
+            "tupleset": { "relation": "parent" },
+            "computedUserset": { "relation": "manage" }
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": { "directly_related_user_types": [{ "type": "KanbanProject" }] },
+          "viewer": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] },
+          "editor": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] }
+        }
+      }
+    },
+    {
+      "type": "KanbanCard",
+      "relations": {
+        "parent": { "this": {} },
+        "assignee": { "this": {} },
+        "blocked_by": { "this": {} },
+        "view": {
+          "tupleToUserset": {
+            "tupleset": { "relation": "parent" },
+            "computedUserset": { "relation": "view" }
+          }
+        },
+        "edit": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "assignee" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "parent" },
+                  "computedUserset": { "relation": "edit" }
+                }
+              }
+            ]
+          }
+        },
+        "manage": {
+          "tupleToUserset": {
+            "tupleset": { "relation": "parent" },
+            "computedUserset": { "relation": "manage" }
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": { "directly_related_user_types": [{ "type": "KanbanBoard" }] },
+          "assignee": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] },
+          "blocked_by": { "directly_related_user_types": [{ "type": "KanbanCard" }] }
+        }
+      }
+    },
+    {
+      "type": "KanbanAggregatedBoard",
+      "relations": {
+        "owner": { "this": {} },
+        "admin": { "this": {} },
+        "editor": { "this": {} },
+        "viewer": { "this": {} },
+        "source_board": { "this": {} },
+        "view": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } },
+              { "computedUserset": { "relation": "editor" } },
+              { "computedUserset": { "relation": "viewer" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "source_board" },
+                  "computedUserset": { "relation": "view" }
+                }
+              }
+            ]
+          }
+        },
+        "edit": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } },
+              { "computedUserset": { "relation": "editor" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "source_board" },
+                  "computedUserset": { "relation": "edit" }
+                }
+              }
+            ]
+          }
+        },
+        "manage": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "owner" } },
+              { "computedUserset": { "relation": "admin" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "source_board" },
+                  "computedUserset": { "relation": "manage" }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "owner": { "directly_related_user_types": [{ "type": "user" }] },
+          "admin": { "directly_related_user_types": [{ "type": "user" }] },
+          "editor": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] },
+          "viewer": { "directly_related_user_types": [{ "type": "user" }, { "type": "agent" }] },
+          "source_board": { "directly_related_user_types": [{ "type": "KanbanBoard" }] }
+        }
+      }
+    }
+  ]
+}

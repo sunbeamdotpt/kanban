@@ -1,39 +1,24 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # `apps/kanban/.integration/`
 
-Authoritative source for kanban's Ory Keto OPL (Ory Permission Language)
-namespaces and the small validator that gates them.
+Authoritative source for kanban's OpenFGA authorization model.
 
 ## Files
 
-- `keto-namespaces.config.ts` — namespace + permission definitions for
-  `KanbanProject`, `KanbanBoard`, `KanbanCard`, plus the synthetic
-  `_kanban_health` namespace used by the kanban service's readiness probe.
-- `validate.ts` — type-checks the config against `@ory/keto-namespace-types`
-  (the same toolchain Keto's directory-watcher applies before reload) and
-  renders the relation graph in plain English.
-- `package.json` — minimal deps for the validator (no workspace impact).
+- `openfga-model.json` — the Kanban authorization model (object types
+  `KanbanProject`, `KanbanBoard`, `KanbanCard`, `KanbanAggregatedBoard` with
+  their relations and computed permissions, plus the `user` and `agent`
+  subject types). This is the single source of truth: the kanban service
+  embeds it at compile time (`include_str!` in
+  `src/auth/permission_client.rs`) and registers it with the sso-gateway
+  `PermissionService` via `EnsurePermissionNamespace` at boot. The gateway
+  resolves each object type to the `kanban` permission namespace's OpenFGA
+  store.
 
-## Validate locally
+## Changing the model
 
-```sh
-cd apps/kanban/.integration
-npm install   # first time only; pulls tsx + typescript + the local types
-npm run validate
-```
-
-Exit 0 means the config compiles cleanly and all four required namespaces
-parse. CI runs this same command as a PR gate (Stage 1a / Pre-mortem 1
-mitigation): a syntax-broken namespace file would otherwise crash Keto on
-reload and lock every user out.
-
-## How this gets into Keto
-
-Stage 1d (forward-reference) wires this file into the workspace Keto
-deployment via the directory-mount pattern documented in
-`project_keto_namespaces_directory_mode.md`: every project owns a single
-`*.config.ts` under its `.integration/` and Keto v26 reads them all from
-`/etc/namespaces/` (directory mode), merging without conflict. This file
-will land at `/etc/namespaces/kanban.config.ts` in the Keto pod once the
-kustomization in `infra/sbbb/apps/kanban/` references it as a configMap
-volume mount.
+Edit `openfga-model.json` and redeploy kanban. Re-ensuring an identical model
+is a no-op on the gateway; a changed model publishes a new model version into
+the existing store without touching relation tuples. Evolve relations by
+dual-writing (add `relation_v2`, dual-write for a release, switch checks, then
+drop `relation_v1`) — never delete a relation in place.

@@ -23,12 +23,14 @@ use sqlx::{PgPool, Row};
 pub(crate) async fn seed_project(pool: &PgPool) -> Id {
     let project_id = Id::new();
     let suffix = project_id.to_string();
+    let tenant_id = test_tenant_id();
 
     sqlx::query(
-        "INSERT INTO projects (id, name, slug, owner_id, created_at, updated_at)
-         VALUES ($1, $2, $3, 'user:test', now(), now())",
+        "INSERT INTO projects (id, tenant_id, name, slug, owner_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'user:test', now(), now())",
     )
     .bind(project_id)
+    .bind(tenant_id)
     .bind(format!("test-proj-{}", &suffix[18..26]))
     .bind(suffix[14..26].to_lowercase())
     .execute(pool)
@@ -39,15 +41,16 @@ pub(crate) async fn seed_project(pool: &PgPool) -> Id {
 }
 
 /// Create a minimal board under `project_id` and return its id.
-pub(crate) async fn seed_board(pool: &PgPool, project_id: Id) -> Id {
+pub(crate) async fn seed_board(pool: &PgPool, tenant_id: &str, project_id: Id) -> Id {
     let board_id = Id::new();
     let suffix = board_id.to_string();
 
     sqlx::query(
-        "INSERT INTO boards (id, project_id, name, slug, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, now(), now())",
+        "INSERT INTO boards (id, tenant_id, project_id, name, slug, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now(), now())",
     )
     .bind(board_id)
+    .bind(tenant_id)
     .bind(project_id)
     .bind(format!("test-board-{}", &suffix[18..26]))
     .bind(suffix[14..26].to_lowercase())
@@ -59,14 +62,15 @@ pub(crate) async fn seed_board(pool: &PgPool, project_id: Id) -> Id {
 }
 
 /// Create a minimal column under `board_id` and return its id.
-pub(crate) async fn seed_column(pool: &PgPool, board_id: Id) -> Id {
+pub(crate) async fn seed_column(pool: &PgPool, tenant_id: &str, board_id: Id) -> Id {
     let column_id = Id::new();
 
     sqlx::query(
-        "INSERT INTO columns (id, board_id, title, position, created_at, updated_at)
-         VALUES ($1, $2, 'todo', 0, now(), now())",
+        "INSERT INTO columns (id, tenant_id, board_id, title, position, created_at, updated_at)
+         VALUES ($1, $2, $3, 'todo', 0, now(), now())",
     )
     .bind(column_id)
+    .bind(tenant_id)
     .bind(board_id)
     .execute(pool)
     .await
@@ -77,21 +81,28 @@ pub(crate) async fn seed_column(pool: &PgPool, board_id: Id) -> Id {
 
 /// Create a minimal card under `board_id`, `column_id`, and `project_id` and
 /// return its id.
-pub(crate) async fn seed_card(pool: &PgPool, board_id: Id, column_id: Id, project_id: Id) -> Id {
+pub(crate) async fn seed_card(
+    pool: &PgPool,
+    tenant_id: &str,
+    board_id: Id,
+    column_id: Id,
+    project_id: Id,
+) -> Id {
     let card_id = Id::new();
     let card_suffix = card_id.to_string();
 
     sqlx::query(
         "INSERT INTO cards \
-         (id, board_id, column_id, project_id, ref, title, position, revision, \
+         (id, tenant_id, board_id, column_id, project_id, ref, title, position, revision, \
           created_by, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, 'test-card', 0, 0, 'user:test', now(), now())",
+         VALUES ($1, $2, $3, $4, $5, $6, 'test-card', 0, 0, 'user:test', now(), now())",
     )
     .bind(card_id)
+    .bind(tenant_id)
     .bind(board_id)
     .bind(column_id)
     .bind(project_id)
-    .bind(format!("T{}", &card_suffix[20..26].to_uppercase()))
+    .bind(format!("T{}", card_suffix[20..26].to_uppercase()))
     .execute(pool)
     .await
     .expect("seed_card: INSERT failed");
@@ -104,10 +115,11 @@ pub(crate) async fn seed_card(pool: &PgPool, board_id: Id, column_id: Id, projec
 /// Returns `(project_id, board_id, column_id, card_id)` with fresh ULIDs so
 /// parallel tests stay independent.
 pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Id, Id, Id, Id) {
+    let tenant_id = test_tenant_id();
     let project_id = seed_project(pool).await;
-    let board_id = seed_board(pool, project_id).await;
-    let column_id = seed_column(pool, board_id).await;
-    let card_id = seed_card(pool, board_id, column_id, project_id).await;
+    let board_id = seed_board(pool, &tenant_id, project_id).await;
+    let column_id = seed_column(pool, &tenant_id, board_id).await;
+    let card_id = seed_card(pool, &tenant_id, board_id, column_id, project_id).await;
     (project_id, board_id, column_id, card_id)
 }
 
@@ -116,12 +128,14 @@ pub(crate) async fn seed_card_chain(pool: &PgPool) -> (Id, Id, Id, Id) {
 /// Returns the inserted row's id.
 pub(crate) async fn seed_event_log(pool: &PgPool, board_id: Id, event_type: &str) -> Id {
     let row_id = Id::new();
+    let tenant_id = test_tenant_id();
     let row = sqlx::query(
-        "INSERT INTO event_log (id, board_id, event_type, payload, created_at)
-         VALUES ($1, $2, $3, '{}'::jsonb, now())
+        "INSERT INTO event_log (id, tenant_id, board_id, event_type, payload, created_at)
+         VALUES ($1, $2, $3, $4, '{}'::jsonb, now())
          RETURNING id",
     )
     .bind(row_id)
+    .bind(tenant_id)
     .bind(board_id)
     .bind(event_type)
     .fetch_one(pool)
@@ -141,13 +155,15 @@ pub(crate) async fn seed_event_log_dispatched(
     nats_seq: i64,
 ) -> Id {
     let row_id = Id::new();
+    let tenant_id = test_tenant_id();
     let row = sqlx::query(
         "INSERT INTO event_log \
-         (id, board_id, event_type, payload, nats_seq, dispatched_at, created_at)
-         VALUES ($1, $2, $3, '{}'::jsonb, $4, now(), now())
+         (id, tenant_id, board_id, event_type, payload, nats_seq, dispatched_at, created_at)
+         VALUES ($1, $2, $3, $4, '{}'::jsonb, $5, now(), now())
          RETURNING id",
     )
     .bind(row_id)
+    .bind(tenant_id)
     .bind(board_id)
     .bind(event_type)
     .bind(nats_seq)
@@ -167,27 +183,33 @@ pub async fn setup_pool() -> PgPool {
 }
 
 /// Start the shared testcontainers stack (if not already started) and return a
-/// Keto client.
+/// permission client backed by the sso-gateway.
 #[cfg(test)]
-pub async fn setup_keto() -> std::sync::Arc<sunbeam_g2v::middleware::auth::keto::KetoClient> {
-    containers::setup().await.keto.clone()
+pub async fn setup_permission() -> std::sync::Arc<crate::auth::permission_client::PermissionClient>
+{
+    containers::setup().await.permission.clone()
 }
 
-/// Start the shared testcontainers stack (if not already started) and return an
-/// OpenSearch client.
+/// Start the shared testcontainers stack (if not already started) and return the
+/// sso-gateway base URL.
 #[cfg(test)]
-pub async fn setup_opensearch() -> std::sync::Arc<crate::integrations::opensearch::OpenSearchClient>
-{
-    use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
-    containers::setup().await;
-    let url =
-        std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string());
-    std::sync::Arc::new(OpenSearchClient::new(OpenSearchConfig { url }))
+pub async fn setup_sso_gateway_url() -> String {
+    containers::setup().await.sso_gateway_url.clone()
+}
+
+/// Tenant ID of the Kanban service application provisioned by the test harness.
+///
+/// Read from `KANBAN_TEST_TENANT_ID`, which the container harness exports
+/// during bootstrap. Tests that run before the harness starts (pure unit
+/// tests that never reach the gateway) fall back to a placeholder value.
+#[cfg(test)]
+pub fn test_tenant_id() -> String {
+    std::env::var("KANBAN_TEST_TENANT_ID").unwrap_or_else(|_| "test-tenant".to_string())
 }
 
 // ── Testcontainers-backed dependency harness ───────────────────────────────
 //
-// This module starts Postgres, NATS (JetStream), Ory Keto, MinIO, and
+// This module starts Postgres, NATS (JetStream), sso-gateway, MinIO, and
 // OpenSearch in throwaway containers when `containers::setup()` is first called.
 // Containers are started through the Docker-compatible API pointed at by
 // `DOCKER_HOST`; testcontainers' host-port mapping is used, so the harness
@@ -196,17 +218,32 @@ pub async fn setup_opensearch() -> std::sync::Arc<crate::integrations::opensearc
 #[cfg(test)]
 pub(crate) mod containers {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use futures::FutureExt;
     use sqlx::postgres::PgPoolOptions;
+    use sunbeam_g2v::client::{ClientBuilder, ConnectTransport};
     use sunbeam_g2v::config::NatsConfig;
-    use sunbeam_g2v::middleware::auth::keto::KetoClient;
     use sunbeam_g2v::mq::NatsClient;
+
+    use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
+    use std::collections::HashMap;
+
+    type PermissionClientCache = HashMap<(String, String, String), Arc<PermissionClient>>;
+
+    use crate::iam_proto::iam::v1::{
+        ApplicationServiceClient, CreateApplicationRequest, CreateTenantRequest,
+        RotateSecretRequest, TenantServiceClient,
+    };
     use testcontainers::core::{ContainerPort, IntoContainerPort};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
     use tokio::sync::OnceCell;
     use tokio::time::sleep;
+
+    use sunbeam_test::SsoGateway;
+    use sunbeam_test::sso_gateway::SsoGatewayHandle;
 
     use crate::integrations::s3::{S3Client, S3Config};
 
@@ -218,8 +255,9 @@ pub(crate) mod containers {
     fn nats_image() -> String {
         std::env::var("KANBAN_TEST_NATS_IMAGE").unwrap_or_else(|_| "nats:2.10-alpine".to_string())
     }
-    fn keto_image() -> String {
-        std::env::var("KANBAN_TEST_KETO_IMAGE").unwrap_or_else(|_| "oryd/keto:v26.2.0".to_string())
+    fn sso_gateway_image() -> String {
+        std::env::var("KANBAN_TEST_SSO_GATEWAY_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/sunbeamdotpt/sso-gateway:v2026.07.21".to_string())
     }
     fn minio_image() -> String {
         std::env::var("KANBAN_TEST_MINIO_IMAGE")
@@ -229,6 +267,11 @@ pub(crate) mod containers {
         std::env::var("KANBAN_TEST_OPENSEARCH_IMAGE")
             .unwrap_or_else(|_| "opensearchproject/opensearch:2.19.1".to_string())
     }
+
+    /// Fixed bootstrap secret shared with the sso-gateway container. Tests use
+    /// the `system-bootstrap-client` credentials to obtain permission tokens.
+    const SYSTEM_BOOTSTRAP_CLIENT_SECRET: &str =
+        "sunbeam-test-bootstrap-secret-key-at-least-32-bytes";
 
     const MINIO_BUCKET: &str = "sunbeam-kanban";
 
@@ -256,6 +299,9 @@ pub(crate) mod containers {
             if std::path::Path::new(path).exists()
                 && std::os::unix::net::UnixStream::connect(path).is_ok()
             {
+                // SAFETY: test-harness bootstrap. Concurrent tests may race this
+                // write, but every racer sets an identical value and DOCKER_HOST
+                // is only read by testcontainers afterwards.
                 unsafe {
                     std::env::set_var("DOCKER_HOST", format!("unix://{path}"));
                 }
@@ -273,65 +319,114 @@ pub(crate) mod containers {
     pub struct TestInfra {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
-        pub keto: Arc<KetoClient>,
+        pub permission: Arc<PermissionClient>,
+        pub sso_gateway_url: String,
     }
 
-    /// Connection URLs and container handles shared by the whole test process.
+    /// Connection URLs, OAuth2 credentials, and container handles shared by the
+    /// whole test process.
     struct SharedInfra {
         database_url: String,
         nats_url: String,
-        keto_read_url: String,
-        keto_write_url: String,
+        sso_gateway_url: String,
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
         _pg: Option<ContainerAsync<GenericImage>>,
         _nats: Option<ContainerAsync<GenericImage>>,
-        _keto: Option<ContainerAsync<GenericImage>>,
+        _sso_gateway: Option<SsoGatewayHandle>,
         _minio: Option<ContainerAsync<GenericImage>>,
         _opensearch: Option<ContainerAsync<GenericImage>>,
     }
 
     impl SharedInfra {
-        fn urls(&self) -> (String, String, String, String) {
+        fn urls(&self) -> (String, String, String, String, String, String) {
             (
                 self.database_url.clone(),
                 self.nats_url.clone(),
-                self.keto_read_url.clone(),
-                self.keto_write_url.clone(),
+                self.sso_gateway_url.clone(),
+                self.tenant_id.clone(),
+                self.client_id.clone(),
+                self.client_secret.clone(),
             )
         }
     }
 
     static SHARED: OnceCell<SharedInfra> = OnceCell::const_new();
 
+    /// Shared permission clients keyed by service credentials so that parallel
+    /// tests do not each trigger a separate OAuth2 token fetch against the
+    /// sso-gateway.
+    static PERMISSION_CLIENT_CACHE: OnceCell<tokio::sync::Mutex<PermissionClientCache>> =
+        OnceCell::const_new();
+
+    /// Set when the shared bootstrap panics inside the `SHARED` initializer.
+    /// A panicked `OnceCell::get_or_init` leaves the cell empty, so without
+    /// this guard every subsequent test would re-pay the full container
+    /// bootstrap (and leak another container set) only to fail at the same
+    /// place.
+    static BOOTSTRAP_FAILED: AtomicBool = AtomicBool::new(false);
+
     /// Set up the shared test infrastructure and return a fresh `TestInfra`
     /// for the calling test.
     pub async fn setup() -> TestInfra {
         ensure_docker_host();
 
+        if BOOTSTRAP_FAILED.load(Ordering::SeqCst) {
+            panic!("shared test infrastructure bootstrap previously failed; not retrying");
+        }
+
         let infra = SHARED
             .get_or_init(|| async {
-                if let Some(infra) = from_env().await {
-                    infra
-                } else {
-                    start_containers().await
+                // `tokio::OnceCell` wakes a waiting caller to re-run the
+                // initializer when the previous attempt panics. Fail fast
+                // instead of leaking a second container stack into the VM.
+                if BOOTSTRAP_FAILED.load(Ordering::SeqCst) {
+                    panic!("shared test infrastructure bootstrap previously failed; not retrying");
+                }
+                let bootstrap = async {
+                    if let Some(infra) = from_env().await {
+                        infra
+                    } else {
+                        start_containers().await
+                    }
+                };
+                match std::panic::AssertUnwindSafe(bootstrap).catch_unwind().await {
+                    Ok(infra) => infra,
+                    Err(payload) => {
+                        BOOTSTRAP_FAILED.store(true, Ordering::SeqCst);
+                        std::panic::resume_unwind(payload);
+                    }
                 }
             })
             .await;
 
-        let (database_url, nats_url, keto_read_url, keto_write_url) = infra.urls();
+        let (database_url, nats_url, sso_gateway_url, tenant_id, client_id, client_secret) =
+            infra.urls();
 
-        build_test_infra(&database_url, &nats_url, &keto_read_url, &keto_write_url).await
+        build_test_infra(
+            &database_url,
+            &nats_url,
+            &sso_gateway_url,
+            &tenant_id,
+            &client_id,
+            &client_secret,
+        )
+        .await
     }
 
     /// Use externally-provided services when the standard env vars are set.
+    ///
+    /// The caller is expected to have bootstrapped an OAuth2 application with
+    /// `permission:admin` and to expose its credentials via `HYDRA_CLIENT_ID`
+    /// and `HYDRA_CLIENT_SECRET`.
     async fn from_env() -> Option<SharedInfra> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let nats_url = std::env::var("NATS_URL").ok()?;
-        let keto_read_url = std::env::var("KETO_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_READ_ADDR"))
-            .ok()?;
-        let keto_write_url = std::env::var("KETO_WRITE_GRPC_URL")
-            .or_else(|_| std::env::var("KETO_WRITE_ADDR"))
-            .ok()?;
+        let sso_gateway_url = std::env::var("SSO_GATEWAY_URL").ok()?;
+        let tenant_id = std::env::var("KANBAN_TEST_TENANT_ID").unwrap_or_default();
+        let client_id = std::env::var("HYDRA_CLIENT_ID").unwrap_or_default();
+        let client_secret = std::env::var("HYDRA_CLIENT_SECRET").unwrap_or_default();
 
         // Ensure an S3 bucket exists even when the rest of the stack is external.
         let _ = ensure_minio().await;
@@ -339,11 +434,13 @@ pub(crate) mod containers {
         Some(SharedInfra {
             database_url,
             nats_url,
-            keto_read_url,
-            keto_write_url,
+            sso_gateway_url,
+            tenant_id,
+            client_id,
+            client_secret,
             _pg: None,
             _nats: None,
-            _keto: None,
+            _sso_gateway: None,
             _minio: None,
             _opensearch: None,
         })
@@ -351,7 +448,9 @@ pub(crate) mod containers {
 
     /// Start all containers, run migrations, and return the shared URLs/handles.
     async fn start_containers() -> SharedInfra {
-        eprintln!("[testcontainers] starting Postgres, NATS, Keto, MinIO, and OpenSearch...");
+        eprintln!(
+            "[testcontainers] starting Postgres, NATS, sso-gateway, MinIO, and OpenSearch..."
+        );
 
         let startup_timeout = Duration::from_secs(600);
 
@@ -363,11 +462,7 @@ pub(crate) mod containers {
         let (nats_host, nats_port) = host_port(&nats, 4222).await;
         let nats_url = format!("nats://{nats_host}:{nats_port}");
 
-        let keto = start_keto(startup_timeout).await;
-        let (keto_host, keto_read_port) = host_port(&keto, 4466).await;
-        let (_, keto_write_port) = host_port(&keto, 4467).await;
-        let keto_read_url = format!("http://{keto_host}:{keto_read_port}");
-        let keto_write_url = format!("http://{keto_host}:{keto_write_port}");
+        let (sso_gateway, sso_gateway_url) = start_sso_gateway_stack().await;
 
         let minio = start_minio(startup_timeout).await;
         let (minio_host, minio_port) = host_port(&minio, 9000).await;
@@ -378,17 +473,53 @@ pub(crate) mod containers {
         let opensearch_url = format!("http://{opensearch_host}:{opensearch_port}");
 
         // Export the service URLs as environment variables so that tests that
-        // spin up their own clients (e.g. auth::keto_dispatch integration tests)
+        // spin up their own clients (e.g. auth::permission_dispatch integration tests)
         // can find the running containers.
+        // SAFETY: runs once inside the SHARED OnceCell initializer, before any
+        // test receives its infra handles and reads these variables.
         unsafe {
             std::env::set_var("DATABASE_URL", &database_url);
             std::env::set_var("NATS_URL", &nats_url);
-            std::env::set_var("KETO_GRPC_URL", &keto_read_url);
-            std::env::set_var("KETO_READ_ADDR", &keto_read_url);
-            std::env::set_var("KETO_WRITE_GRPC_URL", &keto_write_url);
-            std::env::set_var("KETO_WRITE_ADDR", &keto_write_url);
+            std::env::set_var("SSO_GATEWAY_URL", &sso_gateway_url);
+            std::env::set_var("SSO_GATEWAY_PERMISSION_URL", &sso_gateway_url);
+            std::env::set_var(
+                "SSO_GATEWAY_TOKEN_URL",
+                format!("{sso_gateway_url}/oauth2/token"),
+            );
+            std::env::set_var(
+                "HYDRA_INTROSPECTION_URL",
+                format!("{sso_gateway_url}/oauth2/introspect"),
+            );
             std::env::set_var("OPENSEARCH_URL", &opensearch_url);
         }
+
+        // Bootstrap a dedicated tenant + application with `permission:admin`.
+        // Do this once per shared stack so parallel tests reuse the same
+        // service credentials.
+        let (tenant_id, client_id, client_secret) = bootstrap_kanban_app(&sso_gateway_url)
+            .await
+            .expect("failed to bootstrap sso-gateway tenant/application");
+        // SAFETY: same OnceCell initialization as above; single writer.
+        unsafe {
+            std::env::set_var("HYDRA_CLIENT_ID", &client_id);
+            std::env::set_var("HYDRA_CLIENT_SECRET", &client_secret);
+            std::env::set_var("KANBAN_TEST_TENANT_ID", &tenant_id);
+        }
+
+        // Register the Kanban permission namespace + authorization model in
+        // the kanban-test tenant (the service app's home tenant). Idempotent on
+        // the gateway side.
+        let provisioner = PermissionClient::new(&PermissionClientConfig {
+            base_url: sso_gateway_url.clone(),
+            token_url: format!("{sso_gateway_url}/oauth2/token"),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+        })
+        .expect("failed to build permission client for namespace provisioning");
+        provisioner
+            .ensure_kanban_namespace()
+            .await
+            .expect("failed to ensure Kanban permission namespace");
 
         // Run migrations against the fresh Postgres instance.
         {
@@ -400,6 +531,7 @@ pub(crate) mod containers {
         }
 
         // Create the MinIO bucket used by attachment tests.
+        // SAFETY: same OnceCell initialization as above; single writer.
         unsafe {
             std::env::set_var("S3_ENDPOINT", &s3_endpoint);
             std::env::set_var("S3_REGION", "us-east-1");
@@ -417,11 +549,13 @@ pub(crate) mod containers {
         SharedInfra {
             database_url,
             nats_url,
-            keto_read_url,
-            keto_write_url,
+            sso_gateway_url,
+            tenant_id,
+            client_id,
+            client_secret,
             _pg: Some(pg),
             _nats: Some(nats),
-            _keto: Some(keto),
+            _sso_gateway: Some(sso_gateway),
             _minio: Some(minio),
             _opensearch: Some(opensearch),
         }
@@ -466,21 +600,20 @@ pub(crate) mod containers {
 
         // Poll until Postgres accepts connections.
         for _ in 0..120 {
-            match tokio::net::TcpStream::connect((host.as_str(), port)).await {
-                Ok(_) => {
-                    let url = format!("postgres://sunbeam:sunbeam@{host}:{port}/kanban");
-                    if let Ok(pool) = PgPoolOptions::new()
-                        .max_connections(1)
-                        .acquire_timeout(Duration::from_secs(2))
-                        .connect(&url)
-                        .await
-                    {
-                        if sqlx::query("SELECT 1").fetch_optional(&pool).await.is_ok() {
-                            return container;
-                        }
-                    }
+            if tokio::net::TcpStream::connect((host.as_str(), port))
+                .await
+                .is_ok()
+            {
+                let url = format!("postgres://sunbeam:sunbeam@{host}:{port}/kanban");
+                if let Ok(pool) = PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(2))
+                    .connect(&url)
+                    .await
+                    && sqlx::query("SELECT 1").fetch_optional(&pool).await.is_ok()
+                {
+                    return container;
                 }
-                Err(_) => {}
             }
             sleep(Duration::from_millis(500)).await;
         }
@@ -519,48 +652,26 @@ pub(crate) mod containers {
         panic!("NATS did not become ready in time");
     }
 
-    async fn start_keto(timeout: Duration) -> ContainerAsync<GenericImage> {
-        let config = keto_config();
-        let image = keto_image();
-
+    async fn start_sso_gateway_stack() -> (SsoGatewayHandle, String) {
+        let image = sso_gateway_image();
         let parts: Vec<&str> = image.rsplitn(2, ':').collect();
         let (name, tag) = match parts.as_slice() {
             [tag, name] => (name.to_string(), tag.to_string()),
             _ => (image, "latest".to_string()),
         };
 
-        let container = GenericImage::new(name, tag)
-            .with_exposed_port(ContainerPort::Tcp(4466))
-            .with_exposed_port(ContainerPort::Tcp(4467))
-            .with_exposed_port(ContainerPort::Tcp(4468))
-            .with_copy_to("/home/ory/keto.yml", config.into_bytes())
-            .with_env_var("KETO_WATCH", "false")
-            .with_cmd(vec!["serve", "-c", "/home/ory/keto.yml"])
-            .with_startup_timeout(timeout)
+        let handle = SsoGateway::new()
+            .with_image(name, tag)
+            .with_env(
+                "SYSTEM_BOOTSTRAP_CLIENT_SECRET",
+                SYSTEM_BOOTSTRAP_CLIENT_SECRET,
+            )
             .start()
             .await
-            .expect("failed to start Keto container");
+            .expect("failed to start sso-gateway stack");
 
-        let (host, read_port) = host_port(&container, 4466).await;
-        let (_, write_port) = host_port(&container, 4467).await;
-
-        let client = KetoClient::new(sunbeam_g2v::middleware::auth::keto::KetoConfig {
-            grpc_endpoint: format!("http://{host}:{read_port}"),
-            write_grpc_endpoint: format!("http://{host}:{write_port}"),
-        });
-
-        for _ in 0..120 {
-            if client
-                .check_permission("_kanban_health", "probe", "health", "probe-subject")
-                .await
-                .is_ok()
-            {
-                return container;
-            }
-            sleep(Duration::from_millis(250)).await;
-        }
-
-        panic!("Keto did not become ready in time");
+        let url = handle.endpoint().to_string();
+        (handle, url)
     }
 
     async fn start_minio(timeout: Duration) -> ContainerAsync<GenericImage> {
@@ -585,10 +696,10 @@ pub(crate) mod containers {
 
         for _ in 0..120 {
             let url = format!("http://{host}:{port}/minio/health/live");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if resp.status().is_success() {
-                    return container;
-                }
+            if let Ok(resp) = reqwest::get(&url).await
+                && resp.status().is_success()
+            {
+                return container;
             }
             sleep(Duration::from_millis(250)).await;
         }
@@ -623,16 +734,12 @@ pub(crate) mod containers {
 
         for _ in 0..240 {
             let url = format!("http://{host}:{port}/_cluster/health");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if resp.status().is_success() {
-                    if let Ok(body) = resp.text().await {
-                        if body.contains("\"status\":\"green\"")
-                            || body.contains("\"status\":\"yellow\"")
-                        {
-                            return container;
-                        }
-                    }
-                }
+            if let Ok(resp) = reqwest::get(&url).await
+                && resp.status().is_success()
+                && let Ok(body) = resp.text().await
+                && (body.contains("\"status\":\"green\"") || body.contains("\"status\":\"yellow\""))
+            {
+                return container;
             }
             sleep(Duration::from_millis(500)).await;
         }
@@ -640,46 +747,12 @@ pub(crate) mod containers {
         panic!("OpenSearch did not become ready in time");
     }
 
-    /// Return a Keto YAML that declares the namespaces used by kanban.
-    ///
-    /// The in-memory Keto instance uses legacy namespace declarations so any
-    /// relation/permission can be checked as a direct tuple. Tests that rely on
-    /// derived permissions (e.g. board `view` via project access) must write the
-    /// explicit `view` tuple themselves.
-    fn keto_config() -> String {
-        r#"
-dsn: memory
-namespaces:
-  - id: 0
-    name: KanbanProject
-  - id: 1
-    name: KanbanBoard
-  - id: 2
-    name: KanbanCard
-  - id: 3
-    name: KanbanAggregatedBoard
-  - id: 4
-    name: _kanban_health
-serve:
-  read:
-    host: 0.0.0.0
-    port: 4466
-  write:
-    host: 0.0.0.0
-    port: 4467
-  metrics:
-    host: 0.0.0.0
-    port: 4468
-"#
-        .to_string()
-    }
-
     /// Ensure an S3-compatible endpoint is available for attachments tests.
     ///
     /// If `S3_ENDPOINT` is already set the harness reuses it and returns it.
     /// Otherwise it starts a MinIO container and returns the endpoint.
     async fn ensure_minio() -> String {
-        if let Some(endpoint) = std::env::var("S3_ENDPOINT").ok() {
+        if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
             return endpoint;
         }
 
@@ -687,6 +760,7 @@ serve:
         let (host, port) = host_port(&minio, 9000).await;
         let endpoint = format!("http://{host}:{port}");
 
+        // SAFETY: called from within the SHARED OnceCell initializer; single writer.
         unsafe {
             std::env::set_var("S3_ENDPOINT", &endpoint);
             std::env::set_var("S3_REGION", "us-east-1");
@@ -703,24 +777,210 @@ serve:
         endpoint
     }
 
-    /// Build a fresh `TestInfra` from the shared URLs so each test owns its own
-    /// connections and is isolated from other parallel tests.
+    /// Build a fresh `TestInfra` from the shared URLs/credentials so each test
+    /// owns its own connections and is isolated from other parallel tests.
     async fn build_test_infra(
         database_url: &str,
         nats_url: &str,
-        keto_read_url: &str,
-        keto_write_url: &str,
+        sso_gateway_url: &str,
+        _tenant_id: &str,
+        client_id: &str,
+        client_secret: &str,
     ) -> TestInfra {
         let pool = connect_pool(database_url).await;
         let nats = connect_nats(nats_url).await;
-        let keto = Arc::new(KetoClient::new(
-            sunbeam_g2v::middleware::auth::keto::KetoConfig {
-                grpc_endpoint: keto_read_url.to_string(),
-                write_grpc_endpoint: keto_write_url.to_string(),
-            },
-        ));
 
-        TestInfra { pool, nats, keto }
+        let cache = PERMISSION_CLIENT_CACHE
+            .get_or_init(|| async { tokio::sync::Mutex::new(PermissionClientCache::new()) })
+            .await;
+        let key = (
+            sso_gateway_url.to_string(),
+            client_id.to_string(),
+            client_secret.to_string(),
+        );
+        let mut clients = cache.lock().await;
+        let permission = clients.entry(key).or_insert_with(|| {
+            Arc::new(
+                PermissionClient::new(&PermissionClientConfig {
+                    base_url: sso_gateway_url.to_string(),
+                    token_url: format!("{sso_gateway_url}/oauth2/token"),
+                    client_id: client_id.to_string(),
+                    client_secret: client_secret.to_string(),
+                })
+                .expect("failed to build permission client"),
+            )
+        });
+        let permission = Arc::clone(permission);
+        drop(clients);
+
+        TestInfra {
+            pool,
+            nats,
+            permission,
+            sso_gateway_url: sso_gateway_url.to_string(),
+        }
+    }
+
+    /// Create the well-known `kanban-test` tenant and its Kanban service
+    /// application with `permission:admin`.
+    async fn bootstrap_kanban_app(
+        sso_gateway_url: &str,
+    ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+        create_tenant_app(sso_gateway_url, "kanban-test", "Kanban Test Tenant").await
+    }
+
+    /// Create a tenant using the system bootstrap client and return its id.
+    pub async fn create_tenant(
+        sso_gateway_url: &str,
+        slug: &str,
+        display_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let base_uri = sso_gateway_url
+            .parse::<http::Uri>()
+            .map_err(|e| format!("invalid sso-gateway URL: {e}"))?;
+
+        let admin_token = fetch_bootstrap_token(sso_gateway_url, "tenant:admin")
+            .await
+            .map_err(|e| format!("failed to fetch admin token: {e}"))?;
+
+        let client = ClientBuilder::new(sso_gateway_url)
+            .auth(sunbeam_g2v::client::BearerToken::new(admin_token))
+            .build()
+            .map_err(|e| format!("failed to build IAM admin client: {e}"))?;
+        let transport = ConnectTransport::new(client, base_uri.clone());
+        let config = connectrpc::client::ClientConfig::new(base_uri);
+
+        let tenant_client = TenantServiceClient::new(transport, config);
+
+        let tenant = tenant_client
+            .create_tenant(CreateTenantRequest {
+                slug: slug.to_string(),
+                display_name: display_name.to_string(),
+                settings: Default::default(),
+                __buffa_unknown_fields: Default::default(),
+            })
+            .await
+            .map_err(|e| format!("CreateTenant failed: {e}"))?
+            .into_owned();
+
+        Ok(tenant.id)
+    }
+
+    /// Create a tenant and a Kanban service application with `permission:admin`
+    /// inside it, returning `(tenant_id, client_id, client_secret)`.
+    ///
+    /// The system bootstrap client first exchanges its credentials for an access
+    /// token; that token is used to call the IAM Connect-RPC endpoints. The new
+    /// application uses `client_secret_post` so that
+    /// `sunbeam_g2v::client::OAuth2ClientCredentials` can fetch tokens with
+    /// form-encoded credentials. The application is created with
+    /// `cross_tenant: true` so it can target other tenants via `x-tenant-id`.
+    pub async fn create_tenant_app(
+        sso_gateway_url: &str,
+        slug: &str,
+        display_name: &str,
+    ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+        let tenant_id = create_tenant(sso_gateway_url, slug, display_name).await?;
+
+        let base_uri = sso_gateway_url
+            .parse::<http::Uri>()
+            .map_err(|e| format!("invalid sso-gateway URL: {e}"))?;
+
+        let admin_token = fetch_bootstrap_token(sso_gateway_url, "application:admin")
+            .await
+            .map_err(|e| format!("failed to fetch admin token: {e}"))?;
+
+        let client = ClientBuilder::new(sso_gateway_url)
+            .auth(sunbeam_g2v::client::BearerToken::new(admin_token))
+            .build()
+            .map_err(|e| format!("failed to build IAM admin client: {e}"))?;
+        let transport = ConnectTransport::new(client, base_uri.clone());
+        let config = connectrpc::client::ClientConfig::new(base_uri);
+
+        let app_client = ApplicationServiceClient::new(transport, config);
+
+        let tenant_options =
+            connectrpc::client::CallOptions::default().with_header("x-tenant-id", &tenant_id);
+
+        // Hydra serializes OAuth2 client writes; parallel tests can lose the
+        // race with a transient "Unable to serialize access" conflict. Retry
+        // only the app provisioning — the tenant already exists at this point.
+        let mut attempt = 0u32;
+        let secret = loop {
+            attempt += 1;
+            let created = async {
+                let app = app_client
+                    .create_application_with_options(
+                        CreateApplicationRequest {
+                            name: "kanban-service".to_string(),
+                            redirect_uris: vec![],
+                            grant_types: vec!["client_credentials".to_string()],
+                            response_types: vec!["token".to_string()],
+                            scope: vec!["permission:admin".to_string()],
+                            token_endpoint_auth_method: "client_secret_post".to_string(),
+                            cross_tenant: true,
+                            __buffa_unknown_fields: Default::default(),
+                        },
+                        tenant_options.clone(),
+                    )
+                    .await
+                    .map_err(|e| format!("CreateApplication failed: {e}"))?
+                    .into_owned();
+                eprintln!(
+                    "[kanban-test] created app id={} tenant={} cross_tenant={}",
+                    app.id, tenant_id, app.cross_tenant
+                );
+
+                app_client
+                    .rotate_secret_with_options(
+                        RotateSecretRequest {
+                            id: app.id,
+                            __buffa_unknown_fields: Default::default(),
+                        },
+                        tenant_options.clone(),
+                    )
+                    .await
+                    .map_err(|e| format!("RotateSecret failed: {e}"))
+                    .map(|r| r.into_owned())
+            }
+            .await;
+
+            match created {
+                Ok(secret) => break secret,
+                Err(e) => {
+                    let transient = e.contains("Unable to serialize access");
+                    if !transient || attempt >= 5 {
+                        return Err(e.into());
+                    }
+                    sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                }
+            }
+        };
+
+        Ok((tenant_id, secret.client_id, secret.client_secret))
+    }
+
+    /// Exchange the system bootstrap client credentials for an access token with
+    /// the requested scope.
+    ///
+    /// The gateway's OAuth2 token endpoint expects HTTP Basic authentication
+    /// (`client_secret_basic`) rather than form-encoded credentials.
+    async fn fetch_bootstrap_token(sso_gateway_url: &str, scope: &str) -> reqwest::Result<String> {
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .post(format!("{sso_gateway_url}/oauth2/token"))
+            .basic_auth(
+                "system-bootstrap-client",
+                Some(SYSTEM_BOOTSTRAP_CLIENT_SECRET),
+            )
+            .form(&[("grant_type", "client_credentials"), ("scope", scope)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(resp["access_token"].as_str().unwrap_or("").to_string())
     }
 
     async fn connect_pool(database_url: &str) -> sqlx::PgPool {
