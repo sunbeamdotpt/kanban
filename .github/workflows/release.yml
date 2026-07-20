@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag to build and push (e.g. v1.0.0)'
+        description: 'Image tag to build and push (e.g. v2026.07.0)'
         required: true
-        default: 'v1.0.0'
+        default: 'v2026.07.0'
 
 permissions:
   contents: read
@@ -36,6 +36,23 @@ jobs:
             echo "value=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Compute version tags
+        id: version_tags
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          VERSION="${TAG#v}"
+          MAJOR="${VERSION%%.*}"
+          MINOR_REST="${VERSION#*.}"
+          MINOR="${MINOR_REST%%.*}"
+          echo "patch=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "minor=v${MAJOR}.${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "major=v${MAJOR}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" != *-* ]]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -55,8 +72,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.tag.outputs.value }}
-            type=raw,value=latest,enable=${{ !contains(steps.tag.outputs.value, '-') }}
+            type=raw,value=${{ steps.version_tags.outputs.patch }}
+            type=raw,value=${{ steps.version_tags.outputs.minor }}
+            type=raw,value=${{ steps.version_tags.outputs.major }}
+            type=raw,value=latest,enable=${{ steps.version_tags.outputs.latest == 'true' }}
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6

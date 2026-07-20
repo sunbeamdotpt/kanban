@@ -4,7 +4,29 @@
 All notable changes to the Kanban backend will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
+
+## [2026.07.0] - 2026-07-20
+
+### Changed
+
+- **Breaking:** All proto messages are now buf STANDARD compliant, and RPC request/response messages use per-RPC wrapper types. Clients must be updated to the new proto definitions.
+- Migrated authorization from Keto to the sso-gateway's `PermissionService` (OpenFGA-backed, one store per tenant). The Kanban permission namespace and OpenFGA model are provisioned at server boot from `.integration/openfga-model.json`.
+- Every mutating RPC now requires the `x-sunbeam-object-id` header; handlers read the checked object ID from request extensions instead of the protobuf body.
+- Tenant is resolved from the introspected token; trusted service-to-service calls may carry `x-tenant-id`.
+- Server boot readiness now proxies the sso-gateway's `/health/ready` and fails fast when the permission namespace cannot be provisioned.
+
+### Added
+
+- Multitenancy across all services: `tenant_id` columns throughout the database schema and dev seeds, with every query and OpenSearch/S3 integration scoped per tenant.
+- `sunbeam-g2v` integration via generated sso-gateway/IAM proto clients for permission checks.
+- buf configuration and a buf CI workflow for proto linting.
+
+### Removed
+
+- Keto dependency, its namespaces configuration, and the `uuid_to_ulids` system migration.
+- Unused JetStream helper functions.
+- The `test.sh` wrapper; the integration test harness is now self-contained under `cargo test` and boots the sso-gateway via testcontainers.
 
 ## [1.0.0-rc6] - 2026-06-27
 
@@ -121,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
+[2026.07.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.0
 [1.0.0-rc3]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc2
 [1.0.0-rc1]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc1

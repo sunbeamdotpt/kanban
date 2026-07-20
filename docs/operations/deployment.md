@@ -43,6 +43,17 @@ The image is built in two stages:
 
 Only the `kanban` server binary is included in the runtime image. The `permission-coverage` binary is CI-only and is not shipped.
 
+## Release workflow and versioning
+
+Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.0`). The patch field counts releases within the month and resets to `0` on the first release of each new month. Pushing a tag matching `v*` triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR. The workflow can also be triggered manually from the Actions tab.
+
+Each release publishes multiple tags so deployments can choose their pinning level:
+
+- `v2026.07.0` — the exact release.
+- `v2026.07` — floats to the latest release in the month.
+- `v2026` — floats to the latest release in the year.
+- `latest` — floats to the most recent non-prerelease tag.
+
 ## Migrations
 
 Migrations are applied by the default `kanban` binary at boot using `sqlx::migrate!("./migrations")`. No separate migration Job or binary is required.
