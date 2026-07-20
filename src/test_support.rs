@@ -242,8 +242,8 @@ pub(crate) mod containers {
     use tokio::sync::OnceCell;
     use tokio::time::sleep;
 
-    use sunbeam_test::SsoGateway;
-    use sunbeam_test::sso_gateway::SsoGatewayHandle;
+    use sdk::testing::SsoGateway;
+    use sdk::testing::sso_gateway::SsoGatewayHandle;
 
     use crate::integrations::s3::{S3Client, S3Config};
 

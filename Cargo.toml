@@ -67,7 +67,7 @@ url = "2"
 # Pinned to an immutable rev because no tag yet contains the OpenFGA
 # permission-backend orchestration (feat eb26009). Cut a tag and switch back
 # to `tag = "..."` when one is available.
-sunbeam-test = { git = "https://github.com/sunbeamdotpt/test", rev = "de5e66e" }
+sdk = { git = "https://github.com/sunbeamdotpt/sdk", tag = "v3.0.0", default-features = false, features = ["testing"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "nats", "minio"] }
 futures = "0.3"
