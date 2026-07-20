@@ -564,65 +564,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn s3_config_from_env_uses_defaults_when_unset() {
+    const S3_ENV_KEYS: [&str; 5] = [
+        "S3_ENDPOINT",
+        "S3_REGION",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "S3_BUCKET",
+    ];
+
+    /// Snapshot the S3_* variables, run `f` with them cleared, then restore.
+    /// The integration-test harness exports S3_* process-wide, so leaving them
+    /// cleared or overwritten breaks attachments tests.
+    fn with_s3_env_cleared(f: impl FnOnce()) {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
-        for key in [
-            "S3_ENDPOINT",
-            "S3_REGION",
-            "S3_ACCESS_KEY",
-            "S3_SECRET_KEY",
-            "S3_BUCKET",
-        ] {
+        let snapshot: Vec<(&str, Option<String>)> = S3_ENV_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+
+        for (key, _) in &snapshot {
             // SAFETY: test-only env manipulation serialized through ENV_LOCK.
             unsafe { std::env::remove_var(key) };
         }
 
-        let cfg = S3Config::from_env();
-        assert_eq!(
-            cfg.endpoint,
-            "http://seaweedfs-filer.storage.svc.cluster.local:8333"
-        );
-        assert_eq!(cfg.region, "us-east-1");
-        assert!(cfg.access_key.is_empty());
-        assert!(cfg.secret_key.is_empty());
-        assert_eq!(cfg.bucket, "sunbeam-kanban");
+        f();
+
+        for (key, val) in snapshot {
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s3_config_from_env_uses_defaults_when_unset() {
+        with_s3_env_cleared(|| {
+            let cfg = S3Config::from_env();
+            assert_eq!(
+                cfg.endpoint,
+                "http://seaweedfs-filer.storage.svc.cluster.local:8333"
+            );
+            assert_eq!(cfg.region, "us-east-1");
+            assert!(cfg.access_key.is_empty());
+            assert!(cfg.secret_key.is_empty());
+            assert_eq!(cfg.bucket, "sunbeam-kanban");
+        });
     }
 
     #[test]
     fn s3_config_from_env_reads_overrides() {
-        use crate::config::ENV_LOCK;
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::set_var("S3_ENDPOINT", "http://minio:9000") };
-        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::set_var("S3_REGION", "eu-west-1") };
-        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::set_var("S3_ACCESS_KEY", "access") };
-        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::set_var("S3_SECRET_KEY", "secret") };
-        // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::set_var("S3_BUCKET", "bucket") };
-
-        let cfg = S3Config::from_env();
-        assert_eq!(cfg.endpoint, "http://minio:9000");
-        assert_eq!(cfg.region, "eu-west-1");
-        assert_eq!(cfg.access_key, "access");
-        assert_eq!(cfg.secret_key, "secret");
-        assert_eq!(cfg.bucket, "bucket");
-
-        for key in [
-            "S3_ENDPOINT",
-            "S3_REGION",
-            "S3_ACCESS_KEY",
-            "S3_SECRET_KEY",
-            "S3_BUCKET",
-        ] {
+        with_s3_env_cleared(|| {
             // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-            unsafe { std::env::remove_var(key) };
-        }
+            unsafe { std::env::set_var("S3_ENDPOINT", "http://minio:9000") };
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe { std::env::set_var("S3_REGION", "eu-west-1") };
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe { std::env::set_var("S3_ACCESS_KEY", "access") };
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe { std::env::set_var("S3_SECRET_KEY", "secret") };
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe { std::env::set_var("S3_BUCKET", "bucket") };
+
+            let cfg = S3Config::from_env();
+            assert_eq!(cfg.endpoint, "http://minio:9000");
+            assert_eq!(cfg.region, "eu-west-1");
+            assert_eq!(cfg.access_key, "access");
+            assert_eq!(cfg.secret_key, "secret");
+            assert_eq!(cfg.bucket, "bucket");
+        });
     }
 }

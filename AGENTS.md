@@ -105,12 +105,12 @@ KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 
 ### Releases
 
-Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.0`). The patch field counts releases within the month and resets to `0` on the first release of each new month. To cut a release: bump `version` in `Cargo.toml` (semver-compatible form without the zero-padded month, e.g. `2026.7.0`), add a `CHANGELOG.md` entry, commit, tag `vYYYY.0M.PATCH`, and push. The tag triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR under four tags: the exact release, the floating `vYYYY.0M` and `vYYYY`, and `latest` (skipped for prerelease tags).
+Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.1`). The patch field counts releases within the month and resets to `0` on the first release of each new month. To cut a release: bump `version` in `Cargo.toml` (semver-compatible form without the zero-padded month, e.g. `2026.7.0`), add a `CHANGELOG.md` entry, commit, tag `vYYYY.0M.PATCH`, and push. The tag triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR under four tags: the exact release, the floating `vYYYY.0M` and `vYYYY`, and `latest` (skipped for prerelease tags).
 
 To build the image locally for both architectures:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.0 .
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.1 .
 ```
 
 The default buildx builder handles multi-platform builds even though `docker buildx ls` may not advertise them.
@@ -237,9 +237,9 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HYDRA_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint (historical env name). The gateway base URL — permission API, token endpoint, readiness proxy — is derived from it. |
-| `HYDRA_CLIENT_ID` | `''` | OAuth2 client ID for introspection Basic auth and service-to-service permission calls (app must hold `permission:admin`) |
-| `HYDRA_CLIENT_SECRET` | `''` | OAuth2 client secret for the above |
+| `SSO_GATEWAY_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint. The gateway base URL — permission API, token endpoint, readiness proxy — is derived from it. |
+| `SSO_GATEWAY_CLIENT_ID` | `''` | OAuth2 client ID for the service client-credentials used to call the sso-gateway. Introspection authenticates with a bearer token scoped `tenant:admin`; permission calls use `permission:admin`. The app must hold both scopes. |
+| `SSO_GATEWAY_CLIENT_SECRET` | `''` | OAuth2 client secret for the above |
 
 ### Dependencies
 
@@ -247,7 +247,7 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 |----------|---------|---------|
 | `NATS_URL` | `nats://localhost:4222` | NATS server |
 | `NATS_AUTH_TOKEN` | — | NATS auth callout token |
-| `SSO_GATEWAY_URL` | — | Test-only explicit gateway base URL (production derives it from `HYDRA_INTROSPECTION_URL`) |
+| `SSO_GATEWAY_URL` | — | Test-only explicit gateway base URL (production derives it from `SSO_GATEWAY_INTROSPECTION_URL`) |
 | `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
 | `KANBAN_OPENSEARCH_INDEX` | `sunbeam-kanban-cards-v1` | OpenSearch card index |
 

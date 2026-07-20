@@ -427,6 +427,10 @@ mod tests {
     // ── Test env config ──────────────────────────────────────────────────────
 
     fn s3_config() -> crate::integrations::s3::S3Config {
+        // Read under ENV_LOCK: the `integrations::s3` unit tests clear S3_*
+        // under the same lock.
+        use crate::config::ENV_LOCK;
+        let _guard = ENV_LOCK.lock().unwrap();
         crate::integrations::s3::S3Config::from_env()
     }
 

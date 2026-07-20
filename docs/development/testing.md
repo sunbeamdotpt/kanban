@@ -42,14 +42,14 @@ KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 
 ### Reusing an existing stack
 
-If you already have services running, set the standard env vars instead. The sso-gateway application credentials must belong to a service application holding `permission:admin`:
+If you already have services running, set the standard env vars instead. The sso-gateway application credentials must belong to a service application holding `permission:admin` and `tenant:admin`:
 
 ```sh
 export DATABASE_URL='postgres://sunbeam:sunbeam@localhost:5432/kanban'
 export NATS_URL='nats://localhost:4222'
 export SSO_GATEWAY_URL='http://localhost:8080'
-export HYDRA_CLIENT_ID='<service-app-client-id>'
-export HYDRA_CLIENT_SECRET='<service-app-client-secret>'
+export SSO_GATEWAY_CLIENT_ID='<service-app-client-id>'
+export SSO_GATEWAY_CLIENT_SECRET='<service-app-client-secret>'
 export KANBAN_TEST_TENANT_ID='<tenant-id-of-the-app>'
 export OPENSEARCH_URL='http://localhost:9200'
 export S3_ENDPOINT='http://localhost:9000'

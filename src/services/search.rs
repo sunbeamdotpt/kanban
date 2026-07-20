@@ -569,8 +569,17 @@ mod tests {
 
     // ── Integration helpers ────────────────────────────────────────────────────
 
-    fn os_client() -> Arc<OpenSearchClient> {
-        Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()))
+    async fn os_client() -> Arc<OpenSearchClient> {
+        // Ensure the container harness has exported OPENSEARCH_URL before
+        // reading it, and read under ENV_LOCK: the `integrations::opensearch`
+        // unit tests clear the variable under the same lock.
+        crate::test_support::containers::setup().await;
+        let cfg = {
+            use crate::config::ENV_LOCK;
+            let _guard = ENV_LOCK.lock().unwrap();
+            OpenSearchConfig::from_env()
+        };
+        Arc::new(OpenSearchClient::new(cfg))
     }
 
     async fn permission_client() -> Arc<PermissionClient> {
@@ -640,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_empty_when_index_missing() {
-        let os = os_client();
+        let os = os_client().await;
         let permission = permission_client().await;
 
         // Deliberately use a non-existent index name.
@@ -685,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_card_by_title_match() {
-        let os = os_client();
+        let os = os_client().await;
         let permission = permission_client().await;
 
         let index = test_index();
@@ -754,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_project_id() {
-        let os = os_client();
+        let os = os_client().await;
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -825,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_label_name() {
-        let os = os_client();
+        let os = os_client().await;
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -886,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_post_filters_via_permission_expand() {
-        let os = os_client();
+        let os = os_client().await;
         let permission = permission_client().await;
 
         let index = test_index();
@@ -996,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_paginates_via_next_cursor() {
-        let os = os_client();
+        let os = os_client().await;
 
         let index = test_index();
         os.create_cards_index(&index).await.expect("create index");
@@ -1123,7 +1132,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_public_board_hit_without_permission_relation() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1179,7 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_hides_private_board_hit_without_permission_relation() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1274,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_hits_by_tenant_id() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1330,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_returns_empty_when_query_matches_nothing() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1362,7 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_filters_by_project_id() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1403,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_filters_by_board_id() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1445,7 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_filters_by_label_name() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1501,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_filters_by_assignee_subject() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();
@@ -1557,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_handler_maps_completed_status() {
-        let os = os_client();
+        let os = os_client().await;
         let infra = containers::setup().await;
 
         let index = test_index();

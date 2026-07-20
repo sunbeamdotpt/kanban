@@ -6,6 +6,17 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.1] - 2026-07-20
+
+### Changed
+
+- **Breaking:** Renamed the sso-gateway configuration surface. `HYDRA_INTROSPECTION_URL`, `HYDRA_CLIENT_ID`, and `HYDRA_CLIENT_SECRET` are now `SSO_GATEWAY_INTROSPECTION_URL`, `SSO_GATEWAY_CLIENT_ID`, and `SSO_GATEWAY_CLIENT_SECRET` (flags `--sso-gateway-introspection-url`, `--sso-gateway-client-id`, `--sso-gateway-client-secret`). The old variables are no longer read; deployments must rename them before upgrading.
+- Token introspection no longer uses HTTP Basic client authentication. The service exchanges its client credentials for an access token scoped `tenant:admin` (cached by `expires_in`, refreshed on demand, one invalidate-and-retry on 401) and introspects with `Authorization: Bearer`. The OAuth2 application must hold the `tenant:admin` scope in addition to `permission:admin`.
+
+### Fixed
+
+- Fixed full-suite test runs: the S3/OpenSearch config unit tests now snapshot and restore the environment variables they clear (previously they leaked cleared/overridden values into concurrently scheduled integration tests), and the search/attachments integration helpers ensure the container harness is up and read service endpoints under the shared env lock.
+
 ## [2026.07.0] - 2026-07-20
 
 ### Changed
@@ -143,6 +154,7 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
+[2026.07.1]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.1
 [2026.07.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.0
 [1.0.0-rc3]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc3
 [1.0.0-rc2]: https://github.com/sunbeamdotpt/kanban/releases/tag/v1.0.0-rc2

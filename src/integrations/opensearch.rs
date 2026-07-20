@@ -643,10 +643,19 @@ mod tests {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
+        // Snapshot and restore: the integration-test harness exports
+        // OPENSEARCH_URL process-wide, so leaving it cleared breaks them.
+        let original = std::env::var("OPENSEARCH_URL").ok();
+
         // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::remove_var("OPENSEARCH_URL") };
         let cfg = OpenSearchConfig::from_env();
         assert_eq!(cfg.url, "http://localhost:9200");
+
+        if let Some(url) = original {
+            // SAFETY: test-only env manipulation serialized through ENV_LOCK.
+            unsafe { std::env::set_var("OPENSEARCH_URL", url) };
+        }
     }
 
     #[test]
@@ -654,11 +663,19 @@ mod tests {
         use crate::config::ENV_LOCK;
         let _guard = ENV_LOCK.lock().unwrap();
 
+        let original = std::env::var("OPENSEARCH_URL").ok();
+
         // SAFETY: test-only env manipulation serialized through ENV_LOCK.
         unsafe { std::env::set_var("OPENSEARCH_URL", "http://opensearch:9200") };
         let cfg = OpenSearchConfig::from_env();
         assert_eq!(cfg.url, "http://opensearch:9200");
+
         // SAFETY: test-only env manipulation serialized through ENV_LOCK.
-        unsafe { std::env::remove_var("OPENSEARCH_URL") };
+        unsafe {
+            match original {
+                Some(url) => std::env::set_var("OPENSEARCH_URL", url),
+                None => std::env::remove_var("OPENSEARCH_URL"),
+            }
+        }
     }
 }

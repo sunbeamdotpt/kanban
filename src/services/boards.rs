@@ -287,8 +287,9 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
 ///
 /// Returns `Ok(true)` while the introspected token expiry (`AuthContext.exp`)
 /// is still in the future, `Ok(false)` if it has expired, and never fails.
-/// Token revocation is handled by Hydra during the introspection call that
-/// creates the `AuthContext`, so no additional revocation check is needed here.
+/// Token revocation is handled by the sso-gateway during the introspection
+/// call that creates the `AuthContext`, so no additional revocation check is
+/// needed here.
 fn revalidate_token(_auth: &AuthContext) -> Result<bool, Status> {
     Ok(true)
 }

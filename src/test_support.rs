@@ -418,15 +418,15 @@ pub(crate) mod containers {
     /// Use externally-provided services when the standard env vars are set.
     ///
     /// The caller is expected to have bootstrapped an OAuth2 application with
-    /// `permission:admin` and to expose its credentials via `HYDRA_CLIENT_ID`
-    /// and `HYDRA_CLIENT_SECRET`.
+    /// `permission:admin` and `tenant:admin` and to expose its credentials via
+    /// `SSO_GATEWAY_CLIENT_ID` and `SSO_GATEWAY_CLIENT_SECRET`.
     async fn from_env() -> Option<SharedInfra> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let nats_url = std::env::var("NATS_URL").ok()?;
         let sso_gateway_url = std::env::var("SSO_GATEWAY_URL").ok()?;
         let tenant_id = std::env::var("KANBAN_TEST_TENANT_ID").unwrap_or_default();
-        let client_id = std::env::var("HYDRA_CLIENT_ID").unwrap_or_default();
-        let client_secret = std::env::var("HYDRA_CLIENT_SECRET").unwrap_or_default();
+        let client_id = std::env::var("SSO_GATEWAY_CLIENT_ID").unwrap_or_default();
+        let client_secret = std::env::var("SSO_GATEWAY_CLIENT_SECRET").unwrap_or_default();
 
         // Ensure an S3 bucket exists even when the rest of the stack is external.
         let _ = ensure_minio().await;
@@ -487,7 +487,7 @@ pub(crate) mod containers {
                 format!("{sso_gateway_url}/oauth2/token"),
             );
             std::env::set_var(
-                "HYDRA_INTROSPECTION_URL",
+                "SSO_GATEWAY_INTROSPECTION_URL",
                 format!("{sso_gateway_url}/oauth2/introspect"),
             );
             std::env::set_var("OPENSEARCH_URL", &opensearch_url);
@@ -501,8 +501,8 @@ pub(crate) mod containers {
             .expect("failed to bootstrap sso-gateway tenant/application");
         // SAFETY: same OnceCell initialization as above; single writer.
         unsafe {
-            std::env::set_var("HYDRA_CLIENT_ID", &client_id);
-            std::env::set_var("HYDRA_CLIENT_SECRET", &client_secret);
+            std::env::set_var("SSO_GATEWAY_CLIENT_ID", &client_id);
+            std::env::set_var("SSO_GATEWAY_CLIENT_SECRET", &client_secret);
             std::env::set_var("KANBAN_TEST_TENANT_ID", &tenant_id);
         }
 
@@ -867,7 +867,8 @@ pub(crate) mod containers {
     }
 
     /// Create a tenant and a Kanban service application with `permission:admin`
-    /// inside it, returning `(tenant_id, client_id, client_secret)`.
+    /// and `tenant:admin` inside it, returning `(tenant_id, client_id,
+    /// client_secret)`.
     ///
     /// The system bootstrap client first exchanges its credentials for an access
     /// token; that token is used to call the IAM Connect-RPC endpoints. The new
@@ -916,7 +917,10 @@ pub(crate) mod containers {
                             redirect_uris: vec![],
                             grant_types: vec!["client_credentials".to_string()],
                             response_types: vec!["token".to_string()],
-                            scope: vec!["permission:admin".to_string()],
+                            scope: vec![
+                                "permission:admin".to_string(),
+                                "tenant:admin".to_string(),
+                            ],
                             token_endpoint_auth_method: "client_secret_post".to_string(),
                             cross_tenant: true,
                             __buffa_unknown_fields: Default::default(),

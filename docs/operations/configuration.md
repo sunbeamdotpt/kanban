@@ -36,7 +36,7 @@ Command-line flags take precedence over environment variables. Run `kanban --hel
 | `OPENSEARCH_URL` | `--opensearch-url` | `http://localhost:9200` | OpenSearch URL. |
 | `KANBAN_OPENSEARCH_INDEX` | `--opensearch-index-name` | `sunbeam-kanban-cards-v1` | OpenSearch index for card search. |
 
-The sso-gateway base URL (permission API, token endpoint, readiness proxy) is not configured separately; it is derived from `HYDRA_INTROSPECTION_URL` (see below).
+The sso-gateway base URL (permission API, token endpoint, readiness proxy) is not configured separately; it is derived from `SSO_GATEWAY_INTROSPECTION_URL` (see below).
 
 ## PostgreSQL pool
 
@@ -49,9 +49,9 @@ The sso-gateway base URL (permission API, token endpoint, readiness proxy) is no
 
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
-| `HYDRA_INTROSPECTION_URL` | `--hydra-introspection-url` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint (the env var keeps its historical name). Every Bearer token is introspected here. The gateway base URL — permission API, token endpoint, readiness proxy — is derived by stripping the `/oauth2/introspect` suffix. |
-| `HYDRA_CLIENT_ID` | `--hydra-client-id` | `''` | OAuth2 client ID. Used for introspection Basic auth and for service-to-service permission calls; the application must hold the `permission:admin` scope. |
-| `HYDRA_CLIENT_SECRET` | `--hydra-client-secret` | `''` | OAuth2 client secret for the above. |
+| `SSO_GATEWAY_INTROSPECTION_URL` | `--sso-gateway-introspection-url` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint. Every Bearer token is introspected here. The gateway base URL — permission API, token endpoint, readiness proxy — is derived by stripping the `/oauth2/introspect` suffix. |
+| `SSO_GATEWAY_CLIENT_ID` | `--sso-gateway-client-id` | `''` | OAuth2 client ID for the service client-credentials used to call the sso-gateway. Introspection authenticates with a bearer token scoped `tenant:admin`; permission calls use `permission:admin`. The application must hold both scopes. |
+| `SSO_GATEWAY_CLIENT_SECRET` | `--sso-gateway-client-secret` | `''` | OAuth2 client secret for the above. |
 
 ## Object storage (attachments)
 
@@ -132,7 +132,7 @@ metadata:
 data:
   KANBAN_PORT: "8080"
   NATS_URL: "nats://nats.nats.svc.cluster.local:4222"
-  HYDRA_INTROSPECTION_URL: "http://sso-gateway.sso.svc.cluster.local:8080/oauth2/introspect"
+  SSO_GATEWAY_INTROSPECTION_URL: "http://sso-gateway.sso.svc.cluster.local:8080/oauth2/introspect"
   OPENSEARCH_URL: "http://opensearch.opensearch.svc.cluster.local:9200"
   S3_ENDPOINT: "http://seaweedfs-s3.storage.svc.cluster.local:8333"
   S3_REGION: "us-east-1"
@@ -149,8 +149,8 @@ metadata:
   namespace: kanban
 stringData:
   DATABASE_URL: "postgres://kanban:<password>@postgres.postgres.svc.cluster.local:5432/kanban"
-  HYDRA_CLIENT_ID: "<hydra-client-id>"
-  HYDRA_CLIENT_SECRET: "<hydra-client-secret>"
+  SSO_GATEWAY_CLIENT_ID: "<client-id>"
+  SSO_GATEWAY_CLIENT_SECRET: "<client-secret>"
   S3_ACCESS_KEY: "<access-key>"
   S3_SECRET_KEY: "<secret-key>"
 ```

@@ -23,10 +23,9 @@ use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use sunbeam_g2v::client::OAuth2ClientCredentials;
 use sunbeam_g2v::config::NatsConfig;
-use sunbeam_g2v::middleware::auth::{
-    AuthMiddlewareState, auth_middleware, introspection::IntrospectionConfig,
-};
+use sunbeam_g2v::middleware::auth::{AuthMiddlewareState, auth_middleware};
 use sunbeam_g2v::mq::NatsClient;
 
 use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
@@ -223,21 +222,23 @@ pub struct Cli {
     )]
     database_acquire_timeout_secs: u64,
 
-    /// Hydra token introspection endpoint URL.
+    /// sso-gateway OAuth2 token introspection endpoint URL.
     #[arg(
         long,
-        env = "HYDRA_INTROSPECTION_URL",
+        env = "SSO_GATEWAY_INTROSPECTION_URL",
         default_value = "http://localhost:4445/oauth2/introspect"
     )]
-    hydra_introspection_url: String,
+    sso_gateway_introspection_url: String,
 
-    /// Hydra OAuth2 client ID used for introspection Basic authentication.
-    #[arg(long, env = "HYDRA_CLIENT_ID", default_value = "")]
-    hydra_client_id: String,
+    /// OAuth2 client ID for the service client-credentials used to call the
+    /// sso-gateway (introspection and permission service).
+    #[arg(long, env = "SSO_GATEWAY_CLIENT_ID", default_value = "")]
+    sso_gateway_client_id: String,
 
-    /// Hydra OAuth2 client secret used for introspection Basic authentication.
-    #[arg(long, env = "HYDRA_CLIENT_SECRET", default_value = "")]
-    hydra_client_secret: String,
+    /// OAuth2 client secret for the service client-credentials used to call
+    /// the sso-gateway (introspection and permission service).
+    #[arg(long, env = "SSO_GATEWAY_CLIENT_SECRET", default_value = "")]
+    sso_gateway_client_secret: String,
 
     /// System tenant id used for globally-shared resources (e.g. system-wide
     /// board/card templates). Must be a valid tenant id in the sso-gateway.
@@ -402,17 +403,17 @@ impl Cli {
             })?;
 
         let sso_gateway_url = self
-            .hydra_introspection_url
+            .sso_gateway_introspection_url
             .strip_suffix("/oauth2/introspect")
             .map(String::from)
-            .unwrap_or_else(|| self.hydra_introspection_url.clone());
+            .unwrap_or_else(|| self.sso_gateway_introspection_url.clone());
 
         Ok(AppConfig {
             addr,
             host: self.host,
-            hydra_introspection_url: self.hydra_introspection_url,
-            hydra_client_id: self.hydra_client_id,
-            hydra_client_secret: self.hydra_client_secret,
+            sso_gateway_introspection_url: self.sso_gateway_introspection_url,
+            sso_gateway_client_id: self.sso_gateway_client_id,
+            sso_gateway_client_secret: self.sso_gateway_client_secret,
             system_tenant_id: self.system_tenant_id,
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
@@ -454,9 +455,9 @@ impl Cli {
 pub struct AppConfig {
     pub addr: SocketAddr,
     pub host: String,
-    pub hydra_introspection_url: String,
-    pub hydra_client_id: String,
-    pub hydra_client_secret: String,
+    pub sso_gateway_introspection_url: String,
+    pub sso_gateway_client_id: String,
+    pub sso_gateway_client_secret: String,
     pub system_tenant_id: String,
     pub database_url: String,
     pub database_max_connections: u32,
@@ -540,8 +541,8 @@ pub async fn run_with_config(
     let permission_config = PermissionClientConfig {
         base_url: config.sso_gateway_permission_url.clone(),
         token_url: config.sso_gateway_token_url.clone(),
-        client_id: config.hydra_client_id.clone(),
-        client_secret: config.hydra_client_secret.clone(),
+        client_id: config.sso_gateway_client_id.clone(),
+        client_secret: config.sso_gateway_client_secret.clone(),
     };
     let permission_for_migrations = Arc::new(
         PermissionClient::new(&permission_config)
@@ -750,11 +751,15 @@ pub async fn run_with_config(
     });
 
     let auth_state = AuthMiddlewareState::new(Arc::new(
-        SsoGatewaySessionClient::new(IntrospectionConfig {
-            url: config.hydra_introspection_url,
-            client_id: config.hydra_client_id,
-            client_secret: config.hydra_client_secret,
-        })
+        SsoGatewaySessionClient::new(
+            &config.sso_gateway_introspection_url,
+            OAuth2ClientCredentials::new(
+                &config.sso_gateway_token_url,
+                &config.sso_gateway_client_id,
+                &config.sso_gateway_client_secret,
+            )
+            .with_scope("tenant:admin"),
+        )
         .context("failed to build sso-gateway session client")?,
     ));
 
@@ -928,7 +933,7 @@ mod tests {
 
         let prefixes: &[&str] = &[
             "DATABASE_URL",
-            "HYDRA_",
+            "SSO_GATEWAY_",
             "NATS_",
             "OPENSEARCH_URL",
             "KANBAN_",
@@ -963,9 +968,9 @@ mod tests {
         let cfg = parse_config_args(&[
             "--port=1234",
             "--host=127.0.0.1",
-            "--hydra-introspection-url=http://hydra:4445/oauth2/introspect",
-            "--hydra-client-id=kanban-client",
-            "--hydra-client-secret=kanban-secret",
+            "--sso-gateway-introspection-url=http://sso-gateway:4445/oauth2/introspect",
+            "--sso-gateway-client-id=kanban-client",
+            "--sso-gateway-client-secret=kanban-secret",
             "--database-url=postgres://db",
             "--database-max-connections=50",
             "--database-acquire-timeout-secs=5",
@@ -1001,18 +1006,18 @@ mod tests {
         assert_eq!(cfg.addr, "127.0.0.1:1234".parse().unwrap());
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(
-            cfg.hydra_introspection_url,
-            "http://hydra:4445/oauth2/introspect"
+            cfg.sso_gateway_introspection_url,
+            "http://sso-gateway:4445/oauth2/introspect"
         );
-        assert_eq!(cfg.hydra_client_id, "kanban-client");
-        assert_eq!(cfg.hydra_client_secret, "kanban-secret");
+        assert_eq!(cfg.sso_gateway_client_id, "kanban-client");
+        assert_eq!(cfg.sso_gateway_client_secret, "kanban-secret");
         assert_eq!(cfg.database_url, "postgres://db");
         assert_eq!(cfg.database_max_connections, 50);
         assert_eq!(cfg.database_acquire_timeout_secs, 5);
         assert_eq!(cfg.nats_url, "nats://nats");
         assert_eq!(cfg.nats_auth_token, Some("callout-token".into()));
         assert_eq!(cfg.nats_lease_duration_secs, 60);
-        assert_eq!(cfg.sso_gateway_url, "http://hydra:4445");
+        assert_eq!(cfg.sso_gateway_url, "http://sso-gateway:4445");
         assert_eq!(cfg.opensearch_url, "http://opensearch");
         assert_eq!(cfg.opensearch_index_name, "custom-index");
         assert_eq!(cfg.s3_endpoint, Some("http://s3".into()));
@@ -1046,11 +1051,11 @@ mod tests {
         assert_eq!(cfg.addr.port(), 8080);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(
-            cfg.hydra_introspection_url,
+            cfg.sso_gateway_introspection_url,
             "http://localhost:4445/oauth2/introspect"
         );
-        assert_eq!(cfg.hydra_client_id, "");
-        assert_eq!(cfg.hydra_client_secret, "");
+        assert_eq!(cfg.sso_gateway_client_id, "");
+        assert_eq!(cfg.sso_gateway_client_secret, "");
         assert_eq!(cfg.database_max_connections, 20);
         assert_eq!(cfg.database_acquire_timeout_secs, 10);
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
@@ -1143,11 +1148,12 @@ mod tests {
         let config = AppConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             host: "127.0.0.1".into(),
-            hydra_introspection_url: "http://localhost:4445/oauth2/introspect".into(),
+            sso_gateway_introspection_url: "http://localhost:4445/oauth2/introspect".into(),
             // Boot provisions the permission namespace fail-fast, so the test
             // needs the harness-provisioned service credentials.
-            hydra_client_id: std::env::var("HYDRA_CLIENT_ID").unwrap_or_default(),
-            hydra_client_secret: std::env::var("HYDRA_CLIENT_SECRET").unwrap_or_default(),
+            sso_gateway_client_id: std::env::var("SSO_GATEWAY_CLIENT_ID").unwrap_or_default(),
+            sso_gateway_client_secret: std::env::var("SSO_GATEWAY_CLIENT_SECRET")
+                .unwrap_or_default(),
             system_tenant_id: std::env::var("KANBAN_SYSTEM_TENANT_ID")
                 .unwrap_or_else(|_| "system".into()),
             database_url: isolated_url.to_string(),
