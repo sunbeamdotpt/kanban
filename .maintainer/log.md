@@ -51,3 +51,24 @@ object-scoped and `AddMember` clears the prior role first. `ListTemplates`/
 reproduced — three regression tests (builder live-tail, handler live-tail,
 private-board permission rechecks) all pass; the human will supply repro
 details if it recurs.
+
+## 2026-07-21 — Card tuples, refs, and search indexing (v2026.07.3)
+
+Post-deploy sweep by sbbb (message 5) found every card-scoped RPC returning
+403: the OpenFGA model always computed card relations via
+`KanbanCard#parent@KanbanBoard`, but nothing wrote that tuple — an untested
+gap because integration tests inject `AuthContext` directly and bypass the
+dispatch middleware. Fix writes the tuple on `CreateCard`, deletes tuples on
+`DeleteCard`, and re-homes them on cross-board `MoveCard` (which also never
+updated `cards.board_id` — a latent row-corruption bug). Regression tests now
+assert permission behavior through the real backend, and a
+`backfill_card_parent_tuples` system migration repairs existing rows.
+
+Card refs came out as `-001` because `create_project` never persisted
+`projects.prefix` (the response masked this by echoing the slug). Fixed in
+the INSERT plus migration 0027 for existing rows. Search returned zero hits
+because no write path to OpenSearch ever existed; the outbox dispatcher now
+mirrors card events into the index and `backfill_opensearch_cards` covers
+existing data. RemoveColumn/DeleteBoard FK-cascades skip `event_log`, leaving
+tuple and index drift — documented as a known issue pending the reconciler
+rather than silently "fixed" by hand.

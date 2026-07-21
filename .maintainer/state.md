@@ -10,9 +10,10 @@ timestamp: 2026-07-20T00:00:00Z
 
 ## In flight
 
-- **v2026.07.2 release** — Connect-RPC serving migration (tonic/prost fully
-  removed), service-singleton permission checks, member/template bug fixes.
-  Full suite green (244 lib tests); tag push pending at state-update time.
+- **v2026.07.3 release** — card permission tuples (+backfill migration),
+  card ref prefix fix (+migration 0027), OpenSearch indexing pipeline
+  (outbox hook + backfill migration), AddMember subject validation.
+  Full suite green (249 lib tests).
 - **Maintainer system bootstrap**: bundle created 2026-07-20; kanban is the
   second repo enrolled in agent-mail (after sbbb).
 
