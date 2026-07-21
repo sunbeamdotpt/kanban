@@ -72,3 +72,16 @@ mirrors card events into the index and `backfill_opensearch_cards` covers
 existing data. RemoveColumn/DeleteBoard FK-cascades skip `event_log`, leaving
 tuple and index drift — documented as a known issue pending the reconciler
 rather than silently "fixed" by hand.
+
+## 2026-07-21 — Ref-counter healing and S3_PUBLIC_ENDPOINT (v2026.07.4)
+
+sbbb's re-sweep confirmed the v2026.07.3 fixes but caught two leftovers.
+(1) Refs still minted without a prefix: the `project_ref_counter` upsert only
+bumped `next_seq` on conflict, so counter rows created while
+`projects.prefix` was empty kept `''` forever — the v2026.07.3 backfill fixed
+the projects table but not the counter. Allocation now takes
+`EXCLUDED.prefix` on conflict, healing stale rows on next use. (2) Presigned
+URLs pointed at the cluster-internal filer. New `S3_PUBLIC_ENDPOINT` config
+signs and builds presigned URLs for a public host while API calls keep using
+`S3_ENDPOINT`; deployment wiring is sbbb's (they own prod env vars), notified
+by mail.

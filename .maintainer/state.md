@@ -10,10 +10,13 @@ timestamp: 2026-07-20T00:00:00Z
 
 ## In flight
 
-- **v2026.07.3 release** — card permission tuples (+backfill migration),
-  card ref prefix fix (+migration 0027), OpenSearch indexing pipeline
-  (outbox hook + backfill migration), AddMember subject validation.
-  Full suite green (249 lib tests).
+- **v2026.07.4 release** — ref-counter prefix healing, S3_PUBLIC_ENDPOINT
+  for presigned URLs (sbbb wires the prod value). Full suite green
+  (252 lib tests).
+- **Gateway flake pattern** — full-suite runs intermittently fail 1–4
+  permission/OpenFGA tests with "error sending request" to the testcontainer
+  gateway; they always pass in isolation. Compounds with the testcontainers
+  leak (see known-issues).
 - **Maintainer system bootstrap**: bundle created 2026-07-20; kanban is the
   second repo enrolled in agent-mail (after sbbb).
 
