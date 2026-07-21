@@ -55,8 +55,8 @@ ARG VERSION
 # OCI annotations so GHCR autolinks the image to the repository.
 LABEL org.opencontainers.image.title="kanban" \
       org.opencontainers.image.description="Sunbeam Kanban backend service" \
-      org.opencontainers.image.url="https://github.com/sunbeamdotpt/sunbeam/tree/mainline/apps/kanban" \
-      org.opencontainers.image.source="https://github.com/sunbeamdotpt/sunbeam.git" \
+      org.opencontainers.image.url="https://github.com/sunbeamdotpt/kanban" \
+      org.opencontainers.image.source="https://github.com/sunbeamdotpt/kanban.git" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 

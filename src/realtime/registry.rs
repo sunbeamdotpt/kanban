@@ -25,8 +25,8 @@ use std::time::Duration;
 use crate::id::Id;
 use anyhow::{Result, anyhow};
 use async_nats::jetstream::consumer::push;
+use buffa::Message;
 use parking_lot::RwLock;
-use prost::Message as ProstMessage;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -35,7 +35,7 @@ use tracing::{debug, error, warn};
 use sunbeam_g2v::mq::NatsClient;
 
 use super::jetstream_bootstrap::{STREAM_NAME, board_subject, live_tail_consumer_name};
-use crate::pb::BoardEventEnvelope;
+use crate::cpb::sunbeam::kanban::v1::BoardEventEnvelope;
 
 /// Per-board ring-buffer capacity. 256 covers typical burst windows;
 /// slow receivers get `RecvError::Lagged` and must reconnect.
@@ -218,7 +218,7 @@ impl BoardSubscriberRegistry {
                 let payload = msg.payload.clone();
 
                 // Decode the protobuf envelope.
-                match BoardEventEnvelope::decode(payload) {
+                match BoardEventEnvelope::decode_from_slice(&payload) {
                     Ok(envelope) => {
                         // Fire-and-forget: if there are no receivers (all dropped),
                         // send returns Err — we ignore it; the task will be aborted
@@ -316,7 +316,6 @@ impl Drop for StreamHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as ProstMessage;
     use std::time::Duration;
 
     async fn setup_nats() -> Arc<NatsClient> {
@@ -334,25 +333,28 @@ mod tests {
     }
 
     fn make_envelope(board_id: &str, event_id: &str) -> BoardEventEnvelope {
+        use crate::cpb::sunbeam::kanban::v1::{Heartbeat, board_event_envelope::Payload};
+
         BoardEventEnvelope {
             board_id: board_id.to_string(),
             event_id: event_id.to_string(),
             nats_seq: 0,
             board_revision: 1,
-            emitted_at: None,
+            emitted_at: None.into(),
             emitter_pod_id: "test-pod".to_string(),
             actor_subject: "test".to_string(),
-            payload: Some(crate::pb::board_event_envelope::Payload::Heartbeat(
-                crate::pb::Heartbeat { server_time_ms: 0 },
-            )),
+            payload: Some(Payload::Heartbeat(Box::new(Heartbeat {
+                server_time_ms: 0,
+                ..Default::default()
+            }))),
+            ..Default::default()
         }
     }
 
     async fn publish_envelope(nats: &NatsClient, board_id: &str, envelope: &BoardEventEnvelope) {
         let subject = board_subject(board_id);
-        let mut buf = bytes::BytesMut::new();
-        envelope.encode(&mut buf).expect("encode failed");
-        nats.publish_jetstream(&subject, buf.freeze())
+        let buf = bytes::Bytes::from(envelope.encode_to_vec());
+        nats.publish_jetstream(&subject, buf)
             .await
             .expect("publish_jetstream failed")
             .await

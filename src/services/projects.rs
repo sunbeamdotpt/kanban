@@ -14,16 +14,16 @@
 //! Uses the dynamic sqlx API (no macros) so the crate builds without a
 //! live DATABASE_URL.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::id::Id;
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use connectrpc::{
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
+};
 use sqlx::PgPool;
 use sqlx::Row;
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
@@ -32,13 +32,12 @@ use sunbeam_g2v::middleware::auth::AuthContext;
 use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::auth::permission_expand::{ExpandQuery, expand_objects};
 use crate::auth::permission_retry::PermissionRetryExt;
-use crate::pb::project_service_server::ProjectService;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     AddMemberRequest, AddMemberResponse, CreateProjectRequest, CreateProjectResponse,
     DeleteProjectRequest, DeleteProjectResponse, GetProjectRequest, GetProjectResponse,
     ListMembersRequest, ListMembersResponse, ListProjectsRequest, ListProjectsResponse, Project,
-    ProjectMember, RemoveMemberRequest, RemoveMemberResponse, SubscribeProjectRequest,
-    SubscribeProjectResponse, UpdateProjectRequest, UpdateProjectResponse,
+    ProjectMember, ProjectService, RemoveMemberRequest, RemoveMemberResponse,
+    SubscribeProjectRequest, SubscribeProjectResponse, UpdateProjectRequest, UpdateProjectResponse,
 };
 use crate::realtime::registry::BoardSubscriberRegistry;
 
@@ -55,60 +54,61 @@ pub struct ProjectServiceImpl {
     pub registry: Arc<BoardSubscriberRegistry>,
 }
 
-// ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
+// ── Timestamp helpers (chrono ↔ buffa_types) ────────────────────────────────
 
 fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     let full = format!("{msg}: {err}");
     error!("{full}");
-    Status::internal(full)
+    ConnectError::internal(full)
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
 /// Extract the caller's tenant id from the auth context.
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 /// Extract the caller's tenant from the auth context and derive a permission
 /// client scoped to that tenant's store (see `TENANT_HEADER`).
-async fn tenant_client_for<T>(
+async fn tenant_client_for(
     permission: &PermissionClient,
-    req: &Request<T>,
-) -> Result<PermissionClient, Status> {
-    let tenant = req
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = ctx
         .extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
     permission
         .tenant_client(&tenant)
         .await
         .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
-fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn checked_object_id(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<CheckedObjectId>()
         .map(|c| c.0.clone())
-        .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
+        .ok_or_else(|| ConnectError::internal("missing CheckedObjectId extension"))
 }
 
 /// Convert a Postgres row into a `Project` proto.
@@ -127,9 +127,10 @@ fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
         icon: String::new(),
         color: String::new(),
         description: description.unwrap_or_default(),
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
         member_count,
+        ..Default::default()
     }
 }
 
@@ -146,7 +147,8 @@ fn member_from_row(row: &sqlx::postgres::PgRow) -> ProjectMember {
         relation: role,
         display_name: String::new(),
         email: String::new(),
-        added_at: Some(to_proto_ts(created_at)),
+        added_at: Some(to_proto_ts(created_at)).into(),
+        ..Default::default()
     }
 }
 
@@ -167,23 +169,23 @@ async fn fetch_member_count(pool: &PgPool, tenant_id: &str, project_id: Id) -> i
 
 // ── Type alias ───────────────────────────────────────────────────────────────
 
-type SubscribeProjectStream =
-    Pin<Box<dyn Stream<Item = Result<SubscribeProjectResponse, Status>> + Send + 'static>>;
+type SubscribeProjectStream = ServiceStream<SubscribeProjectResponse>;
 
 // ── impl ProjectService ──────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl ProjectService for ProjectServiceImpl {
     // ── CreateProject ────────────────────────────────────────────────────────
 
     async fn create_project(
         &self,
-        request: Request<CreateProjectRequest>,
-    ) -> Result<Response<CreateProjectResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateProjectRequest>,
+    ) -> ServiceResult<CreateProjectResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         // Idempotency check — look up by key; if found, re-fetch the project from DB.
         if !req.idempotency_key.is_empty() {
@@ -210,7 +212,8 @@ impl ProjectService for ProjectServiceImpl {
                 if let Some(row) = row {
                     let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
                     return Ok(Response::new(CreateProjectResponse {
-                        project: Some(project_from_row(&row, member_count)),
+                        project: Some(project_from_row(&row, member_count)).into(),
+                        ..Default::default()
                     }));
                 }
                 // Project was deleted after idempotency key was set — fall through.
@@ -219,7 +222,7 @@ impl ProjectService for ProjectServiceImpl {
 
         // Validate required fields.
         if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+            return Err(ConnectError::invalid_argument("name is required"));
         }
 
         // Derive slug from prefix or name.
@@ -256,7 +259,7 @@ impl ProjectService for ProjectServiceImpl {
             if let sqlx::Error::Database(ref db) = e
                 && db.constraint() == Some("projects_tenant_slug_key")
             {
-                return Status::already_exists("project with that prefix already exists");
+                return ConnectError::already_exists("project with that prefix already exists");
             }
             internal("failed to insert project", e)
         })?;
@@ -309,7 +312,8 @@ impl ProjectService for ProjectServiceImpl {
             }
 
         Ok(Response::new(CreateProjectResponse {
-            project: Some(project),
+            project: Some(project).into(),
+            ..Default::default()
         }))
     }
 
@@ -317,13 +321,14 @@ impl ProjectService for ProjectServiceImpl {
 
     async fn get_project(
         &self,
-        request: Request<GetProjectRequest>,
-    ) -> Result<Response<GetProjectResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, GetProjectRequest>,
+    ) -> ServiceResult<GetProjectResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let row = sqlx::query(
             "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
@@ -333,11 +338,12 @@ impl ProjectService for ProjectServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch project", e))?
-        .ok_or_else(|| Status::not_found("project not found"))?;
+        .ok_or_else(|| ConnectError::not_found("project not found"))?;
 
         let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         Ok(Response::new(GetProjectResponse {
-            project: Some(project_from_row(&row, member_count)),
+            project: Some(project_from_row(&row, member_count)).into(),
+            ..Default::default()
         }))
     }
 
@@ -345,11 +351,12 @@ impl ProjectService for ProjectServiceImpl {
 
     async fn list_projects(
         &self,
-        request: Request<ListProjectsRequest>,
-    ) -> Result<Response<ListProjectsResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListProjectsRequest>,
+    ) -> ServiceResult<ListProjectsResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
 
         let visible_ids = expand_objects(
             &permission,
@@ -364,7 +371,10 @@ impl ProjectService for ProjectServiceImpl {
         .map_err(|e| internal("permission expand failed", e))?;
 
         if visible_ids.is_empty() {
-            return Ok(Response::new(ListProjectsResponse { projects: vec![] }));
+            return Ok(Response::new(ListProjectsResponse {
+                projects: vec![],
+                ..Default::default()
+            }));
         }
 
         let ids: Vec<Id> = visible_ids
@@ -388,23 +398,27 @@ impl ProjectService for ProjectServiceImpl {
             projects.push(project_from_row(row, member_count));
         }
 
-        Ok(Response::new(ListProjectsResponse { projects }))
+        Ok(Response::new(ListProjectsResponse {
+            projects,
+            ..Default::default()
+        }))
     }
 
     // ── UpdateProject ────────────────────────────────────────────────────────
 
     async fn update_project(
         &self,
-        request: Request<UpdateProjectRequest>,
-    ) -> Result<Response<UpdateProjectResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateProjectRequest>,
+    ) -> ServiceResult<UpdateProjectResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
-        let req = request.into_inner();
-        let patch = req.project.unwrap_or_default();
+        let req = request.to_owned_message();
+        let patch = req.project.into_option().unwrap_or_default();
 
         // Apply sparse patch — only non-empty fields are applied.
         let row = sqlx::query(
@@ -426,11 +440,12 @@ impl ProjectService for ProjectServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update project", e))?
-        .ok_or_else(|| Status::not_found("project not found"))?;
+        .ok_or_else(|| ConnectError::not_found("project not found"))?;
 
         let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         Ok(Response::new(UpdateProjectResponse {
-            project: Some(project_from_row(&row, member_count)),
+            project: Some(project_from_row(&row, member_count)).into(),
+            ..Default::default()
         }))
     }
 
@@ -438,13 +453,14 @@ impl ProjectService for ProjectServiceImpl {
 
     async fn delete_project(
         &self,
-        request: Request<DeleteProjectRequest>,
-    ) -> Result<Response<DeleteProjectResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, DeleteProjectRequest>,
+    ) -> ServiceResult<DeleteProjectResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let result = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
             .bind(&tenant_id)
@@ -454,7 +470,7 @@ impl ProjectService for ProjectServiceImpl {
             .map_err(|e| internal("failed to delete project", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("project not found"));
+            return Err(ConnectError::not_found("project not found"));
         }
 
         // Best-effort: permission tuple cleanup for this project is logged as drift.
@@ -466,42 +482,76 @@ impl ProjectService for ProjectServiceImpl {
             "delete_project: permission tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
-        Ok(Response::new(DeleteProjectResponse {}))
+        Ok(Response::new(DeleteProjectResponse::default()))
     }
 
     // ── AddMember ────────────────────────────────────────────────────────────
 
     async fn add_member(
         &self,
-        request: Request<AddMemberRequest>,
-    ) -> Result<Response<AddMemberResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddMemberRequest>,
+    ) -> ServiceResult<AddMemberResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
 
         if req.subject.is_empty() {
-            return Err(Status::invalid_argument("subject is required"));
+            return Err(ConnectError::invalid_argument("subject is required"));
         }
         if req.relation.is_empty() {
-            return Err(Status::invalid_argument("relation is required"));
+            return Err(ConnectError::invalid_argument("relation is required"));
         }
         // owner is set at CreateProject and is immutable.
         if req.relation == "owner" {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "owner relation cannot be granted via AddMember",
             ));
         }
         // The OpenFGA model only accepts role writes; computed relations
         // (view/edit/manage/delete) cannot be written directly.
         if !matches!(req.relation.as_str(), "admin" | "editor" | "viewer") {
-            return Err(Status::invalid_argument(
+            return Err(ConnectError::invalid_argument(
                 "relation must be one of: admin, editor, viewer",
             ));
+        }
+
+        // A subject may already hold a different role on this project. Clear
+        // the stale tuple first so they never accumulate roles the mirror row
+        // (single role per member) does not reflect.
+        let existing_role: Option<String> = sqlx::query(
+            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(&tenant_id)
+        .bind(project_id)
+        .bind(&req.subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to look up existing member role", e))?
+        .map(|r| r.get("role"));
+
+        if let Some(ref existing) = existing_role
+            && existing != &req.relation
+            && let Err(e) = permission
+                .delete_relation_tuples(
+                    PERMISSION_TYPE,
+                    Some(project_id.to_string()),
+                    Some(existing.clone()),
+                    Some(req.subject.clone()),
+                )
+                .await
+        {
+            warn!(
+                error = %e,
+                project_id = %project_id,
+                subject = %req.subject,
+                "mirror_drift: failed to delete stale role tuple before re-grant"
+            );
         }
 
         // Permission backend FIRST (mirror-table write order per plan / Pre-mortem 5).
@@ -539,56 +589,47 @@ impl ProjectService for ProjectServiceImpl {
             // Do not return error — reconciler will fix SQL drift.
         }
 
-        Ok(Response::new(AddMemberResponse {}))
+        Ok(Response::new(AddMemberResponse::default()))
     }
 
     // ── RemoveMember ─────────────────────────────────────────────────────────
 
     async fn remove_member(
         &self,
-        request: Request<RemoveMemberRequest>,
-    ) -> Result<Response<RemoveMemberResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RemoveMemberRequest>,
+    ) -> ServiceResult<RemoveMemberResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
 
         if req.subject.is_empty() {
-            return Err(Status::invalid_argument("subject is required"));
+            return Err(ConnectError::invalid_argument("subject is required"));
         }
 
-        // Read existing relation from mirror to know which permission tuple to delete.
-        let existing_role: Option<String> = sqlx::query(
-            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
-        )
-        .bind(&tenant_id)
-        .bind(project_id)
-        .bind(&req.subject)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to look up member", e))?
-        .map(|r| r.get("role"));
-
-        // Delete permission tuple for the known relation.
-        if let Some(ref relation) = existing_role
-            && let Err(e) = permission
-                .delete_relation_tuples(
-                    PERMISSION_TYPE,
-                    None,
-                    Some(relation.clone()),
-                    Some(req.subject.clone()),
-                )
-                .await
+        // Delete every role tuple the subject holds on THIS project. Scoping
+        // to the object is essential: a namespace-wide delete would revoke the
+        // subject's roles on unrelated projects, and a mirror-driven delete
+        // would miss stale tuples left by earlier role changes.
+        if let Err(e) = permission
+            .delete_relation_tuples(
+                PERMISSION_TYPE,
+                Some(project_id.to_string()),
+                None,
+                Some(req.subject.clone()),
+            )
+            .await
         {
             warn!(
                 error = %e,
                 project_id = %project_id,
                 subject = %req.subject,
-                "mirror_drift: failed to delete permission tuple for removed member"
+                "mirror_drift: failed to delete permission tuples for removed member"
             );
         }
 
@@ -604,23 +645,24 @@ impl ProjectService for ProjectServiceImpl {
         .map_err(|e| internal("failed to delete member row", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("member not found"));
+            return Err(ConnectError::not_found("member not found"));
         }
 
-        Ok(Response::new(RemoveMemberResponse {}))
+        Ok(Response::new(RemoveMemberResponse::default()))
     }
 
     // ── ListMembers ───────────────────────────────────────────────────────────
 
     async fn list_members(
         &self,
-        request: Request<ListMembersRequest>,
-    ) -> Result<Response<ListMembersResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListMembersRequest>,
+    ) -> ServiceResult<ListMembersResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
             "SELECT project_id, user_id, role, created_at FROM project_members WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at",
@@ -632,7 +674,10 @@ impl ProjectService for ProjectServiceImpl {
         .map_err(|e| internal("failed to list members", e))?;
 
         let members = rows.iter().map(member_from_row).collect();
-        Ok(Response::new(ListMembersResponse { members }))
+        Ok(Response::new(ListMembersResponse {
+            members,
+            ..Default::default()
+        }))
     }
 
     // ── SubscribeProject (Stage 4c — deferred to 4c.5) ───────────────────────
@@ -642,13 +687,12 @@ impl ProjectService for ProjectServiceImpl {
     // open one `build_subscribe_board_stream` per board and merge them via
     // `tokio_stream::StreamExt::merge` / `select_all`.
 
-    type SubscribeProjectStream = SubscribeProjectStream;
-
     async fn subscribe_project(
         &self,
-        _request: Request<SubscribeProjectRequest>,
-    ) -> Result<Response<Self::SubscribeProjectStream>, Status> {
-        Err(Status::unimplemented(
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, SubscribeProjectRequest>,
+    ) -> ServiceResult<SubscribeProjectStream> {
+        Err(ConnectError::unimplemented(
             "Stage 4c.5 — per-project multi-board merge not yet implemented",
         ))
     }
@@ -661,6 +705,7 @@ impl ProjectService for ProjectServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{connect_ctx, connect_request};
 
     // ── Setup helpers ────────────────────────────────────────────────────────
 
@@ -693,22 +738,20 @@ mod tests {
         }
     }
 
-    /// Create an authenticated request that only carries the caller subject.
-    fn authed_request<T>(body: T, subject: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut().insert(AuthContext::authenticated(
+    /// Create an authenticated context that only carries the caller subject.
+    fn authed_ctx(subject: &str) -> RequestContext {
+        connect_ctx(AuthContext::authenticated(
             crate::test_support::test_tenant_id(),
             subject,
-        ));
-        req
+        ))
     }
 
-    /// Create an authenticated request that also carries a `CheckedObjectId`.
-    fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
-        let mut req = authed_request(body, subject);
-        req.extensions_mut()
+    /// Create an authenticated context that also carries a `CheckedObjectId`.
+    fn authed_ctx_with_object(subject: &str, object_id: &str) -> RequestContext {
+        let mut ctx = authed_ctx(subject);
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
     /// Remove every permission relation tuple a test may have created for a subject.
@@ -750,44 +793,47 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
                     name: "Test Project Alpha".to_string(),
                     prefix: "TPA".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: "Integration test project".to_string(),
                     idempotency_key: String::new(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_project failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         assert!(!created.id.is_empty(), "created project must have an id");
         assert_eq!(created.name, "Test Project Alpha");
         assert_eq!(created.prefix, "TPA");
         assert_eq!(created.description, "Integration test project");
-        assert!(created.created_at.is_some());
-        assert!(created.updated_at.is_some());
+        assert!(created.created_at.is_set());
+        assert!(created.updated_at.is_set());
 
         let project_id = created.id.parse::<Id>().expect("invalid id from create");
 
         let fetched = svc
-            .get_project(authed_request_with_object(
-                GetProjectRequest {
+            .get_project(
+                authed_ctx_with_object(&subject, &created.id),
+                connect_request(&GetProjectRequest {
                     project_id: created.id.clone(),
-                },
-                &subject,
-                &created.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_project failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         assert_eq!(fetched.id, created.id);
@@ -817,51 +863,58 @@ mod tests {
         // User A creates 3 projects.
         for i in 0..3_u32 {
             let p = svc
-                .create_project(authed_request(
-                    CreateProjectRequest {
+                .create_project(
+                    authed_ctx(&subject_a),
+                    connect_request(&CreateProjectRequest {
                         name: format!("Project A-{i}"),
                         prefix: format!("A{i}{suffix}"),
                         icon: String::new(),
                         color: String::new(),
                         description: String::new(),
                         idempotency_key: String::new(),
-                    },
-                    &subject_a,
-                ))
+                        ..Default::default()
+                    }),
+                )
                 .await
                 .expect("create failed")
-                .into_inner()
+                .body
                 .project
+                .into_option()
                 .expect("project missing");
             project_ids_a.push(p.id.parse::<Id>().unwrap());
         }
 
         // User B creates 1 project.
         let pb = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&subject_b),
+                connect_request(&CreateProjectRequest {
                     name: "Project B-0".to_string(),
                     prefix: format!("B0{suffix}"),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &subject_b,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
         let project_id_b = pb.id.parse::<Id>().unwrap();
 
         // User A sees exactly 3 projects.
         let list_a = svc
-            .list_projects(authed_request(ListProjectsRequest {}, &subject_a))
+            .list_projects(
+                authed_ctx(&subject_a),
+                connect_request(&ListProjectsRequest::default()),
+            )
             .await
             .expect("list_projects failed for user A")
-            .into_inner();
+            .body;
 
         let ids_a: Vec<String> = list_a.projects.iter().map(|p| p.id.clone()).collect();
         assert_eq!(
@@ -878,10 +931,13 @@ mod tests {
 
         // User B sees exactly 1 project.
         let list_b = svc
-            .list_projects(authed_request(ListProjectsRequest {}, &subject_b))
+            .list_projects(
+                authed_ctx(&subject_b),
+                connect_request(&ListProjectsRequest::default()),
+            )
             .await
             .expect("list_projects failed for user B")
-            .into_inner();
+            .body;
 
         let ids_b: Vec<String> = list_b.projects.iter().map(|p| p.id.clone()).collect();
         assert_eq!(
@@ -913,50 +969,46 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
                     name: "Original Name".to_string(),
                     prefix: "ORIG".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: "original description".to_string(),
                     idempotency_key: String::new(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         let project_id = created.id.clone();
 
         // Update name only; description and prefix should be unchanged.
         let updated = svc
-            .update_project(authed_request_with_object(
-                UpdateProjectRequest {
+            .update_project(
+                authed_ctx_with_object(&subject, &project_id),
+                connect_request(&UpdateProjectRequest {
                     project_id: project_id.clone(),
                     project: Some(Project {
-                        id: String::new(),
                         name: "Updated Name".to_string(),
-                        prefix: String::new(),
-                        icon: String::new(),
-                        color: String::new(),
-                        description: String::new(),
-                        created_at: None,
-                        updated_at: None,
-                        member_count: 0,
-                    }),
-                    update_mask: None,
-                },
-                &subject,
-                &project_id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update_project failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         assert_eq!(updated.name, "Updated Name", "name should be updated");
@@ -981,21 +1033,23 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
                     name: "To Delete".to_string(),
                     prefix: "DEL".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         let project_id = created.id.clone();
@@ -1014,13 +1068,13 @@ mod tests {
                 .map(|r| r.get("id"));
         assert!(before.is_some(), "project should exist before delete");
 
-        svc.delete_project(authed_request_with_object(
-            DeleteProjectRequest {
+        svc.delete_project(
+            authed_ctx_with_object(&subject, &project_id),
+            connect_request(&DeleteProjectRequest {
                 project_id: project_id.clone(),
-            },
-            &subject,
-            &project_id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete_project failed");
 
@@ -1049,35 +1103,37 @@ mod tests {
         let member = format!("user:test-member-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&owner),
+                connect_request(&CreateProjectRequest {
                     name: "AddMember Test".to_string(),
                     prefix: "AMT".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &owner,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
 
-        svc.add_member(authed_request_with_object(
-            AddMemberRequest {
+        svc.add_member(
+            authed_ctx_with_object(&owner, &project_id),
+            connect_request(&AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: member.clone(),
                 relation: "editor".to_string(),
-            },
-            &owner,
-            &project_id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add_member failed");
 
@@ -1122,47 +1178,49 @@ mod tests {
         let member = format!("user:test-member-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&owner),
+                connect_request(&CreateProjectRequest {
                     name: "RemoveMember Test".to_string(),
                     prefix: "RMT".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &owner,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
 
         // Add then remove.
-        svc.add_member(authed_request_with_object(
-            AddMemberRequest {
+        svc.add_member(
+            authed_ctx_with_object(&owner, &project_id),
+            connect_request(&AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: member.clone(),
                 relation: "viewer".to_string(),
-            },
-            &owner,
-            &project_id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add_member failed");
 
-        svc.remove_member(authed_request_with_object(
-            RemoveMemberRequest {
+        svc.remove_member(
+            authed_ctx_with_object(&owner, &project_id),
+            connect_request(&RemoveMemberRequest {
                 project_id: project_id.clone(),
                 subject: member.clone(),
-            },
-            &owner,
-            &project_id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("remove_member failed");
 
@@ -1198,6 +1256,169 @@ mod tests {
         cleanup_permission_for_subject(&permission, &owner).await;
     }
 
+    /// Removing a member from one project must not revoke their roles on
+    /// unrelated projects (the tuple delete must be object-scoped).
+    #[tokio::test]
+    async fn remove_member_does_not_revoke_other_projects() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let member = format!("user:test-member-{}", Id::new());
+
+        let mut project_ids = Vec::new();
+        for (name, prefix) in [("Project A", "RMA"), ("Project B", "RMB")] {
+            let created = svc
+                .create_project(
+                    authed_ctx(&owner),
+                    connect_request(&CreateProjectRequest {
+                        name: name.to_string(),
+                        prefix: prefix.to_string(),
+                        icon: String::new(),
+                        color: String::new(),
+                        description: String::new(),
+                        idempotency_key: String::new(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("create failed")
+                .body
+                .project
+                .into_option()
+                .expect("project missing");
+            svc.add_member(
+                authed_ctx_with_object(&owner, &created.id),
+                connect_request(&AddMemberRequest {
+                    project_id: created.id.clone(),
+                    subject: member.clone(),
+                    relation: "viewer".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_member failed");
+            project_ids.push(created.id);
+        }
+
+        // Remove from project A only.
+        svc.remove_member(
+            authed_ctx_with_object(&owner, &project_ids[0]),
+            connect_request(&RemoveMemberRequest {
+                project_id: project_ids[0].clone(),
+                subject: member.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove_member failed");
+
+        assert!(
+            !permission
+                .check_permission_with_retry(PERMISSION_TYPE, &project_ids[0], "view", &member)
+                .await
+                .unwrap_or(false),
+            "view should be revoked on the removed project"
+        );
+        assert!(
+            permission
+                .check_permission_with_retry(PERMISSION_TYPE, &project_ids[1], "view", &member)
+                .await
+                .unwrap_or(false),
+            "view must survive on the unrelated project"
+        );
+
+        for id in &project_ids {
+            cleanup_project(&pool, &test_tenant_id(), id.parse::<Id>().unwrap()).await;
+        }
+        cleanup_permission_for_subject(&permission, &owner).await;
+        cleanup_permission_for_subject(&permission, &member).await;
+    }
+
+    /// Re-adding a member with a different role must not leave a stale tuple
+    /// behind: a later RemoveMember revokes all access.
+    #[tokio::test]
+    async fn remove_member_after_role_change_revokes_all_roles() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let member = format!("user:test-member-{}", Id::new());
+
+        let created = svc
+            .create_project(
+                authed_ctx(&owner),
+                connect_request(&CreateProjectRequest {
+                    name: "Role Change Test".to_string(),
+                    prefix: "RCT".to_string(),
+                    icon: String::new(),
+                    color: String::new(),
+                    description: String::new(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .project
+            .into_option()
+            .expect("project missing");
+        let project_id = created.id.clone();
+        let pid = project_id.parse::<Id>().unwrap();
+
+        for relation in ["viewer", "editor"] {
+            svc.add_member(
+                authed_ctx_with_object(&owner, &project_id),
+                connect_request(&AddMemberRequest {
+                    project_id: project_id.clone(),
+                    subject: member.clone(),
+                    relation: relation.to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_member failed");
+        }
+
+        // The mirror holds exactly one row with the latest role.
+        let role: String = sqlx::query_scalar(
+            "SELECT role FROM project_members WHERE tenant_id = $1 AND project_id = $2 AND user_id = $3",
+        )
+        .bind(test_tenant_id())
+        .bind(pid)
+        .bind(&member)
+        .fetch_one(&pool)
+        .await
+        .expect("member row missing");
+        assert_eq!(role, "editor");
+
+        svc.remove_member(
+            authed_ctx_with_object(&owner, &project_id),
+            connect_request(&RemoveMemberRequest {
+                project_id: project_id.clone(),
+                subject: member.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove_member failed");
+
+        assert!(
+            !permission
+                .check_permission_with_retry(PERMISSION_TYPE, &project_id, "view", &member)
+                .await
+                .unwrap_or(false),
+            "stale viewer tuple must not survive removal"
+        );
+
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &owner).await;
+        cleanup_permission_for_subject(&permission, &member).await;
+    }
+
     #[tokio::test]
     async fn list_members_returns_inserted_rows() {
         let pool = setup_pool().await;
@@ -1208,49 +1429,51 @@ mod tests {
         let viewer = format!("user:test-viewer-{}", Id::new());
 
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&owner),
+                connect_request(&CreateProjectRequest {
                     name: "ListMembers Test".to_string(),
                     prefix: "LMT".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &owner,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         let project_id = created.id.clone();
         let pid = project_id.parse::<Id>().unwrap();
 
-        svc.add_member(authed_request_with_object(
-            AddMemberRequest {
+        svc.add_member(
+            authed_ctx_with_object(&owner, &project_id),
+            connect_request(&AddMemberRequest {
                 project_id: project_id.clone(),
                 subject: viewer.clone(),
                 relation: "viewer".to_string(),
-            },
-            &owner,
-            &project_id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add_member failed");
 
         let members = svc
-            .list_members(authed_request_with_object(
-                ListMembersRequest {
+            .list_members(
+                authed_ctx_with_object(&owner, &project_id),
+                connect_request(&ListMembersRequest {
                     project_id: project_id.clone(),
-                },
-                &owner,
-                &project_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_members failed")
-            .into_inner()
+            .body
             .members;
 
         // Should have at least owner + viewer.
@@ -1273,7 +1496,7 @@ mod tests {
         let viewer_entry = members.iter().find(|m| m.subject == viewer).unwrap();
         assert_eq!(viewer_entry.relation, "viewer");
         assert_eq!(viewer_entry.project_id, project_id);
-        assert!(viewer_entry.added_at.is_some());
+        assert!(viewer_entry.added_at.is_set());
 
         // Cleanup
         cleanup_project(&pool, &test_tenant_id(), pid).await;
@@ -1291,33 +1514,38 @@ mod tests {
         let idem_key = format!("idem-test-{}", Id::new());
 
         let make_req = || {
-            authed_request(
-                CreateProjectRequest {
+            (
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
                     name: "Idempotent Project".to_string(),
                     prefix: "IDP".to_string(),
                     icon: String::new(),
                     color: String::new(),
                     description: "idempotency test".to_string(),
                     idempotency_key: idem_key.clone(),
-                },
-                &subject,
+                    ..Default::default()
+                }),
             )
         };
 
+        let (ctx, req) = make_req();
         let first = svc
-            .create_project(make_req())
+            .create_project(ctx, req)
             .await
             .expect("first create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
+        let (ctx, req) = make_req();
         let second = svc
-            .create_project(make_req())
+            .create_project(ctx, req)
             .await
             .expect("second create (replay) failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
 
         // Both responses must carry the same project id.
@@ -1360,57 +1588,56 @@ mod tests {
 
         // Create a project in tenant A.
         let created = svc
-            .create_project(authed_request(
-                CreateProjectRequest {
+            .create_project(
+                authed_ctx(&subject_a),
+                connect_request(&CreateProjectRequest {
                     name: "Tenant A Project".to_string(),
                     prefix: format!("TA{}", Id::new().to_string()[20..26].to_uppercase()),
                     icon: String::new(),
                     color: String::new(),
                     description: String::new(),
                     idempotency_key: String::new(),
-                },
-                &subject_a,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .project
+            .into_option()
             .expect("project missing");
         let project_id = created.id.parse::<Id>().expect("invalid id");
 
         // Tenant B caller cannot read the project even with the id in the
         // CheckedObjectId extension (SQL isolation).
-        let mut get_req = Request::new(GetProjectRequest {
-            project_id: created.id.clone(),
-        });
-        get_req
-            .extensions_mut()
-            .insert(AuthContext::authenticated(&tenant_b, &subject_b));
-        get_req
+        let mut get_ctx = connect_ctx(AuthContext::authenticated(&tenant_b, &subject_b));
+        get_ctx
             .extensions_mut()
             .insert(CheckedObjectId(created.id.clone()));
 
-        let status = svc
-            .get_project(get_req)
+        let err = svc
+            .get_project(
+                get_ctx,
+                connect_request(&GetProjectRequest {
+                    project_id: created.id.clone(),
+                    ..Default::default()
+                }),
+            )
             .await
-            .expect_err("tenant B must not see tenant A project")
-            .code();
+            .expect_err("tenant B must not see tenant A project");
         assert_eq!(
-            status,
-            tonic::Code::NotFound,
+            err.code,
+            connectrpc::ErrorCode::NotFound,
             "cross-tenant get_project must return NotFound"
         );
 
         // Tenant B caller lists projects and sees none.
-        let mut list_req = Request::new(ListProjectsRequest {});
-        list_req
-            .extensions_mut()
-            .insert(AuthContext::authenticated(&tenant_b, &subject_b));
+        let list_ctx = connect_ctx(AuthContext::authenticated(&tenant_b, &subject_b));
         let list = svc
-            .list_projects(list_req)
+            .list_projects(list_ctx, connect_request(&ListProjectsRequest::default()))
             .await
             .expect("list_projects failed for tenant B")
-            .into_inner();
+            .body;
         assert!(
             list.projects.is_empty(),
             "tenant B must not see tenant A projects"
@@ -1433,35 +1660,37 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
         let project_id = Id::new().to_string();
 
-        let mut req = Request::new(SubscribeProjectRequest {
-            project_id: project_id.clone(),
-            since_seq: 0,
-        });
-        req.extensions_mut().insert(AuthContext::authenticated(
-            crate::test_support::test_tenant_id(),
-            &subject,
-        ));
-        req.extensions_mut()
+        let mut ctx = authed_ctx(&subject);
+        ctx.extensions_mut()
             .insert(crate::auth::permission_dispatch::CheckedObjectId(
                 project_id.clone(),
             ));
 
-        let result = svc.subscribe_project(req).await;
+        let result = svc
+            .subscribe_project(
+                ctx,
+                connect_request(&SubscribeProjectRequest {
+                    project_id: project_id.clone(),
+                    since_seq: 0,
+                    ..Default::default()
+                }),
+            )
+            .await;
 
         assert!(
             result.is_err(),
             "SubscribeProject must return an error (unimplemented)"
         );
-        let status = result.err().expect("result was Ok after is_err check");
+        let err = result.err().expect("result was Ok after is_err check");
         assert_eq!(
-            status.code(),
-            tonic::Code::Unimplemented,
-            "SubscribeProject must return Unimplemented pending Stage 4c.5, got {status:?}"
+            err.code,
+            connectrpc::ErrorCode::Unimplemented,
+            "SubscribeProject must return Unimplemented pending Stage 4c.5, got {err:?}"
         );
     }
 
     // NOTE: per-project multi-board merge test will be added together with
     // the `subscribe_project` implementation (currently returns
-    // `Status::unimplemented`; covered by
+    // `ConnectError::unimplemented`; covered by
     // `subscribe_project_returns_unimplemented_pending_stage_4c5`).
 }

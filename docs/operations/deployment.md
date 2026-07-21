@@ -38,7 +38,7 @@ docker buildx build \
 
 The image is built in two stages:
 
-1. A `rust:1.88-bookworm` builder with `tonistiigi/xx` for cross-compilation.
+1. A `rust:1.95-bookworm` builder with `tonistiigi/xx` for cross-compilation.
 2. A `gcr.io/distroless/cc-debian12:nonroot` runtime image with OCI labels for GHCR autolinking.
 
 Only the `kanban` server binary is included in the runtime image. The `permission-coverage` binary is CI-only and is not shipped.
@@ -151,7 +151,7 @@ For the full list of environment variables, see [Configuration](configuration.md
 
 ## Ingress
 
-The frontend uses Connect-RPC over h2 with an SSE fallback. For best performance, terminate TLS at an Ingress or gateway that supports HTTP/2. If only HTTP/1.1 is available, clients will fall back to SSE.
+The frontend uses Connect-RPC over h2 (gRPC and gRPC-Web are also supported). For best performance, terminate TLS at an Ingress or gateway that supports HTTP/2.
 
 ## Rollout and rollback
 

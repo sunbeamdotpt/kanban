@@ -18,25 +18,25 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::id::Id;
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use sqlx::PgPool;
 use sqlx::Row;
-use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_dispatch::CheckedObjectId;
-use crate::integrations::s3::{S3Client, S3Error, sanitize_filename};
-use crate::pb::attachment_service_server::AttachmentService;
-use crate::pb::{
-    Attachment, ConfirmUploadRequest, ConfirmUploadResponse, DeleteAttachmentRequest,
-    DeleteAttachmentResponse, ListAttachmentsByCardRequest, ListAttachmentsByCardResponse,
-    RequestPresignedDownloadRequest, RequestPresignedDownloadResponse,
-    RequestPresignedUploadRequest, RequestPresignedUploadResponse,
+use crate::cpb::sunbeam::kanban::v1::{
+    Attachment, AttachmentService, ConfirmUploadRequest, ConfirmUploadResponse,
+    DeleteAttachmentRequest, DeleteAttachmentResponse, ListAttachmentsByCardRequest,
+    ListAttachmentsByCardResponse, RequestPresignedDownloadRequest,
+    RequestPresignedDownloadResponse, RequestPresignedUploadRequest,
+    RequestPresignedUploadResponse,
 };
+use crate::id::Id;
+use crate::integrations::s3::{S3Client, S3Error, sanitize_filename};
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
@@ -53,6 +53,7 @@ fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
     }
 }
 
@@ -65,55 +66,56 @@ fn now_plus_secs(secs: u64) -> Timestamp {
     Timestamp {
         seconds: t as i64,
         nanos: 0,
+        ..Default::default()
     }
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
-fn s3_err_to_status(err: S3Error, op: &str) -> Status {
+fn s3_err_to_status(err: S3Error, op: &str) -> ConnectError {
     match err {
-        S3Error::NotFound => Status::not_found("object not found in S3"),
+        S3Error::NotFound => ConnectError::not_found("object not found in S3"),
         S3Error::Forbidden => {
             warn!(op, "S3 returned 403 — likely misconfiguration");
-            Status::permission_denied("S3 access denied")
+            ConnectError::permission_denied("S3 access denied")
         }
         S3Error::Http(e) => {
             error!(op, error = %e, "S3 HTTP error");
-            Status::internal("S3 request failed")
+            ConnectError::internal("S3 request failed")
         }
         S3Error::Unexpected(status, body) => {
             error!(op, %status, body = %body, "S3 unexpected response");
-            Status::internal("S3 unexpected response")
+            ConnectError::internal("S3 unexpected response")
         }
     }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn checked_object_id(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<CheckedObjectId>()
         .map(|c| c.0.clone())
-        .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
+        .ok_or_else(|| ConnectError::internal("missing CheckedObjectId extension"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 // ── Row builder ───────────────────────────────────────────────────────────────
@@ -136,34 +138,36 @@ fn attachment_from_row(row: &sqlx::postgres::PgRow) -> Attachment {
         mime_type: mimetype,
         size_bytes: size,
         uploaded_by,
-        uploaded_at: Some(to_proto_ts(created_at)),
+        uploaded_at: Some(to_proto_ts(created_at)).into(),
+        ..Default::default()
     }
 }
 
 // ── impl AttachmentService ────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl AttachmentService for AttachmentServiceImpl {
     // ── RequestPresignedUpload ────────────────────────────────────────────────
 
     async fn request_presigned_upload(
         &self,
-        request: Request<RequestPresignedUploadRequest>,
-    ) -> Result<Response<RequestPresignedUploadResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let subject = subject_from_request(&request)?;
-        let card_id_str = checked_object_id(&request)?;
-        let card_id = card_id_str
-            .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id in x-sunbeam-object-id"))?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RequestPresignedUploadRequest>,
+    ) -> ServiceResult<RequestPresignedUploadResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let subject = subject_from_request(&ctx)?;
+        let card_id_str = checked_object_id(&ctx)?;
+        let card_id = card_id_str.parse::<Id>().map_err(|_| {
+            ConnectError::invalid_argument("invalid card_id in x-sunbeam-object-id")
+        })?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
 
         if req.filename.is_empty() {
-            return Err(Status::invalid_argument("filename is required"));
+            return Err(ConnectError::invalid_argument("filename is required"));
         }
         if req.mime_type.is_empty() {
-            return Err(Status::invalid_argument("mime_type is required"));
+            return Err(ConnectError::invalid_argument("mime_type is required"));
         }
 
         let attachment_id = Id::new();
@@ -200,7 +204,8 @@ impl AttachmentService for AttachmentServiceImpl {
             presigned_url,
             s3_key,
             attachment_id: attachment_id.to_string(),
-            expires_at: Some(expires_at),
+            expires_at: Some(expires_at).into(),
+            ..Default::default()
         }))
     }
 
@@ -208,16 +213,17 @@ impl AttachmentService for AttachmentServiceImpl {
 
     async fn confirm_upload(
         &self,
-        request: Request<ConfirmUploadRequest>,
-    ) -> Result<Response<ConfirmUploadResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let checked_card_id = checked_object_id(&request)?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ConfirmUploadRequest>,
+    ) -> ServiceResult<ConfirmUploadResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let checked_card_id = checked_object_id(&ctx)?;
+        let req = request.to_owned_message();
 
         let attachment_id = req
             .attachment_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid attachment_id"))?;
 
         // Fetch the attachment row; verify card_id matches the checked object.
         let row = sqlx::query(
@@ -228,7 +234,7 @@ impl AttachmentService for AttachmentServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch attachment", e))?
-        .ok_or_else(|| Status::not_found("attachment not found"))?;
+        .ok_or_else(|| ConnectError::not_found("attachment not found"))?;
 
         let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -238,7 +244,7 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "confirm_upload: card_id mismatch — possible header-vs-body bypass attempt"
             );
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "attachment does not belong to the authorized card",
             ));
         }
@@ -269,7 +275,8 @@ impl AttachmentService for AttachmentServiceImpl {
         .map_err(|e| internal("failed to confirm attachment", e))?;
 
         Ok(Response::new(ConfirmUploadResponse {
-            attachment: Some(attachment_from_row(&updated)),
+            attachment: Some(attachment_from_row(&updated)).into(),
+            ..Default::default()
         }))
     }
 
@@ -277,16 +284,17 @@ impl AttachmentService for AttachmentServiceImpl {
 
     async fn request_presigned_download(
         &self,
-        request: Request<RequestPresignedDownloadRequest>,
-    ) -> Result<Response<RequestPresignedDownloadResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let checked_card_id = checked_object_id(&request)?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RequestPresignedDownloadRequest>,
+    ) -> ServiceResult<RequestPresignedDownloadResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let checked_card_id = checked_object_id(&ctx)?;
+        let req = request.to_owned_message();
 
         let attachment_id = req
             .attachment_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid attachment_id"))?;
 
         let row = sqlx::query(
             "SELECT card_id, s3_key FROM card_attachments WHERE id = $1 AND tenant_id = $2",
@@ -296,7 +304,7 @@ impl AttachmentService for AttachmentServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch attachment", e))?
-        .ok_or_else(|| Status::not_found("attachment not found"))?;
+        .ok_or_else(|| ConnectError::not_found("attachment not found"))?;
 
         let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -306,7 +314,7 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "request_presigned_download: card_id mismatch"
             );
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "attachment does not belong to the authorized card",
             ));
         }
@@ -317,7 +325,8 @@ impl AttachmentService for AttachmentServiceImpl {
 
         Ok(Response::new(RequestPresignedDownloadResponse {
             presigned_url,
-            expires_at: Some(expires_at),
+            expires_at: Some(expires_at).into(),
+            ..Default::default()
         }))
     }
 
@@ -325,16 +334,17 @@ impl AttachmentService for AttachmentServiceImpl {
 
     async fn delete_attachment(
         &self,
-        request: Request<DeleteAttachmentRequest>,
-    ) -> Result<Response<DeleteAttachmentResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let checked_card_id = checked_object_id(&request)?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteAttachmentRequest>,
+    ) -> ServiceResult<DeleteAttachmentResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let checked_card_id = checked_object_id(&ctx)?;
+        let req = request.to_owned_message();
 
         let attachment_id = req
             .attachment_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid attachment_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid attachment_id"))?;
 
         let row = sqlx::query(
             "SELECT card_id, s3_key FROM card_attachments WHERE id = $1 AND tenant_id = $2",
@@ -344,7 +354,7 @@ impl AttachmentService for AttachmentServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch attachment", e))?
-        .ok_or_else(|| Status::not_found("attachment not found"))?;
+        .ok_or_else(|| ConnectError::not_found("attachment not found"))?;
 
         let db_card_id: Id = row.get("card_id");
         if db_card_id.to_string() != checked_card_id {
@@ -354,7 +364,7 @@ impl AttachmentService for AttachmentServiceImpl {
                 db_card_id = %db_card_id,
                 "delete_attachment: card_id mismatch"
             );
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "attachment does not belong to the authorized card",
             ));
         }
@@ -379,23 +389,24 @@ impl AttachmentService for AttachmentServiceImpl {
             .await
             .map_err(|e| internal("failed to delete attachment row", e))?;
 
-        Ok(Response::new(DeleteAttachmentResponse {}))
+        Ok(Response::new(DeleteAttachmentResponse::default()))
     }
 
     // ── ListAttachmentsByCard ─────────────────────────────────────────────────
 
     async fn list_attachments_by_card(
         &self,
-        request: Request<ListAttachmentsByCardRequest>,
-    ) -> Result<Response<ListAttachmentsByCardResponse>, Status> {
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListAttachmentsByCardRequest>,
+    ) -> ServiceResult<ListAttachmentsByCardResponse> {
         // The dispatch matrix authorized by card_id (from x-sunbeam-object-id).
         // CheckedObjectId is the card_id; we also accept it from the request body
         // for symmetry, but the authoritative value is the checked extension.
-        let tenant_id = tenant_id_from_request(&request)?;
-        let card_id_str = checked_object_id(&request)?;
-        let card_id = card_id_str
-            .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id in x-sunbeam-object-id"))?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let card_id_str = checked_object_id(&ctx)?;
+        let card_id = card_id_str.parse::<Id>().map_err(|_| {
+            ConnectError::invalid_argument("invalid card_id in x-sunbeam-object-id")
+        })?;
 
         let rows = sqlx::query(
             r#"
@@ -412,7 +423,10 @@ impl AttachmentService for AttachmentServiceImpl {
         .map_err(|e| internal("failed to list attachments", e))?;
 
         let attachments = rows.iter().map(attachment_from_row).collect();
-        Ok(Response::new(ListAttachmentsByCardResponse { attachments }))
+        Ok(Response::new(ListAttachmentsByCardResponse {
+            attachments,
+            ..Default::default()
+        }))
     }
 }
 
@@ -423,6 +437,7 @@ impl AttachmentService for AttachmentServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{connect_ctx, connect_request};
 
     // ── Test env config ──────────────────────────────────────────────────────
 
@@ -449,15 +464,14 @@ mod tests {
         (infra, svc)
     }
 
-    fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut().insert(AuthContext::authenticated(
+    fn authed_ctx_with_object(subject: &str, object_id: &str) -> RequestContext {
+        let mut ctx = connect_ctx(AuthContext::authenticated(
             crate::test_support::test_tenant_id(),
             subject,
         ));
-        req.extensions_mut()
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
     // Clean up a card_attachments row directly.
@@ -489,19 +503,19 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
 
         let resp = svc
-            .request_presigned_upload(authed_request_with_object(
-                RequestPresignedUploadRequest {
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
                     card_id: card_id.to_string(),
                     filename: "test.pdf".to_string(),
                     mime_type: "application/pdf".to_string(),
                     size_bytes: 1024,
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("request_presigned_upload failed")
-            .into_inner();
+            .body;
 
         assert!(
             resp.presigned_url.contains("X-Amz-Signature="),
@@ -518,7 +532,7 @@ mod tests {
             "attachment_id must be non-empty"
         );
         assert!(!resp.s3_key.is_empty(), "s3_key must be non-empty");
-        assert!(resp.expires_at.is_some(), "expires_at must be present");
+        assert!(resp.expires_at.is_set(), "expires_at must be present");
 
         // Cleanup
         let att_id = resp.attachment_id.parse::<Id>().unwrap();
@@ -541,19 +555,19 @@ mod tests {
 
         // Step 1: RequestPresignedUpload
         let upload_resp = svc
-            .request_presigned_upload(authed_request_with_object(
-                RequestPresignedUploadRequest {
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
                     card_id: card_id.to_string(),
                     filename: "hello.txt".to_string(),
                     mime_type: "text/plain".to_string(),
                     size_bytes: 5,
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("request_presigned_upload failed")
-            .into_inner();
+            .body;
 
         let attachment_id = upload_resp.attachment_id.clone();
         let s3_key = upload_resp.s3_key.clone();
@@ -575,17 +589,18 @@ mod tests {
 
         // Step 3: ConfirmUpload
         let confirmed = svc
-            .confirm_upload(authed_request_with_object(
-                ConfirmUploadRequest {
+            .confirm_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&ConfirmUploadRequest {
                     attachment_id: attachment_id.clone(),
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("confirm_upload failed")
-            .into_inner()
+            .body
             .attachment
+            .into_option()
             .expect("attachment missing");
 
         assert_eq!(confirmed.id, attachment_id);
@@ -596,16 +611,16 @@ mod tests {
 
         // Step 4: RequestPresignedDownload
         let download_resp = svc
-            .request_presigned_download(authed_request_with_object(
-                RequestPresignedDownloadRequest {
+            .request_presigned_download(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedDownloadRequest {
                     attachment_id: attachment_id.clone(),
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("request_presigned_download failed")
-            .into_inner();
+            .body;
 
         // Step 5: GET via presigned URL and verify byte-identical content
         let get_resp = http
@@ -642,43 +657,43 @@ mod tests {
 
         // Create a pending attachment but never PUT to S3.
         let upload_resp = svc
-            .request_presigned_upload(authed_request_with_object(
-                RequestPresignedUploadRequest {
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
                     card_id: card_id.to_string(),
                     filename: "missing.bin".to_string(),
                     mime_type: "application/octet-stream".to_string(),
                     size_bytes: 100,
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("request_presigned_upload failed")
-            .into_inner();
+            .body;
 
         let attachment_id = upload_resp.attachment_id.clone();
 
         // ConfirmUpload before the PUT — should fail with not_found.
         let result = svc
-            .confirm_upload(authed_request_with_object(
-                ConfirmUploadRequest {
+            .confirm_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&ConfirmUploadRequest {
                     attachment_id: attachment_id.clone(),
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(
             result.is_err(),
             "confirm_upload should fail when file is not in S3"
         );
-        let status = result.unwrap_err();
+        let err = result.unwrap_err();
         assert_eq!(
-            status.code(),
-            tonic::Code::NotFound,
+            err.code,
+            connectrpc::ErrorCode::NotFound,
             "expected NotFound, got: {:?}",
-            status.code()
+            err.code
         );
 
         // Cleanup
@@ -702,19 +717,19 @@ mod tests {
 
         // Upload a real file.
         let upload_resp = svc
-            .request_presigned_upload(authed_request_with_object(
-                RequestPresignedUploadRequest {
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
                     card_id: card_id.to_string(),
                     filename: "to-delete.txt".to_string(),
                     mime_type: "text/plain".to_string(),
                     size_bytes: 7,
-                },
-                &subject,
-                &card_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("upload request failed")
-            .into_inner();
+            .body;
 
         let attachment_id = upload_resp.attachment_id.clone();
         let s3_key = upload_resp.s3_key.clone();
@@ -726,24 +741,24 @@ mod tests {
             .await
             .expect("PUT failed");
 
-        svc.confirm_upload(authed_request_with_object(
-            ConfirmUploadRequest {
+        svc.confirm_upload(
+            authed_ctx_with_object(&subject, &card_id.to_string()),
+            connect_request(&ConfirmUploadRequest {
                 attachment_id: attachment_id.clone(),
-            },
-            &subject,
-            &card_id.to_string(),
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("confirm failed");
 
         // DeleteAttachment
-        svc.delete_attachment(authed_request_with_object(
-            DeleteAttachmentRequest {
+        svc.delete_attachment(
+            authed_ctx_with_object(&subject, &card_id.to_string()),
+            connect_request(&DeleteAttachmentRequest {
                 attachment_id: attachment_id.clone(),
-            },
-            &subject,
-            &card_id.to_string(),
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete_attachment failed");
 
@@ -806,16 +821,16 @@ mod tests {
         }
 
         let list = svc
-            .list_attachments_by_card(authed_request_with_object(
-                ListAttachmentsByCardRequest {
+            .list_attachments_by_card(
+                authed_ctx_with_object(&subject, &card_a.to_string()),
+                connect_request(&ListAttachmentsByCardRequest {
                     card_id: card_a.to_string(),
-                },
-                &subject,
-                &card_a.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_attachments_by_card failed")
-            .into_inner();
+            .body;
 
         assert_eq!(
             list.attachments.len(),
@@ -863,44 +878,44 @@ mod tests {
 
         // Create an attachment on card_legit.
         let upload_resp = svc
-            .request_presigned_upload(authed_request_with_object(
-                RequestPresignedUploadRequest {
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_legit.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
                     card_id: card_legit.to_string(),
                     filename: "secret.pdf".to_string(),
                     mime_type: "application/pdf".to_string(),
                     size_bytes: 42,
-                },
-                &subject,
-                &card_legit.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("upload request failed")
-            .into_inner();
+            .body;
 
         let attachment_id = upload_resp.attachment_id.clone();
 
         // Attacker calls ConfirmUpload with card_attacker as the checked object
         // but the attachment_id belongs to card_legit.
         let result = svc
-            .confirm_upload(authed_request_with_object(
-                ConfirmUploadRequest {
+            .confirm_upload(
+                authed_ctx_with_object(&subject, &card_attacker.to_string()), // WRONG card_id in header
+                connect_request(&ConfirmUploadRequest {
                     attachment_id: attachment_id.clone(),
-                },
-                &subject,
-                &card_attacker.to_string(), // WRONG card_id in header
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(
             result.is_err(),
             "confirm_upload must reject card_id mismatch"
         );
-        let status = result.unwrap_err();
+        let err = result.unwrap_err();
         assert_eq!(
-            status.code(),
-            tonic::Code::PermissionDenied,
+            err.code,
+            connectrpc::ErrorCode::PermissionDenied,
             "expected PermissionDenied for card_id mismatch, got: {:?}",
-            status.code()
+            err.code
         );
 
         // Cleanup

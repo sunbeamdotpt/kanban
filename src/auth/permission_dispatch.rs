@@ -26,9 +26,16 @@
 //! Token revocation is handled by the gateway, so no additional local
 //! revocation check is performed here.
 //!
+//! # Service-credential permission checks
+//!
+//! Checks are made with the service's own singleton [`PermissionClient`]
+//! (client-credentials, `permission:admin`), scoped to the caller's tenant via
+//! the `x-tenant-id` header. End-user tokens never need permission scopes of
+//! their own; the service authorizes on their behalf after introspection has
+//! established who they are.
+//!
 use std::{fmt, sync::Arc};
 
-use axum::http::header::AUTHORIZATION;
 use axum::{
     Extension,
     extract::{Request, State},
@@ -36,7 +43,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use sunbeam_g2v::middleware::auth::AuthContext;
+use sunbeam_g2v::middleware::auth::{AuthContext, TenantId};
 
 use super::permission_client::{PermissionClient, PermissionError};
 
@@ -93,30 +100,10 @@ pub struct DispatchEntry {
 
 /// Shared state carried by `Extension<Arc<DispatchState>>`.
 pub struct DispatchState {
-    /// Base URL of the sso-gateway. A fresh `PermissionClient` is built for
-    /// each request using the caller's bearer token.
-    pub permission_base_url: String,
-}
-
-impl DispatchState {
-    /// Build a `PermissionClient` for the current request, forwarding the
-    /// caller's bearer token.
-    fn client_for_request(&self, req: &Request) -> Result<PermissionClient, (StatusCode, String)> {
-        let token = req
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token".to_string()))?;
-
-        PermissionClient::with_bearer_token(&self.permission_base_url, token).map_err(|e| {
-            tracing::error!(error = %e, "permission_dispatch: failed to build PermissionClient");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "authorization client error".to_string(),
-            )
-        })
-    }
+    /// Root service-credential permission client. Per-request checks use a
+    /// cached per-tenant derivative (see [`PermissionClient::tenant_client`])
+    /// so the service — not the caller's token — authorizes every check.
+    pub permission: Arc<PermissionClient>,
 }
 
 // ============================================================================
@@ -607,10 +594,11 @@ fn hash_subject_prefix(subject: &str) -> impl fmt::Display {
 pub async fn dispatch(
     State(state): State<Arc<DispatchState>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(tenant): Extension<TenantId>,
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
-    let req = dispatch_check(state, auth, req).await?;
+    let req = dispatch_check(state, auth, tenant.0, req).await?;
     Ok(next.run(req).await)
 }
 
@@ -622,6 +610,7 @@ pub async fn dispatch(
 pub(crate) async fn dispatch_check(
     state: Arc<DispatchState>,
     auth: AuthContext,
+    tenant_id: String,
     mut req: Request,
 ) -> Result<Request, (StatusCode, String)> {
     // 1. Require authentication.
@@ -680,8 +669,19 @@ pub(crate) async fn dispatch_check(
                 }
             };
 
-            // 5. Build a per-request permission client from the caller's token.
-            let client = state.client_for_request(&req)?;
+            // 5. Build the tenant-scoped service client (cached per tenant)
+            //    and run the check with the service's own credentials.
+            let client = state
+                .permission
+                .tenant_client(&tenant_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "permission_dispatch: failed to derive tenant client");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "authorization client error".to_string(),
+                    )
+                })?;
 
             // 6. Permission check.
             let allowed = client
@@ -838,6 +838,22 @@ mod tests {
         req
     }
 
+    /// Dummy state whose client is never called (the tested paths bail before
+    /// the permission check).
+    fn dummy_state() -> Arc<DispatchState> {
+        let permission =
+            PermissionClient::new(&crate::auth::permission_client::PermissionClientConfig {
+                base_url: "http://localhost:1".to_string(),
+                token_url: "http://localhost:1/oauth2/token".to_string(),
+                client_id: "unused".to_string(),
+                client_secret: "unused".to_string(),
+            })
+            .expect("dummy permission client should build");
+        Arc::new(DispatchState {
+            permission: Arc::new(permission),
+        })
+    }
+
     #[tokio::test]
     async fn dispatch_rejects_unauthenticated() {
         // Use a None-source entry so we never reach the permission check.
@@ -846,9 +862,7 @@ mod tests {
 
         // We need Extension<Arc<DispatchState>> too — but dispatch checks
         // is_authenticated first, so we can use a dummy state.
-        let state = Arc::new(DispatchState {
-            permission_base_url: "http://localhost:8080".to_string(),
-        });
+        let state = dummy_state();
         req.extensions_mut().insert(state);
 
         let result = dispatch_raw(req).await;
@@ -865,9 +879,7 @@ mod tests {
         let auth = make_auth(true);
         let mut req = make_request("/sunbeam.kanban.v1.BoardService/DeleteBoard", auth.clone());
 
-        let state = Arc::new(DispatchState {
-            permission_base_url: "http://localhost:8080".to_string(),
-        });
+        let state = dummy_state();
         req.extensions_mut().insert(auth);
         req.extensions_mut().insert(state);
 
@@ -957,6 +969,7 @@ mod tests {
                 .cloned()
                 .unwrap(),
             req.extensions().get::<AuthContext>().cloned().unwrap(),
+            "tenant-1".to_string(),
             req,
         )
         .await;

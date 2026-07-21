@@ -8,16 +8,17 @@
 //! `GetAggregatedBoard` streams chunks back to the client, so large aggregates
 //! can be returned without pagination.
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::id::Id;
 use async_stream::stream;
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
+use connectrpc::{
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
+};
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
@@ -26,14 +27,14 @@ use sunbeam_g2v::middleware::auth::AuthContext;
 use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::auth::permission_expand::{ExpandQuery, expand_objects};
 use crate::auth::permission_retry::PermissionRetryExt;
-use crate::pb::aggregated_board_service_server::AggregatedBoardService;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     AddSourceBoardRequest, AddSourceBoardResponse, AggregatedBoard, AggregatedBoardChunk,
-    AggregatedCardBatch, AggregatedColumn, BoardEventEnvelope, Card, CreateAggregatedBoardRequest,
-    CreateAggregatedBoardResponse, Cutover, DeleteAggregatedBoardRequest,
-    DeleteAggregatedBoardResponse, GetAggregatedBoardRequest, GetAggregatedBoardResponse,
-    Heartbeat, ListAggregatedBoardsRequest, ListAggregatedBoardsResponse, MoveSourceBoardRequest,
-    MoveSourceBoardResponse, RemoveSourceBoardRequest, RemoveSourceBoardResponse, SourceBoardRef,
+    AggregatedBoardService, AggregatedCardBatch, AggregatedColumn, BoardEventEnvelope, Card,
+    CreateAggregatedBoardRequest, CreateAggregatedBoardResponse, Cutover,
+    DeleteAggregatedBoardRequest, DeleteAggregatedBoardResponse, GetAggregatedBoardRequest,
+    GetAggregatedBoardResponse, Heartbeat, ListAggregatedBoardsRequest,
+    ListAggregatedBoardsResponse, MoveSourceBoardRequest, MoveSourceBoardResponse,
+    RemoveSourceBoardRequest, RemoveSourceBoardResponse, SourceBoardRef,
     SubscribeAggregatedBoardRequest, SubscribeAggregatedBoardResponse,
     UpdateAggregatedBoardRequest, UpdateAggregatedBoardResponse,
     aggregated_board_chunk::Payload as ChunkPayload, board_event_envelope::Payload as EventPayload,
@@ -42,7 +43,7 @@ use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::cards::{
     CardAggregates, card_from_row, fetch_assignees, fetch_attachments_count, fetch_checklist,
-    fetch_comments_count, fetch_dependencies, fetch_dependents, fetch_labels, to_proto_ts,
+    fetch_comments_count, fetch_dependencies, fetch_dependents, fetch_labels,
 };
 use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
@@ -63,47 +64,57 @@ pub struct AggregatedBoardServiceImpl {
     pub cutover_seen_capacity: usize,
 }
 
+// ── Timestamp helpers (chrono ↔ buffa_types) ─────────────────────────────────
+
+fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
+    Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
+    }
+}
+
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn checked_object_id(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<CheckedObjectId>()
         .map(|c| c.0.clone())
-        .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
+        .ok_or_else(|| ConnectError::internal("missing CheckedObjectId extension"))
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 /// Extract the caller's tenant from the auth context and derive a permission
 /// client scoped to that tenant's store (see `TENANT_HEADER`).
-async fn tenant_client_for<T>(
+async fn tenant_client_for(
     permission: &PermissionClient,
-    req: &Request<T>,
-) -> Result<PermissionClient, Status> {
-    let tenant = req
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = ctx
         .extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
     permission
         .tenant_client(&tenant)
         .await
@@ -126,9 +137,10 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
         name,
         description: description.unwrap_or_default(),
         icon: icon.unwrap_or_default(),
-        visibility: db_to_proto(&visibility),
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        visibility: db_to_proto(&visibility).into(),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        ..Default::default()
     }
 }
 
@@ -140,7 +152,7 @@ async fn insert_event_log(
     aggregated_board_id: Id,
     event_type: &str,
     payload: serde_json::Value,
-) -> Result<(), Status> {
+) -> Result<(), ConnectError> {
     sqlx::query(
         "INSERT INTO event_log (id, tenant_id, aggregated_board_id, event_type, payload, created_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, now())",
@@ -165,7 +177,7 @@ async fn fetch_ordered_source_ids(
     tx: &mut Transaction<'_, Postgres>,
     aggregated_board_id: Id,
     tenant_id: &str,
-) -> Result<Vec<Id>, Status> {
+) -> Result<Vec<Id>, ConnectError> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources \
          WHERE aggregated_board_id = $1 AND tenant_id = $2 \
@@ -185,7 +197,7 @@ async fn apply_source_order(
     aggregated_board_id: Id,
     tenant_id: &str,
     ordered_ids: &[Id],
-) -> Result<(), Status> {
+) -> Result<(), ConnectError> {
     for (i, board_id) in ordered_ids.iter().enumerate() {
         sqlx::query(
             "UPDATE aggregated_board_sources SET position = $4 \
@@ -206,7 +218,7 @@ async fn fetch_source_boards(
     pool: &PgPool,
     aggregated_board_id: Id,
     tenant_id: &str,
-) -> Result<Vec<SourceBoardRef>, Status> {
+) -> Result<Vec<SourceBoardRef>, ConnectError> {
     let rows = sqlx::query(
         r#"
         SELECT b.id, b.project_id, b.name, b.icon, s.position
@@ -236,6 +248,7 @@ async fn fetch_source_boards(
                 name,
                 icon: icon.unwrap_or_default(),
                 position,
+                ..Default::default()
             }
         })
         .collect())
@@ -245,7 +258,7 @@ async fn fetch_source_board_ids(
     pool: &PgPool,
     aggregated_board_id: Id,
     tenant_id: &str,
-) -> Result<Vec<Id>, Status> {
+) -> Result<Vec<Id>, ConnectError> {
     let rows = sqlx::query(
         "SELECT board_id FROM aggregated_board_sources
          WHERE aggregated_board_id = $1 AND tenant_id = $2
@@ -265,7 +278,7 @@ async fn fetch_public_internal_board_ids(
     pool: &PgPool,
     tenant_id: &str,
     board_ids: &[Id],
-) -> Result<std::collections::HashSet<Id>, Status> {
+) -> Result<std::collections::HashSet<Id>, ConnectError> {
     if board_ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
@@ -289,7 +302,7 @@ async fn fetch_cards_for_boards(
     board_ids: &[Id],
     visible_board_ids: &[Id],
     tenant_id: &str,
-) -> Result<Vec<Card>, Status> {
+) -> Result<Vec<Card>, ConnectError> {
     if board_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -345,11 +358,9 @@ async fn fetch_cards_for_boards(
 
 // ── Streaming helpers ─────────────────────────────────────────────────────────
 
-type AggregatedBoardStream =
-    Pin<Box<dyn Stream<Item = Result<GetAggregatedBoardResponse, Status>> + Send + 'static>>;
+type AggregatedBoardStream = ServiceStream<GetAggregatedBoardResponse>;
 
-type SubscribeAggregatedBoardStream =
-    Pin<Box<dyn Stream<Item = Result<SubscribeAggregatedBoardResponse, Status>> + Send + 'static>>;
+type SubscribeAggregatedBoardStream = ServiceStream<SubscribeAggregatedBoardResponse>;
 
 fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
     BoardEventEnvelope {
@@ -357,12 +368,14 @@ fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
         event_id: String::new(),
         nats_seq: 0,
         board_revision: 0,
-        emitted_at: None,
+        emitted_at: None.into(),
         emitter_pod_id: String::new(),
         actor_subject: "system".to_string(),
-        payload: Some(EventPayload::Cutover(Cutover {
+        payload: Some(EventPayload::Cutover(Box::new(Cutover {
             last_replay_nats_seq,
-        })),
+            ..Default::default()
+        }))),
+        ..Default::default()
     }
 }
 
@@ -377,14 +390,18 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
         event_id: String::new(),
         nats_seq: 0,
         board_revision: 0,
-        emitted_at: None,
+        emitted_at: None.into(),
         emitter_pod_id: String::new(),
         actor_subject: "system".to_string(),
-        payload: Some(EventPayload::Heartbeat(Heartbeat { server_time_ms })),
+        payload: Some(EventPayload::Heartbeat(Box::new(Heartbeat {
+            server_time_ms,
+            ..Default::default()
+        }))),
+        ..Default::default()
     }
 }
 
-fn revalidate_token(_auth: &AuthContext) -> Result<bool, Status> {
+fn revalidate_token(_auth: &AuthContext) -> Result<bool, ConnectError> {
     Ok(true)
 }
 
@@ -392,39 +409,37 @@ async fn revalidate_permission(
     permission: &PermissionClient,
     auth: &AuthContext,
     aggregated_board_id: &str,
-) -> Result<bool, Status> {
+) -> Result<bool, ConnectError> {
     let subject = auth.subject.as_deref().unwrap_or("");
     permission.check_permission_with_retry(PERMISSION_TYPE, aggregated_board_id, "view", subject)
         .await
         .map_err(|e| {
             warn!(aggregated_board_id, subject, error = %e, "aggregate stream: permission recheck failed");
-            Status::internal("authorization check failed")
+            ConnectError::internal("authorization check failed")
         })
 }
 
 // ── impl AggregatedBoardService ───────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl AggregatedBoardService for AggregatedBoardServiceImpl {
-    type GetAggregatedBoardStream = AggregatedBoardStream;
-    type SubscribeAggregatedBoardStream = SubscribeAggregatedBoardStream;
-
     // ── CreateAggregatedBoard ───────────────────────────────────────────────────
     async fn create_aggregated_board(
         &self,
-        request: Request<CreateAggregatedBoardRequest>,
-    ) -> Result<Response<CreateAggregatedBoardResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateAggregatedBoardRequest>,
+    ) -> ServiceResult<CreateAggregatedBoardResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+            return Err(ConnectError::invalid_argument("name is required"));
         }
 
         let aggregated_board_id = Id::new();
-        let visibility = proto_to_db(req.visibility);
+        let visibility = proto_to_db(req.visibility.to_i32());
 
         let mut tx = self
             .pool
@@ -452,7 +467,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         for (position, board_id_str) in req.source_board_ids.iter().enumerate() {
             let board_id = board_id_str
                 .parse::<Id>()
-                .map_err(|_| Status::invalid_argument("invalid source_board_id"))?;
+                .map_err(|_| ConnectError::invalid_argument("invalid source_board_id"))?;
             sqlx::query(
                 "INSERT INTO aggregated_board_sources (aggregated_board_id, tenant_id, board_id, position) \
                  VALUES ($1, $2, $3, $4)",
@@ -533,23 +548,25 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             }
 
         Ok(Response::new(CreateAggregatedBoardResponse {
-            aggregated_board: Some(aggregated_board_from_row(&row)),
+            aggregated_board: Some(aggregated_board_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     // ── GetAggregatedBoard ──────────────────────────────────────────────────────
     async fn get_aggregated_board(
         &self,
-        request: Request<GetAggregatedBoardRequest>,
-    ) -> Result<Response<Self::GetAggregatedBoardStream>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetAggregatedBoardRequest>,
+    ) -> ServiceResult<AggregatedBoardStream> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let aggregated_board_id = req
             .aggregated_board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
@@ -560,7 +577,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch aggregated board", e))?
-        .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("aggregated board not found"))?;
 
         let aggregate_visibility: String = row.get("visibility");
         if !is_public_or_internal(&aggregate_visibility) {
@@ -574,7 +591,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 .await
                 .map_err(|e| internal("failed to check aggregated board view permission", e))?;
             if !allowed {
-                return Err(Status::permission_denied(
+                return Err(ConnectError::permission_denied(
                     "you do not have permission to view this aggregated board",
                 ));
             }
@@ -620,7 +637,8 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let mut chunks: Vec<AggregatedBoardChunk> = Vec::new();
         chunks.push(AggregatedBoardChunk {
-            payload: Some(ChunkPayload::Metadata(metadata)),
+            payload: Some(ChunkPayload::Metadata(Box::new(metadata))),
+            ..Default::default()
         });
         let filtered_source_boards: Vec<_> = source_boards
             .into_iter()
@@ -633,34 +651,42 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .collect();
         for sb in &filtered_source_boards {
             chunks.push(AggregatedBoardChunk {
-                payload: Some(ChunkPayload::SourceBoard(sb.clone())),
+                payload: Some(ChunkPayload::SourceBoard(Box::new(sb.clone()))),
+                ..Default::default()
             });
         }
         for (position, sb) in filtered_source_boards.iter().enumerate() {
             chunks.push(AggregatedBoardChunk {
-                payload: Some(ChunkPayload::Column(AggregatedColumn {
+                payload: Some(ChunkPayload::Column(Box::new(AggregatedColumn {
                     id: format!("agg-col-{}", sb.board_id),
                     title: sb.name.clone(),
                     accent: sb.icon.clone(),
                     wip_limit: 0,
                     position: position as i32 + 1,
                     source_board_id: sb.board_id.clone(),
-                })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
             });
         }
 
         // Card batches.
         for batch in cards.chunks(CARD_BATCH_SIZE) {
             chunks.push(AggregatedBoardChunk {
-                payload: Some(ChunkPayload::CardBatch(AggregatedCardBatch {
+                payload: Some(ChunkPayload::CardBatch(Box::new(AggregatedCardBatch {
                     cards: batch.to_vec(),
-                })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
             });
         }
 
         let stream = stream! {
             for chunk in chunks {
-                yield Ok(GetAggregatedBoardResponse { chunk: Some(chunk) });
+                yield Ok(GetAggregatedBoardResponse {
+                    chunk: Some(chunk).into(),
+                    ..Default::default()
+                });
             }
         };
 
@@ -670,21 +696,22 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
     // ── UpdateAggregatedBoard ───────────────────────────────────────────────────
     async fn update_aggregated_board(
         &self,
-        request: Request<UpdateAggregatedBoardRequest>,
-    ) -> Result<Response<UpdateAggregatedBoardResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateAggregatedBoardRequest>,
+    ) -> ServiceResult<UpdateAggregatedBoardResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
-        let req = request.into_inner();
-        let patch = req.aggregated_board.unwrap_or_default();
+        let req = request.to_owned_message();
+        let patch = req.aggregated_board.into_option().unwrap_or_default();
 
         let update_paths: std::collections::HashSet<&str> = req
             .update_mask
-            .as_ref()
+            .as_option()
             .map(|m| m.paths.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
         let visibility_change = update_paths.contains("visibility");
@@ -701,13 +728,13 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
                 .await
                 .map_err(|e| internal("failed to check aggregated board manage permission", e))?;
             if !allowed {
-                return Err(Status::permission_denied(
+                return Err(ConnectError::permission_denied(
                     "you do not have permission to change aggregated board visibility",
                 ));
             }
         }
 
-        let new_visibility = proto_to_db(patch.visibility);
+        let new_visibility = proto_to_db(patch.visibility.to_i32());
 
         let mut tx = self
             .pool
@@ -735,7 +762,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update aggregated board", e))?
-        .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("aggregated board not found"))?;
 
         insert_event_log(
             &mut tx,
@@ -751,20 +778,22 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .map_err(|e| internal("failed to commit transaction", e))?;
 
         Ok(Response::new(UpdateAggregatedBoardResponse {
-            aggregated_board: Some(aggregated_board_from_row(&row)),
+            aggregated_board: Some(aggregated_board_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     // ── DeleteAggregatedBoard ───────────────────────────────────────────────────
     async fn delete_aggregated_board(
         &self,
-        request: Request<DeleteAggregatedBoardRequest>,
-    ) -> Result<Response<DeleteAggregatedBoardResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, DeleteAggregatedBoardRequest>,
+    ) -> ServiceResult<DeleteAggregatedBoardResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
         let result = sqlx::query("DELETE FROM aggregated_boards WHERE id = $1 AND tenant_id = $2")
             .bind(aggregated_board_id)
@@ -774,7 +803,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .map_err(|e| internal("failed to delete aggregated board", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("aggregated board not found"));
+            return Err(ConnectError::not_found("aggregated board not found"));
         }
 
         warn!(
@@ -782,17 +811,18 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             "delete_aggregated_board: permission tuple cleanup is best-effort; reconciler will catch any drift"
         );
 
-        Ok(Response::new(DeleteAggregatedBoardResponse {}))
+        Ok(Response::new(DeleteAggregatedBoardResponse::default()))
     }
 
     // ── ListAggregatedBoards ────────────────────────────────────────────────────
     async fn list_aggregated_boards(
         &self,
-        request: Request<ListAggregatedBoardsRequest>,
-    ) -> Result<Response<ListAggregatedBoardsResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListAggregatedBoardsRequest>,
+    ) -> ServiceResult<ListAggregatedBoardsResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
 
         // Public/internal aggregates are visible to any authenticated user in the
         // tenant; private aggregates require an explicit view relation in the
@@ -830,25 +860,27 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         Ok(Response::new(ListAggregatedBoardsResponse {
             aggregated_boards,
+            ..Default::default()
         }))
     }
 
     // ── AddSourceBoard ──────────────────────────────────────────────────────────
     async fn add_source_board(
         &self,
-        request: Request<AddSourceBoardRequest>,
-    ) -> Result<Response<AddSourceBoardResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddSourceBoardRequest>,
+    ) -> ServiceResult<AddSourceBoardResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let board_id = req
             .board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
             .pool
@@ -925,26 +957,28 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .get_aggregate_metadata(aggregated_board_id, &tenant_id)
             .await?;
         Ok(Response::new(AddSourceBoardResponse {
-            aggregated_board: Some(aggregated_board),
+            aggregated_board: Some(aggregated_board).into(),
+            ..Default::default()
         }))
     }
 
     // ── RemoveSourceBoard ───────────────────────────────────────────────────────
     async fn remove_source_board(
         &self,
-        request: Request<RemoveSourceBoardRequest>,
-    ) -> Result<Response<RemoveSourceBoardResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RemoveSourceBoardRequest>,
+    ) -> ServiceResult<RemoveSourceBoardResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let board_id = req
             .board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
             .pool
@@ -987,26 +1021,28 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .get_aggregate_metadata(aggregated_board_id, &tenant_id)
             .await?;
         Ok(Response::new(RemoveSourceBoardResponse {
-            aggregated_board: Some(aggregated_board),
+            aggregated_board: Some(aggregated_board).into(),
+            ..Default::default()
         }))
     }
 
     // ── MoveSourceBoard ─────────────────────────────────────────────────────────
     async fn move_source_board(
         &self,
-        request: Request<MoveSourceBoardRequest>,
-    ) -> Result<Response<MoveSourceBoardResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, MoveSourceBoardRequest>,
+    ) -> ServiceResult<MoveSourceBoardResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let aggregated_board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let board_id = req
             .board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let mut tx = self
             .pool
@@ -1021,7 +1057,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let current_idx = ordered
             .iter()
             .position(|&id| id == board_id)
-            .ok_or_else(|| Status::not_found("source board not found in aggregate"))?;
+            .ok_or_else(|| ConnectError::not_found("source board not found in aggregate"))?;
         let board_id_moved = ordered.remove(current_idx);
         let target_idx = (req.to_position as usize).min(ordered.len());
         ordered.insert(target_idx, board_id_moved);
@@ -1035,25 +1071,27 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             .get_aggregate_metadata(aggregated_board_id, &tenant_id)
             .await?;
         Ok(Response::new(MoveSourceBoardResponse {
-            aggregated_board: Some(aggregated_board),
+            aggregated_board: Some(aggregated_board).into(),
+            ..Default::default()
         }))
     }
 
     // ── SubscribeAggregatedBoard ────────────────────────────────────────────────
     async fn subscribe_aggregated_board(
         &self,
-        request: Request<SubscribeAggregatedBoardRequest>,
-    ) -> Result<Response<SubscribeAggregatedBoardStream>, Status> {
-        let auth = request
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SubscribeAggregatedBoardRequest>,
+    ) -> ServiceResult<SubscribeAggregatedBoardStream> {
+        let auth = ctx
             .extensions()
             .get::<AuthContext>()
             .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing auth context"))?;
+            .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))?;
         let tenant_id = auth
             .tenant_id
             .clone()
-            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
-        let req = request.into_inner();
+            .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
+        let req = request.to_owned_message();
         let aggregated_board_id = req.aggregated_board_id;
 
         let visibility: String = sqlx::query_scalar(
@@ -1062,13 +1100,13 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .bind(
             aggregated_board_id
                 .parse::<Id>()
-                .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
+                .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?,
         )
         .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch aggregated board visibility", e))?
-        .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("aggregated board not found"))?;
 
         let is_private = !is_public_or_internal(&visibility);
 
@@ -1076,7 +1114,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             &self.pool,
             aggregated_board_id
                 .parse::<Id>()
-                .map_err(|_| Status::invalid_argument("invalid aggregated_board_id"))?,
+                .map_err(|_| ConnectError::invalid_argument("invalid aggregated_board_id"))?,
             &tenant_id,
         )
         .await?;
@@ -1085,7 +1123,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let tenant = auth
             .tenant_id
             .clone()
-            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+            .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
         let permission = Arc::new(
             self.permission
                 .tenant_client(&tenant)
@@ -1117,7 +1155,7 @@ impl AggregatedBoardServiceImpl {
         &self,
         aggregated_board_id: Id,
         tenant_id: &str,
-    ) -> Result<AggregatedBoard, Status> {
+    ) -> Result<AggregatedBoard, ConnectError> {
         let row = sqlx::query(
             "SELECT id, name, description, icon, visibility, created_at, updated_at \
              FROM aggregated_boards WHERE id = $1 AND tenant_id = $2",
@@ -1127,7 +1165,7 @@ impl AggregatedBoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch aggregated board", e))?
-        .ok_or_else(|| Status::not_found("aggregated board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("aggregated board not found"))?;
 
         Ok(aggregated_board_from_row(&row))
     }
@@ -1150,7 +1188,7 @@ pub struct SubscribeAggregatedBoardArgs {
 
 pub async fn build_subscribe_aggregated_board_stream(
     args: SubscribeAggregatedBoardArgs,
-) -> Result<SubscribeAggregatedBoardStream, Status> {
+) -> Result<SubscribeAggregatedBoardStream, ConnectError> {
     let SubscribeAggregatedBoardArgs {
         registry,
         permission,
@@ -1166,7 +1204,8 @@ pub async fn build_subscribe_aggregated_board_stream(
     let s = stream! {
         // Emit cutover immediately (empty replay).
         yield Ok(SubscribeAggregatedBoardResponse {
-            envelope: Some(cutover_envelope(0)),
+            envelope: Some(cutover_envelope(0)).into(),
+            ..Default::default()
         });
 
         // Subscribe to the aggregate's own event stream.
@@ -1174,7 +1213,7 @@ pub async fn build_subscribe_aggregated_board_stream(
             Ok(h) => h,
             Err(e) => {
                 warn!(aggregated_board_id = %aggregated_board_id, error = %e, "SubscribeAggregatedBoard: aggregate subscribe failed");
-                yield Err(Status::internal(format!("subscribe: {e}")));
+                yield Err(ConnectError::internal(format!("subscribe: {e}")));
                 return;
             }
         };
@@ -1186,7 +1225,7 @@ pub async fn build_subscribe_aggregated_board_stream(
                 Ok(h) => source_handles.push(h),
                 Err(e) => {
                     warn!(board_id = %board_id, error = %e, "SubscribeAggregatedBoard: source subscribe failed");
-                    yield Err(Status::internal(format!("subscribe: {e}")));
+                    yield Err(ConnectError::internal(format!("subscribe: {e}")));
                     return;
                 }
             }
@@ -1232,7 +1271,7 @@ pub async fn build_subscribe_aggregated_board_stream(
             match revalidate_token(&auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    yield Err(Status::unauthenticated("token expired"));
+                    yield Err(ConnectError::unauthenticated("token expired"));
                     break;
                 }
                 Err(status) => {
@@ -1245,7 +1284,7 @@ pub async fn build_subscribe_aggregated_board_stream(
                 match revalidate_permission(&permission, &auth, &aggregated_board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        yield Err(Status::permission_denied("permission revoked mid-stream"));
+                        yield Err(ConnectError::permission_denied("permission revoked mid-stream"));
                         break;
                     }
                     Err(status) => {
@@ -1261,7 +1300,10 @@ pub async fn build_subscribe_aggregated_board_stream(
                     match msg {
                         Some(envelope) => {
                             match tracker.observe_live(&envelope.event_id, envelope.nats_seq) {
-                                Outcome::Emit => yield Ok(SubscribeAggregatedBoardResponse { envelope: Some(envelope) }),
+                                Outcome::Emit => yield Ok(SubscribeAggregatedBoardResponse {
+                                    envelope: Some(envelope).into(),
+                                    ..Default::default()
+                                }),
                                 Outcome::Drop | Outcome::OutOfOrder => {}
                             }
                         }
@@ -1273,7 +1315,8 @@ pub async fn build_subscribe_aggregated_board_stream(
                 }
                 _ = heartbeat.tick() => {
                     yield Ok(SubscribeAggregatedBoardResponse {
-                        envelope: Some(heartbeat_envelope()),
+                        envelope: Some(heartbeat_envelope()).into(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1287,31 +1330,30 @@ pub async fn build_subscribe_aggregated_board_stream(
 mod tests {
     use super::*;
     use tokio_stream::StreamExt;
-    use tonic::Request;
 
-    use crate::pb::board_service_server::BoardService;
-    use crate::pb::card_service_server::CardService;
-    use crate::pb::{BoardVisibility, CreateBoardRequest, CreateCardRequest, GetBoardRequest};
+    use crate::cpb::sunbeam::kanban::v1::{
+        BoardService, BoardVisibility, CardService, CreateBoardRequest, CreateCardRequest,
+        GetBoardRequest,
+    };
     use crate::services::boards::BoardServiceImpl;
     use crate::services::cards::CardServiceImpl;
-    use crate::test_support::containers;
-    use prost_types::FieldMask;
+    use crate::test_support::{connect_ctx, connect_request, containers};
+    use buffa_types::google::protobuf::FieldMask;
 
-    fn authed_request<T>(body: T, subject: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(sunbeam_g2v::middleware::auth::AuthContext::authenticated(
-                crate::test_support::test_tenant_id(),
-                subject,
-            ));
-        req
+    /// Create an authenticated context that only carries the caller subject.
+    fn authed_ctx(subject: &str) -> RequestContext {
+        connect_ctx(AuthContext::authenticated(
+            crate::test_support::test_tenant_id(),
+            subject,
+        ))
     }
 
-    fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
-        let mut req = authed_request(body, subject);
-        req.extensions_mut()
+    /// Create an authenticated context that also carries a `CheckedObjectId`.
+    fn authed_ctx_with_object(subject: &str, object_id: &str) -> RequestContext {
+        let mut ctx = authed_ctx(subject);
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
     async fn make_service(infra: &containers::TestInfra) -> AggregatedBoardServiceImpl {
@@ -1399,7 +1441,7 @@ mod tests {
             project_id,
             name,
             subject,
-            BoardVisibility::Private as i32,
+            BoardVisibility::Private,
         )
         .await
     }
@@ -1409,25 +1451,26 @@ mod tests {
         project_id: Id,
         name: &str,
         subject: &str,
-        visibility: i32,
+        visibility: BoardVisibility,
     ) -> Id {
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: name.to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility,
-                },
-                subject,
-                &project_id.to_string(),
-            ))
+                    visibility: visibility.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
         let board_id = board.id.parse::<Id>().expect("board id is ulid");
 
@@ -1475,6 +1518,7 @@ mod tests {
             chunks.push(
                 item.expect("stream item failed")
                     .chunk
+                    .into_option()
                     .expect("chunk missing"),
             );
         }
@@ -1496,21 +1540,23 @@ mod tests {
         let board_b = create_source_board(&board_svc, project_id, "Source B", &subject).await;
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&subject),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Cross-Project View".to_string(),
                     description: "meta board".to_string(),
                     icon: "layers".to_string(),
                     source_board_ids: vec![board_a.to_string(), board_b.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_aggregated_board failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         assert!(!created.id.is_empty());
@@ -1518,16 +1564,16 @@ mod tests {
 
         let agg_id = created.id.clone();
         let stream = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_aggregated_board failed")
-            .into_inner();
+            .body;
 
         let chunks = collect_aggregate_stream(stream).await;
         let metadata = chunks
@@ -1566,46 +1612,53 @@ mod tests {
         let board_id = create_source_board(&board_svc, project_id, "Source", &subject).await;
 
         let _ = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&subject),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Visible A".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create A failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         let _ = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&subject),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Visible B".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create B failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         let list = agg_svc
-            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &subject))
+            .list_aggregated_boards(
+                authed_ctx(&subject),
+                connect_request(&ListAggregatedBoardsRequest::default()),
+            )
             .await
             .expect("list failed")
-            .into_inner();
+            .body;
 
         let names: Vec<&str> = list
             .aggregated_boards
@@ -1631,86 +1684,88 @@ mod tests {
         let board_c = create_source_board(&board_svc, project_id, "C", &subject).await;
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&subject),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Reorder Test".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_a.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
         agg_svc
-            .add_source_board(authed_request_with_object(
-                AddSourceBoardRequest {
+            .add_source_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&AddSourceBoardRequest {
                     aggregated_board_id: agg_id.clone(),
                     board_id: board_b.to_string(),
                     position: 1,
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add B failed");
 
         agg_svc
-            .add_source_board(authed_request_with_object(
-                AddSourceBoardRequest {
+            .add_source_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&AddSourceBoardRequest {
                     aggregated_board_id: agg_id.clone(),
                     board_id: board_c.to_string(),
                     position: 2,
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add C failed");
 
         agg_svc
-            .move_source_board(authed_request_with_object(
-                MoveSourceBoardRequest {
+            .move_source_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&MoveSourceBoardRequest {
                     aggregated_board_id: agg_id.clone(),
                     board_id: board_a.to_string(),
                     to_position: 2,
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("move failed");
 
         agg_svc
-            .remove_source_board(authed_request_with_object(
-                RemoveSourceBoardRequest {
+            .remove_source_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&RemoveSourceBoardRequest {
                     aggregated_board_id: agg_id.clone(),
                     board_id: board_b.to_string(),
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("remove failed");
 
         let stream = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get failed")
-            .into_inner();
+            .body;
         let chunks = collect_aggregate_stream(stream).await;
 
         let source_ids: Vec<String> = chunks
@@ -1741,17 +1796,18 @@ mod tests {
 
         // Find the default column created by BoardService.
         let board_detail = board_svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&subject, &board_id.to_string()),
+                connect_request(&GetBoardRequest {
                     board_id: board_id.to_string(),
-                },
-                &subject,
-                &board_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get board failed")
-            .into_inner()
+            .body
             .detail
+            .into_option()
             .expect("detail missing");
         let column_id = board_detail
             .columns
@@ -1761,50 +1817,51 @@ mod tests {
             .clone();
 
         card_svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &board_id.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: board_id.to_string(),
                     column_id: column_id.clone(),
                     title: "Card One".to_string(),
                     idempotency_key: String::new(),
                     ..Default::default()
-                },
-                &subject,
-                &board_id.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create card failed");
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&subject),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Cards Aggregate".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&subject, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &subject,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get aggregate failed")
-            .into_inner();
+            .body;
         let chunks = collect_aggregate_stream(stream).await;
 
         let cards: Vec<&Card> = chunks
@@ -1837,21 +1894,23 @@ mod tests {
         let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Private Aggregate".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
@@ -1859,10 +1918,13 @@ mod tests {
         // no tuples should see nothing even though the service is called
         // directly (no middleware gating this RPC in tests).
         let list = agg_svc
-            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &other))
+            .list_aggregated_boards(
+                authed_ctx(&other),
+                connect_request(&ListAggregatedBoardsRequest::default()),
+            )
             .await
             .expect("list failed")
-            .into_inner();
+            .body;
 
         assert!(
             list.aggregated_boards.iter().all(|b| b.id != agg_id),
@@ -1884,35 +1946,37 @@ mod tests {
         let stranger = format!("user:test-{}", Id::new());
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Public Aggregate".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Public as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&stranger, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &stranger,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("non-member should view public aggregate")
-            .into_inner();
+            .body;
 
         let chunks = collect_aggregate_stream(stream).await;
         let metadata = chunks
@@ -1936,32 +2000,34 @@ mod tests {
         let stranger = format!("user:test-{}", Id::new());
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Private Aggregate".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let result = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&stranger, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &stranger,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(
@@ -1969,8 +2035,8 @@ mod tests {
             "non-member must not view private aggregate"
         );
         assert_eq!(
-            result.err().unwrap().code(),
-            tonic::Code::PermissionDenied,
+            result.err().unwrap().code,
+            connectrpc::ErrorCode::PermissionDenied,
             "private aggregate must return PermissionDenied"
         );
 
@@ -1987,57 +2053,63 @@ mod tests {
         let non_viewer = format!("user:test-{}", Id::new());
 
         let public_agg = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Public Agg".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Public as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create public aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         let internal_agg = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Internal Agg".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Internal as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Internal.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create internal aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         let private_agg = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Private Agg".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create private aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         // Grant one stranger explicit viewer on the private aggregate.
@@ -2048,10 +2120,13 @@ mod tests {
             .expect("grant viewer failed");
 
         let list = agg_svc
-            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &viewer))
+            .list_aggregated_boards(
+                authed_ctx(&viewer),
+                connect_request(&ListAggregatedBoardsRequest::default()),
+            )
             .await
             .expect("list failed")
-            .into_inner();
+            .body;
 
         let names: Vec<&str> = list
             .aggregated_boards
@@ -2073,10 +2148,13 @@ mod tests {
 
         // A different stranger without a view tuple should see only public/internal.
         let list_after = agg_svc
-            .list_aggregated_boards(authed_request(ListAggregatedBoardsRequest {}, &non_viewer))
+            .list_aggregated_boards(
+                authed_ctx(&non_viewer),
+                connect_request(&ListAggregatedBoardsRequest::default()),
+            )
             .await
             .expect("list failed")
-            .into_inner();
+            .body;
 
         let names_after: Vec<&str> = list_after
             .aggregated_boards
@@ -2109,21 +2187,23 @@ mod tests {
         let owner = format!("user:test-{}", Id::new());
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Visibility Patch".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
@@ -2140,34 +2220,39 @@ mod tests {
             .expect("grant admin failed");
 
         let updated = agg_svc
-            .update_aggregated_board(authed_request_with_object(
-                UpdateAggregatedBoardRequest {
+            .update_aggregated_board(
+                authed_ctx_with_object(&owner, &agg_id),
+                connect_request(&UpdateAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
                     aggregated_board: Some(AggregatedBoard {
                         id: String::new(),
                         name: String::new(),
                         description: String::new(),
                         icon: String::new(),
-                        visibility: BoardVisibility::Public as i32,
-                        created_at: None,
-                        updated_at: None,
-                    }),
+                        visibility: BoardVisibility::Public.into(),
+                        created_at: None.into(),
+                        updated_at: None.into(),
+                        ..Default::default()
+                    })
+                    .into(),
                     update_mask: Some(FieldMask {
                         paths: vec!["visibility".to_string()],
-                    }),
-                },
-                &owner,
-                &agg_id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update visibility failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         assert_eq!(
             updated.visibility,
-            BoardVisibility::Public as i32,
+            BoardVisibility::Public,
             "visibility must be persisted as public"
         );
 
@@ -2190,7 +2275,7 @@ mod tests {
             project_id,
             "Public Source",
             &owner,
-            BoardVisibility::Public as i32,
+            BoardVisibility::Public,
         )
         .await;
         let private_board_id = create_source_board_with_visibility(
@@ -2198,23 +2283,24 @@ mod tests {
             project_id,
             "Private Source",
             &owner,
-            BoardVisibility::Private as i32,
+            BoardVisibility::Private,
         )
         .await;
 
         // Create one card in each source board.
         let public_column_id = board_svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&owner, &public_board_id.to_string()),
+                connect_request(&GetBoardRequest {
                     board_id: public_board_id.to_string(),
-                },
-                &owner,
-                &public_board_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get public board failed")
-            .into_inner()
+            .body
             .detail
+            .into_option()
             .expect("detail missing")
             .columns
             .first()
@@ -2222,17 +2308,18 @@ mod tests {
             .id
             .clone();
         let private_column_id = board_svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&owner, &private_board_id.to_string()),
+                connect_request(&GetBoardRequest {
                     board_id: private_board_id.to_string(),
-                },
-                &owner,
-                &private_board_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get private board failed")
-            .into_inner()
+            .body
             .detail
+            .into_option()
             .expect("detail missing")
             .columns
             .first()
@@ -2241,39 +2328,38 @@ mod tests {
             .clone();
 
         card_svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&owner, &public_board_id.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: public_board_id.to_string(),
                     column_id: public_column_id,
                     title: "Public Card".to_string(),
                     idempotency_key: String::new(),
                     ..Default::default()
-                },
-                &owner,
-                &public_board_id.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create public card failed");
 
         card_svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&owner, &private_board_id.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: private_board_id.to_string(),
                     column_id: private_column_id,
                     title: "Private Card".to_string(),
                     idempotency_key: String::new(),
                     ..Default::default()
-                },
-                &owner,
-                &private_board_id.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create private card failed");
 
         // Make the aggregate public so the stranger can access it.
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Filtered Aggregate".to_string(),
                     description: String::new(),
                     icon: String::new(),
@@ -2282,28 +2368,29 @@ mod tests {
                         private_board_id.to_string(),
                     ],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Public as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregate failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
         let agg_id = created.id;
 
         let stream = agg_svc
-            .get_aggregated_board(authed_request_with_object(
-                GetAggregatedBoardRequest {
+            .get_aggregated_board(
+                authed_ctx_with_object(&stranger, &agg_id),
+                connect_request(&GetAggregatedBoardRequest {
                     aggregated_board_id: agg_id.clone(),
-                },
-                &stranger,
-                &agg_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("stranger should view public aggregate")
-            .into_inner();
+            .body;
         let chunks = collect_aggregate_stream(stream).await;
 
         let source_ids: Vec<String> = chunks
@@ -2342,31 +2429,33 @@ mod tests {
 
         let owner = format!("user:test-{}", Id::new());
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "To Delete".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         agg_svc
-            .delete_aggregated_board(authed_request_with_object(
-                DeleteAggregatedBoardRequest {
+            .delete_aggregated_board(
+                authed_ctx_with_object(&owner, &created.id),
+                connect_request(&DeleteAggregatedBoardRequest {
                     aggregated_board_id: created.id.clone(),
-                },
-                &owner,
-                &created.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("delete failed");
 
@@ -2390,17 +2479,17 @@ mod tests {
         let owner = format!("user:test-{}", Id::new());
         let missing_id = Id::new().to_string();
         let result = agg_svc
-            .delete_aggregated_board(authed_request_with_object(
-                DeleteAggregatedBoardRequest {
+            .delete_aggregated_board(
+                authed_ctx_with_object(&owner, &missing_id),
+                connect_request(&DeleteAggregatedBoardRequest {
                     aggregated_board_id: missing_id.clone(),
-                },
-                &owner,
-                &missing_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+        assert_eq!(result.unwrap_err().code, connectrpc::ErrorCode::NotFound);
     }
 
     #[tokio::test]
@@ -2410,21 +2499,23 @@ mod tests {
 
         let owner = format!("user:test-{}", Id::new());
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Original".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Private as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         // Grant editor so the update request passes middleware.
@@ -2435,29 +2526,34 @@ mod tests {
             .expect("grant editor failed");
 
         let updated = agg_svc
-            .update_aggregated_board(authed_request_with_object(
-                UpdateAggregatedBoardRequest {
+            .update_aggregated_board(
+                authed_ctx_with_object(&owner, &created.id),
+                connect_request(&UpdateAggregatedBoardRequest {
                     aggregated_board_id: created.id.clone(),
                     aggregated_board: Some(AggregatedBoard {
                         id: String::new(),
                         name: "Renamed".to_string(),
                         description: "New desc".to_string(),
                         icon: String::new(),
-                        visibility: BoardVisibility::Private as i32,
-                        created_at: None,
-                        updated_at: None,
-                    }),
+                        visibility: BoardVisibility::Private.into(),
+                        created_at: None.into(),
+                        updated_at: None.into(),
+                        ..Default::default()
+                    })
+                    .into(),
                     update_mask: Some(FieldMask {
                         paths: vec!["name".to_string(), "description".to_string()],
-                    }),
-                },
-                &owner,
-                &created.id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update failed")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         assert_eq!(updated.name, "Renamed");
@@ -2477,21 +2573,23 @@ mod tests {
         let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
 
         let created = agg_svc
-            .create_aggregated_board(authed_request(
-                CreateAggregatedBoardRequest {
+            .create_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&CreateAggregatedBoardRequest {
                     name: "Agg".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     source_board_ids: vec![board_id.to_string()],
                     idempotency_key: String::new(),
-                    visibility: BoardVisibility::Public as i32,
-                },
-                &owner,
-            ))
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create aggregated board")
-            .into_inner()
+            .body
             .aggregated_board
+            .into_option()
             .expect("aggregated_board missing");
 
         // Grant viewer so the subscribe request passes the middleware check.
@@ -2501,21 +2599,18 @@ mod tests {
             .await
             .expect("grant viewer failed");
 
-        let mut req = Request::new(SubscribeAggregatedBoardRequest {
-            aggregated_board_id: created.id.clone(),
-            since_seq: 0,
-        });
-        req.extensions_mut()
-            .insert(sunbeam_g2v::middleware::auth::AuthContext::authenticated(
-                crate::test_support::test_tenant_id(),
-                &owner,
-            ));
-
         let mut stream = agg_svc
-            .subscribe_aggregated_board(req)
+            .subscribe_aggregated_board(
+                authed_ctx(&owner),
+                connect_request(&SubscribeAggregatedBoardRequest {
+                    aggregated_board_id: created.id.clone(),
+                    since_seq: 0,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("subscribe should succeed")
-            .into_inner();
+            .body;
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -2525,11 +2620,67 @@ mod tests {
 
         assert!(
             matches!(
-                first.envelope.expect("envelope missing").payload,
+                first
+                    .envelope
+                    .into_option()
+                    .expect("envelope missing")
+                    .payload,
                 Some(EventPayload::Cutover(_))
             ),
             "first payload should be a cutover"
         );
+
+        // The stream must stay open for the live tail: publish an event to the
+        // source board and expect it on the aggregated stream.
+        {
+            use crate::realtime::jetstream_bootstrap::board_subject;
+            use buffa::Message;
+
+            crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+                &infra.nats,
+                &crate::realtime::jetstream_bootstrap::default_config(),
+            )
+            .await
+            .expect("ensure kanban stream");
+
+            let live_event_id = format!("live-{}", Id::new());
+            let envelope = BoardEventEnvelope {
+                board_id: board_id.to_string(),
+                event_id: live_event_id.clone(),
+                nats_seq: 1,
+                board_revision: 1,
+                emitted_at: None.into(),
+                emitter_pod_id: "test".to_string(),
+                actor_subject: "test".to_string(),
+                payload: Some(EventPayload::Heartbeat(Box::new(Heartbeat {
+                    server_time_ms: 0,
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            };
+            let buf = bytes::Bytes::from(envelope.encode_to_vec());
+            infra
+                .nats
+                .publish_jetstream(&board_subject(&board_id.to_string()), buf)
+                .await
+                .expect("publish failed")
+                .await
+                .expect("ack failed");
+
+            let second = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("stream closed after cutover — no live tail")
+                .expect("stream ended after cutover")
+                .expect("live event errored");
+            assert_eq!(
+                second
+                    .envelope
+                    .into_option()
+                    .expect("envelope missing")
+                    .event_id,
+                live_event_id
+            );
+        }
 
         cleanup_aggregated_board(&infra.pool, created.id.parse::<Id>().unwrap()).await;
         cleanup_project(&infra.pool, project_id).await;
@@ -2581,7 +2732,11 @@ mod tests {
             .expect("first item errored");
         assert!(
             matches!(
-                first.envelope.expect("envelope missing").payload,
+                first
+                    .envelope
+                    .into_option()
+                    .expect("envelope missing")
+                    .payload,
                 Some(EventPayload::Cutover(_))
             ),
             "first item should be cutover"
@@ -2594,12 +2749,216 @@ mod tests {
             .expect("heartbeat item errored");
         assert!(
             matches!(
-                second.envelope.expect("envelope missing").payload,
+                second
+                    .envelope
+                    .into_option()
+                    .expect("envelope missing")
+                    .payload,
                 Some(EventPayload::Heartbeat(_))
             ),
             "second item should be a heartbeat"
         );
 
         cleanup_project(&infra.pool, project_id).await;
+    }
+
+    /// Regression: the aggregated live-tail must keep forwarding source-board
+    /// events after the cutover envelope instead of closing the stream.
+    #[tokio::test]
+    async fn subscribe_aggregated_board_stays_open_and_forwards_live_events() {
+        use crate::realtime::jetstream_bootstrap::board_subject;
+        use buffa::Message;
+
+        let infra = containers::setup().await;
+        let board_svc = make_board_service(&infra).await;
+
+        let owner = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&infra.pool, &owner).await;
+        let board_id = create_source_board(&board_svc, project_id, "Source", &owner).await;
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &infra.nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("ensure kanban stream");
+
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&infra.nats),
+            "pod-test-agg-live",
+        ));
+
+        let mut stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
+            registry,
+            permission: Arc::clone(&infra.permission),
+            auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(
+                crate::test_support::test_tenant_id(),
+                &owner,
+            ),
+            aggregated_board_id: Id::new().to_string(),
+            source_board_ids: vec![board_id],
+            is_private: false,
+            heartbeat_interval: Duration::from_millis(15_000),
+            permission_recheck_interval: Duration::from_millis(30_000),
+            cutover_seen_capacity: 16,
+        })
+        .await
+        .expect("build stream should succeed");
+
+        // Consume the cutover envelope.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for cutover");
+
+        // Publish a live event to the source board.
+        let live_event_id = format!("live-{}", Id::new());
+        let envelope = BoardEventEnvelope {
+            board_id: board_id.to_string(),
+            event_id: live_event_id.clone(),
+            nats_seq: 1,
+            board_revision: 1,
+            emitted_at: None.into(),
+            emitter_pod_id: "test".to_string(),
+            actor_subject: "test".to_string(),
+            payload: Some(EventPayload::Heartbeat(Box::new(Heartbeat {
+                server_time_ms: 0,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        let buf = bytes::Bytes::from(envelope.encode_to_vec());
+        infra
+            .nats
+            .publish_jetstream(&board_subject(&board_id.to_string()), buf)
+            .await
+            .expect("publish failed")
+            .await
+            .expect("ack failed");
+
+        // The live event must arrive on the aggregated stream.
+        let received = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for live event — stream closed after cutover")
+            .expect("stream ended after cutover")
+            .expect("stream errored after cutover");
+        assert_eq!(
+            received
+                .envelope
+                .into_option()
+                .expect("envelope missing")
+                .event_id,
+            live_event_id
+        );
+
+        cleanup_project(&infra.pool, project_id).await;
+    }
+
+    /// A private aggregate with a valid view grant must survive the periodic
+    /// mid-stream permission rechecks and keep live-tailing.
+    #[tokio::test]
+    async fn subscribe_aggregated_board_private_survives_permission_rechecks() {
+        use crate::realtime::jetstream_bootstrap::board_subject;
+        use buffa::Message;
+
+        let infra = containers::setup().await;
+        let owner = format!("user:test-{}", Id::new());
+        let aggregated_board_id = Id::new();
+
+        infra
+            .permission
+            .grant_with_retry(
+                PERMISSION_TYPE,
+                &aggregated_board_id.to_string(),
+                "viewer",
+                &owner,
+            )
+            .await
+            .expect("grant viewer failed");
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &infra.nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("ensure kanban stream");
+
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&infra.nats),
+            "pod-test-agg-priv",
+        ));
+
+        let source_board_id = Id::new();
+        let mut stream = build_subscribe_aggregated_board_stream(SubscribeAggregatedBoardArgs {
+            registry,
+            permission: Arc::clone(&infra.permission),
+            auth: sunbeam_g2v::middleware::auth::AuthContext::authenticated(
+                crate::test_support::test_tenant_id(),
+                &owner,
+            ),
+            aggregated_board_id: aggregated_board_id.to_string(),
+            source_board_ids: vec![source_board_id],
+            is_private: true,
+            heartbeat_interval: Duration::from_millis(15_000),
+            permission_recheck_interval: Duration::from_millis(100),
+            cutover_seen_capacity: 16,
+        })
+        .await
+        .expect("build stream should succeed");
+
+        // Consume the cutover envelope, then wait past several recheck ticks.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for cutover");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // Publish a live event to the source board; the stream must still be
+        // open to deliver it.
+        let live_event_id = format!("live-{}", Id::new());
+        let envelope = BoardEventEnvelope {
+            board_id: source_board_id.to_string(),
+            event_id: live_event_id.clone(),
+            nats_seq: 1,
+            board_revision: 1,
+            emitted_at: None.into(),
+            emitter_pod_id: "test".to_string(),
+            actor_subject: "test".to_string(),
+            payload: Some(EventPayload::Heartbeat(Box::new(Heartbeat {
+                server_time_ms: 0,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        let buf = bytes::Bytes::from(envelope.encode_to_vec());
+        infra
+            .nats
+            .publish_jetstream(&board_subject(&source_board_id.to_string()), buf)
+            .await
+            .expect("publish failed")
+            .await
+            .expect("ack failed");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream closed during permission rechecks")
+            .expect("stream ended during permission rechecks")
+            .expect("stream errored during permission rechecks");
+        assert_eq!(
+            received
+                .envelope
+                .into_option()
+                .expect("envelope missing")
+                .event_id,
+            live_event_id
+        );
+
+        let _ = infra
+            .permission
+            .delete_relation_tuples(
+                PERMISSION_TYPE,
+                None,
+                Some("viewer".to_string()),
+                Some(owner.clone()),
+            )
+            .await;
     }
 }

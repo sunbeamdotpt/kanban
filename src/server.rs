@@ -19,7 +19,6 @@ use axum::{
 use clap::Parser;
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
-use tonic::service::Routes as TonicRoutes;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -32,17 +31,14 @@ use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
 use crate::auth::session_client::SsoGatewaySessionClient;
 
 use crate::auth::permission_dispatch::{DispatchState, dispatch};
+use crate::cpb::sunbeam::kanban::v1::{
+    AggregatedBoardServiceExt as _, AttachmentServiceExt as _, BoardServiceExt as _,
+    CardServiceExt as _, GithubLinkServiceExt as _, ProjectServiceExt as _,
+    PublicBoardServiceExt as _, SearchServiceExt as _, TemplatesServiceExt as _,
+};
 use crate::id::Id;
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
 use crate::integrations::s3::{S3Client, S3Config};
-use crate::pb::{
-    aggregated_board_service_server::AggregatedBoardServiceServer,
-    attachment_service_server::AttachmentServiceServer, board_service_server::BoardServiceServer,
-    card_service_server::CardServiceServer, github_link_service_server::GithubLinkServiceServer,
-    project_service_server::ProjectServiceServer,
-    public_board_service_server::PublicBoardServiceServer,
-    search_service_server::SearchServiceServer, templates_service_server::TemplatesServiceServer,
-};
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
@@ -50,6 +46,7 @@ use crate::services::{
     projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl, search::SearchServiceImpl,
     templates::TemplatesServiceImpl,
 };
+use sunbeam_g2v::router::ServiceRouter;
 
 // ── JetStream stream name & config ──────────────────────────────────────────
 //
@@ -670,62 +667,71 @@ pub async fn run_with_config(
         config.opensearch_url
     );
 
-    // ── Build tonic gRPC router ─────────────────────────────────────────────
-    let grpc_axum = TonicRoutes::new(AttachmentServiceServer::new(AttachmentServiceImpl {
+    // ── Build Connect-RPC router (sunbeam-g2v serving stack) ─────────────────
+    let connect_router = connectrpc::Router::new();
+    let connect_router = Arc::new(AttachmentServiceImpl {
         pool: pg_pool.clone(),
         s3: Arc::clone(&s3_client),
         upload_expires_secs: config.upload_expires_secs,
         download_expires_secs: config.download_expires_secs,
-    }))
-    .add_service(BoardServiceServer::new(BoardServiceImpl {
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(BoardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
         registry: Arc::clone(&board_registry),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
         permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
         cutover_seen_capacity: config.cutover_seen_capacity,
-    }))
-    .add_service(CardServiceServer::new(CardServiceImpl {
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(CardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
-    }))
-    .add_service(GithubLinkServiceServer::new(GitHubServiceImpl))
-    .add_service(AggregatedBoardServiceServer::new(
-        AggregatedBoardServiceImpl {
-            pool: pg_pool.clone(),
-            permission: Arc::clone(&permission),
-            registry: Arc::clone(&board_registry),
-            heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-            permission_recheck_interval: Duration::from_millis(
-                config.permission_recheck_interval_ms,
-            ),
-            cutover_seen_capacity: config.cutover_seen_capacity,
-        },
-    ))
-    .add_service(ProjectServiceServer::new(ProjectServiceImpl {
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(GitHubServiceImpl).register(connect_router);
+    let connect_router = Arc::new(AggregatedBoardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
         registry: Arc::clone(&board_registry),
-    }))
-    .add_service(SearchServiceServer::new(SearchServiceImpl {
+        heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+        permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
+        cutover_seen_capacity: config.cutover_seen_capacity,
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(ProjectServiceImpl {
+        pool: pg_pool.clone(),
+        permission: Arc::clone(&permission),
+        registry: Arc::clone(&board_registry),
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(SearchServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
         opensearch: Arc::clone(&opensearch_client),
         index_name: Some(config.opensearch_index_name.clone()),
-    }))
-    .add_service(TemplatesServiceServer::new(TemplatesServiceImpl {
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(TemplatesServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
-    }))
-    .into_axum_router();
+    })
+    .register(connect_router);
+    let grpc_axum = ServiceRouter::from_router(connect_router)
+        .into_inner()
+        .into_axum_router();
 
     // Public, unauthenticated RPCs (no introspection / permission middleware).
-    // We route each method directly to the tonic service so the resulting
-    // axum Router has no fallback; this lets us merge it with the main gRPC
-    // router (which does have a fallback) without a runtime panic.
-    let public_svc = PublicBoardServiceServer::new(PublicBoardServiceImpl {
+    // Registered on their own router and mounted on explicit paths so the
+    // resulting axum Router has no fallback; this lets us merge it with the
+    // main RPC router (which does have a fallback) without a runtime panic.
+    let public_router = connectrpc::Router::new();
+    let public_router = Arc::new(PublicBoardServiceImpl {
         pool: pg_pool.clone(),
-    });
+    })
+    .register(public_router);
+    let public_svc = connectrpc::ConnectRpcService::new(public_router);
     let public_axum = Router::new()
         .route_service(
             "/sunbeam.kanban.v1.PublicBoardService/GetPublicBoard",
@@ -747,7 +753,7 @@ pub async fn run_with_config(
     //   prometheus placeholder, then tracing.
 
     let dispatch_state = Arc::new(DispatchState {
-        permission_base_url: config.sso_gateway_url.clone(),
+        permission: Arc::clone(&permission),
     });
 
     let auth_state = AuthMiddlewareState::new(Arc::new(

@@ -13,10 +13,10 @@
 
 pub mod auth;
 pub mod config;
+pub mod cpb;
 pub mod iam_proto;
 pub mod id;
 pub mod integrations;
-pub mod pb;
 pub mod realtime;
 pub mod server;
 pub mod services;
@@ -29,8 +29,8 @@ pub(crate) mod test_support;
 mod codegen_smoke {
     #[test]
     fn types_exist() {
-        let _ = std::mem::size_of::<crate::pb::Card>();
-        let _ = std::mem::size_of::<crate::pb::Project>();
-        let _ = std::mem::size_of::<crate::pb::BoardEventEnvelope>();
+        let _ = std::mem::size_of::<crate::cpb::sunbeam::kanban::v1::Card>();
+        let _ = std::mem::size_of::<crate::cpb::sunbeam::kanban::v1::Project>();
+        let _ = std::mem::size_of::<crate::cpb::sunbeam::kanban::v1::BoardEventEnvelope>();
     }
 }

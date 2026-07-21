@@ -17,7 +17,7 @@ labels:
 
 ```
 Frontend (React/TS)
-  │ Connect-Web (h2 or SSE) + Bearer OAuth2 token
+  │ Connect-RPC / gRPC-Web (h2) + Bearer OAuth2 token
   ▼
 kanban-server (Rust Axum) :8080
   │
@@ -55,7 +55,7 @@ kanban-server (Rust Axum) :8080
 | `src/realtime/cutover.rs` | Resume-token deduplication for subscribers. |
 | `src/integrations/opensearch.rs` | OpenSearch client and index management. |
 | `src/integrations/s3.rs` | Presigned URL client. |
-| `src/services/*.rs` | Tonic service handlers. |
+| `src/services/*.rs` | Connect-RPC service handlers. |
 
 ## Key invariants
 

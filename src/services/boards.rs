@@ -13,19 +13,19 @@
 //! heartbeats, and revalidates the token and permissions on every
 //! yield.
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::id::Id;
 use async_stream::stream;
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use connectrpc::{
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
+};
 use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::broadcast;
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
@@ -33,14 +33,13 @@ use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::auth::permission_retry::PermissionRetryExt;
-use crate::pb::board_service_server::BoardService;
-use crate::pb::{
-    AddColumnRequest, AddColumnResponse, Board, BoardDetail, BoardEventEnvelope, Column,
-    CreateBoardRequest, CreateBoardResponse, Cutover, DeleteBoardRequest, DeleteBoardResponse,
-    GetBoardRequest, GetBoardResponse, Heartbeat, ListBoardsRequest, ListBoardsResponse,
-    MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest, RemoveColumnResponse,
-    SubscribeBoardRequest, SubscribeBoardResponse, UpdateBoardRequest, UpdateBoardResponse,
-    UpdateColumnRequest, UpdateColumnResponse, board_event_envelope::Payload,
+use crate::cpb::sunbeam::kanban::v1::{
+    AddColumnRequest, AddColumnResponse, Board, BoardDetail, BoardEventEnvelope, BoardService,
+    Column, CreateBoardRequest, CreateBoardResponse, Cutover, DeleteBoardRequest,
+    DeleteBoardResponse, GetBoardRequest, GetBoardResponse, Heartbeat, ListBoardsRequest,
+    ListBoardsResponse, MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest,
+    RemoveColumnResponse, SubscribeBoardRequest, SubscribeBoardResponse, UpdateBoardRequest,
+    UpdateBoardResponse, UpdateColumnRequest, UpdateColumnResponse, board_event_envelope::Payload,
 };
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
@@ -61,56 +60,57 @@ pub struct BoardServiceImpl {
     pub cutover_seen_capacity: usize,
 }
 
-// ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
+// ── Timestamp helpers (chrono ↔ buffa_types) ─────────────────────────────────
 
 fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
     }
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn checked_object_id(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<CheckedObjectId>()
         .map(|c| c.0.clone())
-        .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
+        .ok_or_else(|| ConnectError::internal("missing CheckedObjectId extension"))
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 /// Extract the caller's tenant from the auth context and derive a permission
 /// client scoped to that tenant's store (see `TENANT_HEADER`).
-async fn tenant_client_for<T>(
+async fn tenant_client_for(
     permission: &PermissionClient,
-    req: &Request<T>,
-) -> Result<PermissionClient, Status> {
-    let tenant = req
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = ctx
         .extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
     permission
         .tenant_client(&tenant)
         .await
@@ -139,11 +139,12 @@ pub(crate) fn board_from_row(
         name,
         description: description.unwrap_or_default(),
         icon: icon.unwrap_or_default(),
-        visibility: db_to_proto(&visibility),
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        visibility: db_to_proto(&visibility).into(),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
         columns_count,
         cards_count,
+        ..Default::default()
     }
 }
 
@@ -164,8 +165,9 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
         accent: accent.unwrap_or_default(),
         wip_limit: wip_limit.unwrap_or(0),
         position,
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        ..Default::default()
     }
 }
 
@@ -219,7 +221,7 @@ pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Id, tenant_id: Op
         .unwrap_or(0)
 }
 
-async fn fetch_board_columns(pool: &PgPool, board_id: Id) -> Result<Vec<Column>, Status> {
+async fn fetch_board_columns(pool: &PgPool, board_id: Id) -> Result<Vec<Column>, ConnectError> {
     let rows = sqlx::query(
         "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
          FROM columns WHERE board_id = $1 ORDER BY position ASC",
@@ -243,8 +245,7 @@ fn slug_from_name(name: &str) -> String {
 
 // ── Type alias ───────────────────────────────────────────────────────────────
 
-type SubscribeBoardStream =
-    Pin<Box<dyn Stream<Item = Result<SubscribeBoardResponse, Status>> + Send + 'static>>;
+type SubscribeBoardStream = ServiceStream<SubscribeBoardResponse>;
 
 // ── Stream helpers ────────────────────────────────────────────────────────────
 
@@ -255,12 +256,14 @@ fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
         event_id: String::new(),
         nats_seq: 0,
         board_revision: 0,
-        emitted_at: None,
+        emitted_at: None.into(),
         emitter_pod_id: String::new(),
         actor_subject: "system".to_string(),
-        payload: Some(Payload::Cutover(Cutover {
+        payload: Some(Payload::Cutover(Box::new(Cutover {
             last_replay_nats_seq,
-        })),
+            ..Default::default()
+        }))),
+        ..Default::default()
     }
 }
 
@@ -276,10 +279,14 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
         event_id: String::new(),
         nats_seq: 0,
         board_revision: 0,
-        emitted_at: None,
+        emitted_at: None.into(),
         emitter_pod_id: String::new(),
         actor_subject: "system".to_string(),
-        payload: Some(Payload::Heartbeat(Heartbeat { server_time_ms })),
+        payload: Some(Payload::Heartbeat(Box::new(Heartbeat {
+            server_time_ms,
+            ..Default::default()
+        }))),
+        ..Default::default()
     }
 }
 
@@ -290,7 +297,7 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
 /// Token revocation is handled by the sso-gateway during the introspection
 /// call that creates the `AuthContext`, so no additional revocation check is
 /// needed here.
-fn revalidate_token(_auth: &AuthContext) -> Result<bool, Status> {
+fn revalidate_token(_auth: &AuthContext) -> Result<bool, ConnectError> {
     Ok(true)
 }
 
@@ -302,14 +309,14 @@ async fn revalidate_permission(
     permission: &PermissionClient,
     auth: &AuthContext,
     board_id: &str,
-) -> Result<bool, Status> {
+) -> Result<bool, ConnectError> {
     let subject = auth.subject.as_deref().unwrap_or("");
     permission
         .check_permission_with_retry("KanbanBoard", board_id, "view", subject)
         .await
         .map_err(|e| {
             warn!(board_id, subject, error = %e, "stream: permission recheck failed");
-            Status::internal("authorization check failed")
+            ConnectError::internal("authorization check failed")
         })
 }
 
@@ -337,7 +344,7 @@ pub struct SubscribeBoardArgs {
 /// `CardCreated` events with `nats_seq=0` before the `Cutover` envelope.
 pub async fn build_subscribe_board_stream(
     args: SubscribeBoardArgs,
-) -> Result<SubscribeBoardStream, Status> {
+) -> Result<SubscribeBoardStream, ConnectError> {
     let SubscribeBoardArgs {
         registry,
         permission,
@@ -353,7 +360,8 @@ pub async fn build_subscribe_board_stream(
         // TODO(4c.5): snapshot replay — emit synthetic CardCreated/ColumnAdded
         // events before this Cutover, each with nats_seq=0.
         yield Ok(SubscribeBoardResponse {
-            envelope: Some(cutover_envelope(0)),
+            envelope: Some(cutover_envelope(0)).into(),
+            ..Default::default()
         });
 
         // ── Step 2: subscribe to live events ─────────────────────────────────
@@ -361,7 +369,7 @@ pub async fn build_subscribe_board_stream(
             Ok(h) => h,
             Err(e) => {
                 warn!(board_id = %board_id, error = %e, "SubscribeBoard: registry subscribe failed");
-                yield Err(Status::internal(format!("subscribe: {e}")));
+                yield Err(ConnectError::internal(format!("subscribe: {e}")));
                 return;
             }
         };
@@ -381,7 +389,7 @@ pub async fn build_subscribe_board_stream(
             match revalidate_token(&auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    yield Err(Status::unauthenticated("token expired"));
+                    yield Err(ConnectError::unauthenticated("token expired"));
                     break;
                 }
                 Err(status) => {
@@ -398,7 +406,7 @@ pub async fn build_subscribe_board_stream(
                 match revalidate_permission(&permission, &auth, &board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        yield Err(Status::permission_denied("permission revoked mid-stream"));
+                        yield Err(ConnectError::permission_denied("permission revoked mid-stream"));
                         break;
                     }
                     Err(status) => {
@@ -415,12 +423,15 @@ pub async fn build_subscribe_board_stream(
                     match msg {
                         Ok(envelope) => {
                             match tracker.observe_live(&envelope.event_id, envelope.nats_seq) {
-                                Outcome::Emit => yield Ok(SubscribeBoardResponse { envelope: Some(envelope) }),
+                                Outcome::Emit => yield Ok(SubscribeBoardResponse {
+                                    envelope: Some(envelope).into(),
+                                    ..Default::default()
+                                }),
                                 Outcome::Drop | Outcome::OutOfOrder => { /* skip */ }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            yield Err(Status::resource_exhausted(
+                            yield Err(ConnectError::resource_exhausted(
                                 "stream lagged; reconnect with last seq"
                             ));
                             break;
@@ -430,7 +441,8 @@ pub async fn build_subscribe_board_stream(
                 }
                 _ = heartbeat.tick() => {
                     yield Ok(SubscribeBoardResponse {
-                        envelope: Some(heartbeat_envelope()),
+                        envelope: Some(heartbeat_envelope()).into(),
+                        ..Default::default()
                     });
                 }
             }
@@ -442,7 +454,7 @@ pub async fn build_subscribe_board_stream(
 
 // ── impl BoardService ────────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl BoardService for BoardServiceImpl {
     // ── ListBoards ────────────────────────────────────────────────────────────
     //
@@ -452,16 +464,17 @@ impl BoardService for BoardServiceImpl {
 
     async fn list_boards(
         &self,
-        request: Request<ListBoardsRequest>,
-    ) -> Result<Response<ListBoardsResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListBoardsRequest>,
+    ) -> ServiceResult<ListBoardsResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let project_id = req
             .project_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
@@ -501,7 +514,10 @@ impl BoardService for BoardServiceImpl {
             boards.push(board_from_row(row, columns_count, cards_count));
         }
 
-        Ok(Response::new(ListBoardsResponse { boards }))
+        Ok(Response::new(ListBoardsResponse {
+            boards,
+            ..Default::default()
+        }))
     }
 
     // ── GetBoard ──────────────────────────────────────────────────────────────
@@ -511,16 +527,17 @@ impl BoardService for BoardServiceImpl {
 
     async fn get_board(
         &self,
-        request: Request<GetBoardRequest>,
-    ) -> Result<Response<GetBoardResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetBoardRequest>,
+    ) -> ServiceResult<GetBoardResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let board_id = req
             .board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
@@ -531,7 +548,7 @@ impl BoardService for BoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board", e))?
-        .ok_or_else(|| Status::not_found("board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("board not found"))?;
 
         let visibility: String = row.get("visibility");
         if !is_public_or_internal(&visibility) {
@@ -546,7 +563,7 @@ impl BoardService for BoardServiceImpl {
                 .await
                 .map_err(|e| internal("failed to check board view permission", e))?;
             if !allowed {
-                return Err(Status::permission_denied(
+                return Err(ConnectError::permission_denied(
                     "you do not have permission to view this board",
                 ));
             }
@@ -558,9 +575,12 @@ impl BoardService for BoardServiceImpl {
 
         Ok(Response::new(GetBoardResponse {
             detail: Some(BoardDetail {
-                board: Some(board),
+                board: Some(board).into(),
                 columns,
-            }),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
         }))
     }
 
@@ -572,16 +592,17 @@ impl BoardService for BoardServiceImpl {
 
     async fn create_board(
         &self,
-        request: Request<CreateBoardRequest>,
-    ) -> Result<Response<CreateBoardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateBoardRequest>,
+    ) -> ServiceResult<CreateBoardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let project_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         // Idempotency check.
         if !req.idempotency_key.is_empty() {
@@ -612,19 +633,20 @@ impl BoardService for BoardServiceImpl {
                     let cards_count =
                         fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
                     return Ok(Response::new(CreateBoardResponse {
-                        board: Some(board_from_row(&row, columns_count, cards_count)),
+                        board: Some(board_from_row(&row, columns_count, cards_count)).into(),
+                        ..Default::default()
                     }));
                 }
             }
         }
 
         if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+            return Err(ConnectError::invalid_argument("name is required"));
         }
 
         let board_id = Id::new();
         let slug = slug_from_name(&req.name);
-        let visibility = proto_to_db(req.visibility);
+        let visibility = proto_to_db(req.visibility.to_i32());
 
         // INSERT board.
         let row = sqlx::query(
@@ -652,7 +674,7 @@ impl BoardService for BoardServiceImpl {
             if let sqlx::Error::Database(ref db) = e
                 && db.constraint() == Some("boards_project_id_slug_key")
             {
-                return Status::already_exists("board with that name already exists in project");
+                return ConnectError::already_exists("board with that name already exists in project");
             }
             internal("failed to insert board", e)
         })?;
@@ -691,7 +713,8 @@ impl BoardService for BoardServiceImpl {
             }
 
         Ok(Response::new(CreateBoardResponse {
-            board: Some(board_from_row(&row, 0, 0)),
+            board: Some(board_from_row(&row, 0, 0)).into(),
+            ..Default::default()
         }))
     }
 
@@ -702,22 +725,23 @@ impl BoardService for BoardServiceImpl {
 
     async fn update_board(
         &self,
-        request: Request<UpdateBoardRequest>,
-    ) -> Result<Response<UpdateBoardResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateBoardRequest>,
+    ) -> ServiceResult<UpdateBoardResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let req = request.into_inner();
-        let patch = req.board.unwrap_or_default();
+        let req = request.to_owned_message();
+        let patch = req.board.into_option().unwrap_or_default();
 
         let update_paths: std::collections::HashSet<&str> = req
             .update_mask
-            .as_ref()
+            .as_option()
             .map(|m| m.paths.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
         let visibility_change = update_paths.contains("visibility");
@@ -734,13 +758,13 @@ impl BoardService for BoardServiceImpl {
                 .await
                 .map_err(|e| internal("failed to check board manage permission", e))?;
             if !allowed {
-                return Err(Status::permission_denied(
+                return Err(ConnectError::permission_denied(
                     "you do not have permission to change board visibility",
                 ));
             }
         }
 
-        let new_visibility = proto_to_db(patch.visibility);
+        let new_visibility = proto_to_db(patch.visibility.to_i32());
 
         let row = sqlx::query(
             r#"
@@ -764,12 +788,13 @@ impl BoardService for BoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update board", e))?
-        .ok_or_else(|| Status::not_found("board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("board not found"))?;
 
         let columns_count = fetch_columns_count(&self.pool, board_id, Some(&tenant_id)).await;
         let cards_count = fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
         Ok(Response::new(UpdateBoardResponse {
-            board: Some(board_from_row(&row, columns_count, cards_count)),
+            board: Some(board_from_row(&row, columns_count, cards_count)).into(),
+            ..Default::default()
         }))
     }
 
@@ -781,13 +806,14 @@ impl BoardService for BoardServiceImpl {
 
     async fn delete_board(
         &self,
-        request: Request<DeleteBoardRequest>,
-    ) -> Result<Response<DeleteBoardResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, DeleteBoardRequest>,
+    ) -> ServiceResult<DeleteBoardResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let result = sqlx::query("DELETE FROM boards WHERE tenant_id = $1 AND id = $2")
             .bind(&tenant_id)
@@ -797,7 +823,7 @@ impl BoardService for BoardServiceImpl {
             .map_err(|e| internal("failed to delete board", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("board not found"));
+            return Err(ConnectError::not_found("board not found"));
         }
 
         // Best-effort permission parent tuple cleanup.
@@ -806,7 +832,7 @@ impl BoardService for BoardServiceImpl {
             "delete_board: permission parent tuple cleanup is best-effort; reconciler (Stage 7a) will catch any drift"
         );
 
-        Ok(Response::new(DeleteBoardResponse {}))
+        Ok(Response::new(DeleteBoardResponse::default()))
     }
 
     // ── AddColumn ─────────────────────────────────────────────────────────────
@@ -817,18 +843,19 @@ impl BoardService for BoardServiceImpl {
 
     async fn add_column(
         &self,
-        request: Request<AddColumnRequest>,
-    ) -> Result<Response<AddColumnResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddColumnRequest>,
+    ) -> ServiceResult<AddColumnResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.title.is_empty() {
-            return Err(Status::invalid_argument("title is required"));
+            return Err(ConnectError::invalid_argument("title is required"));
         }
 
         // Idempotency check.
@@ -856,7 +883,8 @@ impl BoardService for BoardServiceImpl {
 
                 if let Some(row) = row {
                     return Ok(Response::new(AddColumnResponse {
-                        column: Some(column_from_row(&row)),
+                        column: Some(column_from_row(&row)).into(),
+                        ..Default::default()
                     }));
                 }
             }
@@ -942,7 +970,8 @@ impl BoardService for BoardServiceImpl {
             }
 
         Ok(Response::new(AddColumnResponse {
-            column: Some(column_from_row(&row)),
+            column: Some(column_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
@@ -953,20 +982,21 @@ impl BoardService for BoardServiceImpl {
 
     async fn update_column(
         &self,
-        request: Request<UpdateColumnRequest>,
-    ) -> Result<Response<UpdateColumnResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateColumnRequest>,
+    ) -> ServiceResult<UpdateColumnResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let col_id = req
             .column_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid column_id"))?;
-        let patch = req.column.unwrap_or_default();
+            .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
+        let patch = req.column.into_option().unwrap_or_default();
 
         let row = sqlx::query(
             r#"
@@ -988,12 +1018,13 @@ impl BoardService for BoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update column", e))?
-        .ok_or_else(|| Status::not_found("column not found on this board"))?;
+        .ok_or_else(|| ConnectError::not_found("column not found on this board"))?;
 
         // Stage 4: emit BoardEventEnvelope::ColumnUpdated over NATS subject kanban.board.<board_id>.events
 
         Ok(Response::new(UpdateColumnResponse {
-            column: Some(column_from_row(&row)),
+            column: Some(column_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
@@ -1012,19 +1043,20 @@ impl BoardService for BoardServiceImpl {
 
     async fn remove_column(
         &self,
-        request: Request<RemoveColumnRequest>,
-    ) -> Result<Response<RemoveColumnResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RemoveColumnRequest>,
+    ) -> ServiceResult<RemoveColumnResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let col_id = req
             .column_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid column_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
 
         // Verify the column belongs to this board.
         let exists: bool = sqlx::query(
@@ -1039,7 +1071,7 @@ impl BoardService for BoardServiceImpl {
         .map(|r| r.get::<bool, _>(0))?;
 
         if !exists {
-            return Err(Status::not_found("column not found on this board"));
+            return Err(ConnectError::not_found("column not found on this board"));
         }
 
         // Delete the column. Cards cascade-delete via FK (0006_cards.sql).
@@ -1053,7 +1085,7 @@ impl BoardService for BoardServiceImpl {
                 .map_err(|e| internal("failed to delete column", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("column not found"));
+            return Err(ConnectError::not_found("column not found"));
         }
 
         // Gap-fill remaining column positions (renumber 0, 1, 2, ... by current order).
@@ -1081,7 +1113,7 @@ impl BoardService for BoardServiceImpl {
 
         // Stage 4: emit BoardEventEnvelope::ColumnDeleted over NATS subject kanban.board.<board_id>.events
 
-        Ok(Response::new(RemoveColumnResponse {}))
+        Ok(Response::new(RemoveColumnResponse::default()))
     }
 
     // ── MoveColumn ────────────────────────────────────────────────────────────
@@ -1093,22 +1125,23 @@ impl BoardService for BoardServiceImpl {
 
     async fn move_column(
         &self,
-        request: Request<MoveColumnRequest>,
-    ) -> Result<Response<MoveColumnResponse>, Status> {
-        let tenant_id = tenant_id_from_request(&request)?;
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, MoveColumnRequest>,
+    ) -> ServiceResult<MoveColumnResponse> {
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let req = request.into_inner();
+        let req = request.to_owned_message();
         let col_id = req
             .column_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid column_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
 
         if req.to_position < 1 {
-            return Err(Status::invalid_argument("to_position must be >= 1"));
+            return Err(ConnectError::invalid_argument("to_position must be >= 1"));
         }
 
         // Convert to 0-based target.
@@ -1124,7 +1157,7 @@ impl BoardService for BoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch column position", e))?
-        .ok_or_else(|| Status::not_found("column not found on this board"))
+        .ok_or_else(|| ConnectError::not_found("column not found on this board"))
         .map(|r| r.get("position"))?;
 
         if current_pos != target_pos {
@@ -1171,23 +1204,25 @@ impl BoardService for BoardServiceImpl {
         // Stage 4: emit BoardEventEnvelope::ColumnsReordered over NATS subject kanban.board.<board_id>.events
 
         let columns = fetch_board_columns(&self.pool, board_id).await?;
-        Ok(Response::new(MoveColumnResponse { columns }))
+        Ok(Response::new(MoveColumnResponse {
+            columns,
+            ..Default::default()
+        }))
     }
 
     // ── SubscribeBoard (Stage 4c) ─────────────────────────────────────────────
 
-    type SubscribeBoardStream = SubscribeBoardStream;
-
     async fn subscribe_board(
         &self,
-        request: Request<SubscribeBoardRequest>,
-    ) -> Result<Response<Self::SubscribeBoardStream>, Status> {
-        let auth = request
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SubscribeBoardRequest>,
+    ) -> ServiceResult<SubscribeBoardStream> {
+        let auth = ctx
             .extensions()
             .get::<AuthContext>()
             .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing auth context"))?;
-        let req = request.into_inner();
+            .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))?;
+        let req = request.to_owned_message();
         let board_id = req.board_id;
         // since_seq is reserved for Stage 4c.5 resume protocol; ignored here.
         let _since_seq = req.since_seq;
@@ -1195,10 +1230,10 @@ impl BoardService for BoardServiceImpl {
         let tenant = auth
             .tenant_id
             .clone()
-            .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+            .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
         let board_id_parsed = board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let visibility: String =
             sqlx::query_scalar("SELECT visibility FROM boards WHERE tenant_id = $1 AND id = $2")
@@ -1207,7 +1242,7 @@ impl BoardService for BoardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch board visibility", e))?
-                .ok_or_else(|| Status::not_found("board not found"))?;
+                .ok_or_else(|| ConnectError::not_found("board not found"))?;
 
         let is_private = !is_public_or_internal(&visibility);
         let permission = Arc::new(
@@ -1243,7 +1278,10 @@ mod tests {
     use sunbeam_g2v::middleware::auth::AuthContext;
     use sunbeam_g2v::mq::NatsClient;
 
-    use prost_types::FieldMask;
+    use buffa_types::google::protobuf::FieldMask;
+
+    use crate::cpb::sunbeam::kanban::v1::BoardVisibility;
+    use crate::test_support::{connect_ctx, connect_request};
 
     // ── Subscribe test helpers ───────────────────────────────────────────────
 
@@ -1322,7 +1360,12 @@ mod tests {
             .expect("stream ended without first envelope")
             .expect("first envelope was an error");
 
-        match first.envelope.expect("envelope missing").payload {
+        match first
+            .envelope
+            .into_option()
+            .expect("envelope missing")
+            .payload
+        {
             Some(Payload::Cutover(c)) => {
                 assert_eq!(
                     c.last_replay_nats_seq, 0,
@@ -1348,7 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_forwards_live_event_published_to_jetstream() {
         use crate::realtime::jetstream_bootstrap::board_subject;
-        use prost::Message as ProstMessage;
+        use buffa::Message;
 
         let nats = connect_nats().await;
         ensure_stream(&nats).await;
@@ -1388,14 +1431,17 @@ mod tests {
             event_id: live_event_id.clone(),
             nats_seq: 1,
             board_revision: 1,
-            emitted_at: None,
+            emitted_at: None.into(),
             emitter_pod_id: "test".to_string(),
             actor_subject: "test".to_string(),
-            payload: Some(Payload::Heartbeat(Heartbeat { server_time_ms: 0 })),
+            payload: Some(Payload::Heartbeat(Box::new(Heartbeat {
+                server_time_ms: 0,
+                ..Default::default()
+            }))),
+            ..Default::default()
         };
-        let mut buf = bytes::BytesMut::new();
-        envelope.encode(&mut buf).expect("encode failed");
-        nats.publish_jetstream(&board_subject(&board_id), buf.freeze())
+        let buf = bytes::Bytes::from(envelope.encode_to_vec());
+        nats.publish_jetstream(&board_subject(&board_id), buf)
             .await
             .expect("publish failed")
             .await
@@ -1409,7 +1455,11 @@ mod tests {
             .expect("stream error");
 
         assert_eq!(
-            received.envelope.expect("envelope missing").event_id,
+            received
+                .envelope
+                .into_option()
+                .expect("envelope missing")
+                .event_id,
             live_event_id
         );
 
@@ -1475,7 +1525,12 @@ mod tests {
             .expect("stream ended")
             .expect("stream error");
 
-        match heartbeat_env.envelope.expect("envelope missing").payload {
+        match heartbeat_env
+            .envelope
+            .into_option()
+            .expect("envelope missing")
+            .payload
+        {
             Some(Payload::Heartbeat(h)) => {
                 assert!(
                     h.server_time_ms > 0,
@@ -1496,7 +1551,7 @@ mod tests {
     }
 
     /// When the caller's view permission is revoked mid-stream, the stream
-    /// closes with `Status::PermissionDenied`.
+    /// closes with `ConnectError::PermissionDenied`.
     ///
     /// Uses a one-second permission recheck interval override so the test does not
     /// wait 30 s.
@@ -1566,8 +1621,8 @@ mod tests {
         .expect("stream closed without error status");
 
         assert_eq!(
-            err.code(),
-            tonic::Code::PermissionDenied,
+            err.code,
+            connectrpc::ErrorCode::PermissionDenied,
             "expected PermissionDenied when permission is revoked, got {err:?}"
         );
 
@@ -1608,22 +1663,20 @@ mod tests {
         }
     }
 
-    /// Create an authenticated request that only carries the caller subject.
-    fn authed_request<T>(body: T, subject: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut().insert(AuthContext::authenticated(
+    /// Create an authenticated context that only carries the caller subject.
+    fn authed_ctx(subject: &str) -> RequestContext {
+        connect_ctx(AuthContext::authenticated(
             crate::test_support::test_tenant_id(),
             subject,
-        ));
-        req
+        ))
     }
 
-    /// Create an authenticated request that also carries a `CheckedObjectId`.
-    fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
-        let mut req = authed_request(body, subject);
-        req.extensions_mut()
+    /// Create an authenticated context that also carries a `CheckedObjectId`.
+    fn authed_ctx_with_object(subject: &str, object_id: &str) -> RequestContext {
+        let mut ctx = authed_ctx(subject);
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
     /// Insert a project row directly for a test, bypassing ProjectService.
@@ -1692,29 +1745,30 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let created = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Sprint Board".to_string(),
                     description: "integration test board".to_string(),
                     icon: "rocket".to_string(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         assert!(!created.id.is_empty());
         assert_eq!(created.name, "Sprint Board");
         assert_eq!(created.description, "integration test board");
         assert_eq!(created.icon, "rocket");
-        assert!(created.created_at.is_some());
+        assert!(created.created_at.is_set());
 
         let board_id = created.id.clone();
 
@@ -1725,20 +1779,24 @@ mod tests {
             .await;
 
         let detail = svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&subject, &board_id),
+                connect_request(&GetBoardRequest {
                     board_id: board_id.clone(),
-                },
-                &subject,
-                &board_id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_board failed")
-            .into_inner()
+            .body
             .detail
+            .into_option()
             .expect("detail missing");
 
-        let board = detail.board.expect("BoardDetail must contain board");
+        let board = detail
+            .board
+            .into_option()
+            .expect("BoardDetail must contain board");
         assert_eq!(board.id, board_id);
         assert_eq!(board.name, "Sprint Board");
         assert_eq!(board.project_id, project_id.to_string());
@@ -1760,43 +1818,45 @@ mod tests {
         let mut board_ids_a = vec![];
         for name in &["Board A1", "Board A2"] {
             let board = svc
-                .create_board(authed_request_with_object(
-                    CreateBoardRequest {
+                .create_board(
+                    authed_ctx_with_object(&subject, &project_a.to_string()),
+                    connect_request(&CreateBoardRequest {
                         project_id: project_a.to_string(),
                         name: name.to_string(),
                         description: String::new(),
                         icon: String::new(),
                         idempotency_key: String::new(),
-                        visibility: crate::pb::BoardVisibility::Private as i32,
-                    },
-                    &subject,
-                    &project_a.to_string(),
-                ))
+                        visibility: BoardVisibility::Private.into(),
+                        ..Default::default()
+                    }),
+                )
                 .await
                 .expect("create_board failed")
-                .into_inner()
+                .body
                 .board
+                .into_option()
                 .expect("board missing");
             board_ids_a.push(board.id);
         }
 
         let board_b = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_b.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_b.to_string(),
                     name: "Board B1".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_b.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         // Grant an explicit viewer role on each board so reads do not depend
@@ -1808,16 +1868,16 @@ mod tests {
         }
 
         let list_a = svc
-            .list_boards(authed_request_with_object(
-                ListBoardsRequest {
+            .list_boards(
+                authed_ctx_with_object(&subject, &project_a.to_string()),
+                connect_request(&ListBoardsRequest {
                     project_id: project_a.to_string(),
-                },
-                &subject,
-                &project_a.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_boards failed")
-            .into_inner();
+            .body;
 
         assert_eq!(list_a.boards.len(), 2, "project A should have 2 boards");
         let names_a: Vec<&str> = list_a.boards.iter().map(|b| b.name.as_str()).collect();
@@ -1825,16 +1885,16 @@ mod tests {
         assert!(names_a.contains(&"Board A2"));
 
         let list_b = svc
-            .list_boards(authed_request_with_object(
-                ListBoardsRequest {
+            .list_boards(
+                authed_ctx_with_object(&subject, &project_b.to_string()),
+                connect_request(&ListBoardsRequest {
                     project_id: project_b.to_string(),
-                },
-                &subject,
-                &project_b.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_boards failed")
-            .into_inner();
+            .body;
 
         assert_eq!(list_b.boards.len(), 1, "project B should have 1 board");
         assert_eq!(list_b.boards[0].name, "Board B1");
@@ -1853,30 +1913,32 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let created = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Original Name".to_string(),
                     description: "original desc".to_string(),
                     icon: "star".to_string(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let board_id = created.id.clone();
 
         // Update name only; description and icon should be unchanged.
         let updated = svc
-            .update_board(authed_request_with_object(
-                UpdateBoardRequest {
+            .update_board(
+                authed_ctx_with_object(&subject, &board_id),
+                connect_request(&UpdateBoardRequest {
                     board_id: board_id.clone(),
                     board: Some(Board {
                         id: String::new(),
@@ -1884,21 +1946,23 @@ mod tests {
                         name: "Updated Name".to_string(),
                         description: String::new(),
                         icon: String::new(),
-                        visibility: crate::pb::BoardVisibility::Private as i32,
-                        created_at: None,
-                        updated_at: None,
+                        visibility: BoardVisibility::Private.into(),
+                        created_at: None.into(),
+                        updated_at: None.into(),
                         columns_count: 0,
                         cards_count: 0,
-                    }),
-                    update_mask: None,
-                },
-                &subject,
-                &board_id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         assert_eq!(updated.name, "Updated Name");
@@ -1921,44 +1985,46 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "To Delete".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let board_id = board.id.parse::<Id>().unwrap();
 
         // Add a column to confirm cascade.
         let col = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &board.id),
+                connect_request(&AddColumnRequest {
                     board_id: board.id.clone(),
                     title: "To Do".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &board.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         let col_id = col.id.parse::<Id>().unwrap();
@@ -1967,13 +2033,13 @@ mod tests {
         create_test_card(&pool, project_id, board_id, col_id, &subject, "TEST-1").await;
 
         // Delete the board.
-        svc.delete_board(authed_request_with_object(
-            DeleteBoardRequest {
+        svc.delete_board(
+            authed_ctx_with_object(&subject, &board.id),
+            connect_request(&DeleteBoardRequest {
                 board_id: board.id.clone(),
-            },
-            &subject,
-            &board.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete_board failed");
 
@@ -2008,81 +2074,85 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Position Test Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let bid = board.id.clone();
 
         let c1 = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "C1".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         let c2 = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "C2".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         let c3 = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "C3".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         // Positions should be 0, 1, 2 in order.
@@ -2103,75 +2173,77 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Shift Test Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let bid = board.id.clone();
 
         // Add two columns at position 0 (append).
-        svc.add_column(authed_request_with_object(
-            AddColumnRequest {
+        svc.add_column(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&AddColumnRequest {
                 board_id: bid.clone(),
                 title: "First".to_string(),
                 accent: String::new(),
                 wip_limit: 0,
                 position: 0,
                 idempotency_key: String::new(),
-            },
-            &subject,
-            &bid,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add First failed");
 
-        svc.add_column(authed_request_with_object(
-            AddColumnRequest {
+        svc.add_column(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&AddColumnRequest {
                 board_id: bid.clone(),
                 title: "Second".to_string(),
                 accent: String::new(),
                 wip_limit: 0,
                 position: 0,
                 idempotency_key: String::new(),
-            },
-            &subject,
-            &bid,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add Second failed");
 
         // Insert "Middle" at position 1 (0-based), should push "Second" to position 2.
         let middle = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "Middle".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 1,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add Middle failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         assert_eq!(
@@ -2202,48 +2274,51 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Update Column Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let bid = board.id.clone();
 
         let col = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "Old Title".to_string(),
                     accent: "blue".to_string(),
                     wip_limit: 5,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         let updated = svc
-            .update_column(authed_request_with_object(
-                UpdateColumnRequest {
+            .update_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&UpdateColumnRequest {
                     board_id: bid.clone(),
                     column_id: col.id.clone(),
                     column: Some(Column {
@@ -2253,18 +2328,20 @@ mod tests {
                         accent: String::new(),
                         wip_limit: 10,
                         position: 0,
-                        created_at: None,
-                        updated_at: None,
-                    }),
-                    update_mask: None,
-                },
-                &subject,
-                &bid,
-            ))
+                        created_at: None.into(),
+                        updated_at: None.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         assert_eq!(updated.title, "New Title");
@@ -2287,44 +2364,46 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Remove Col Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let bid = board.id.clone();
         let board_id = bid.parse::<Id>().unwrap();
 
         let col = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
                     board_id: bid.clone(),
                     title: "Doomed".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &bid,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         let column_id = col.id.parse::<Id>().unwrap();
@@ -2351,14 +2430,14 @@ mod tests {
             .get(0);
         assert_eq!(card_count_before, 3);
 
-        svc.remove_column(authed_request_with_object(
-            RemoveColumnRequest {
+        svc.remove_column(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&RemoveColumnRequest {
                 board_id: bid.clone(),
                 column_id: col.id.clone(),
-            },
-            &subject,
-            &bid,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("remove_column failed");
 
@@ -2397,73 +2476,76 @@ mod tests {
         let project_b = create_test_project(&pool, &subject).await;
 
         let board_a = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_a.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_a.to_string(),
                     name: "Board A".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_a.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board A failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let board_b = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_b.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_b.to_string(),
                     name: "Board B".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_b.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board B failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         // Add a column to board B.
         let col_b = svc
-            .add_column(authed_request_with_object(
-                AddColumnRequest {
+            .add_column(
+                authed_ctx_with_object(&subject, &board_b.id),
+                connect_request(&AddColumnRequest {
                     board_id: board_b.id.clone(),
                     title: "Col B".to_string(),
                     accent: String::new(),
                     wip_limit: 0,
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &board_b.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add_column failed")
-            .into_inner()
+            .body
             .column
+            .into_option()
             .expect("column missing");
 
         // Try to remove col_b using board_a's object id — should fail with not_found.
         let result = svc
-            .remove_column(authed_request_with_object(
-                RemoveColumnRequest {
+            .remove_column(
+                authed_ctx_with_object(&subject, &board_a.id),
+                connect_request(&RemoveColumnRequest {
                     board_id: board_a.id.clone(),
                     column_id: col_b.id.clone(),
-                },
-                &subject,
-                &board_a.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(
@@ -2472,8 +2554,8 @@ mod tests {
         );
         let status = result.unwrap_err();
         assert_eq!(
-            status.code(),
-            tonic::Code::NotFound,
+            status.code,
+            connectrpc::ErrorCode::NotFound,
             "wrong board removal should be not_found"
         );
 
@@ -2491,22 +2573,23 @@ mod tests {
         let project_id = create_test_project(&pool, &subject).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Move Col Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &subject,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let bid = board.id.clone();
@@ -2515,43 +2598,44 @@ mod tests {
         let mut col_ids = vec![];
         for title in &["A", "B", "C", "D"] {
             let c = svc
-                .add_column(authed_request_with_object(
-                    AddColumnRequest {
+                .add_column(
+                    authed_ctx_with_object(&subject, &bid),
+                    connect_request(&AddColumnRequest {
                         board_id: bid.clone(),
                         title: title.to_string(),
                         accent: String::new(),
                         wip_limit: 0,
                         position: 0,
                         idempotency_key: String::new(),
-                    },
-                    &subject,
-                    &bid,
-                ))
+                        ..Default::default()
+                    }),
+                )
                 .await
                 .expect("add_column failed")
-                .into_inner()
+                .body
                 .column
+                .into_option()
                 .expect("column missing");
             col_ids.push(c.id.clone());
         }
 
         // Move D (position 3) to position 1 (1-based), so: A(0), D(1), B(2), C(3).
         let resp = svc
-            .move_column(authed_request_with_object(
-                MoveColumnRequest {
+            .move_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&MoveColumnRequest {
                     board_id: bid.clone(),
                     column_id: col_ids[3].clone(), // D
                     to_position: 1, // 1-based → 0-based = 0... wait, to_position=1 → target_pos=0
-                                    // Let's move D to position 2 (1-based) → 0-based = 1: A, D, B, C
-                                    // Actually, to make it clearer: move B (index 1, pos 1) to position 3 (1-based)
-                                    // so A(0), C(1), D(2), B(3) → no let's keep it simple
-                },
-                &subject,
-                &bid,
-            ))
+                    // Let's move D to position 2 (1-based) → 0-based = 1: A, D, B, C
+                    // Actually, to make it clearer: move B (index 1, pos 1) to position 3 (1-based)
+                    // so A(0), C(1), D(2), B(3) → no let's keep it simple
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("move_column failed")
-            .into_inner();
+            .body;
 
         // The response must contain all 4 columns.
         assert_eq!(
@@ -2589,39 +2673,41 @@ mod tests {
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&owner, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Public Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Public as i32,
-                },
-                &owner,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let detail = svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&stranger, &board.id),
+                connect_request(&GetBoardRequest {
                     board_id: board.id.clone(),
-                },
-                &stranger,
-                &board.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("non-member should view public board")
-            .into_inner()
+            .body
             .detail
+            .into_option()
             .expect("detail missing");
 
-        assert_eq!(detail.board.unwrap().id, board.id);
+        assert_eq!(detail.board.as_option().unwrap().id, board.id);
         cleanup_project(&pool, project_id).await;
     }
 
@@ -2636,38 +2722,39 @@ mod tests {
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&owner, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Private Board".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &owner,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         let result = svc
-            .get_board(authed_request_with_object(
-                GetBoardRequest {
+            .get_board(
+                authed_ctx_with_object(&stranger, &board.id),
+                connect_request(&GetBoardRequest {
                     board_id: board.id.clone(),
-                },
-                &stranger,
-                &board.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(result.is_err(), "non-member must not view private board");
         assert_eq!(
-            result.unwrap_err().code(),
-            tonic::Code::PermissionDenied,
+            result.unwrap_err().code,
+            connectrpc::ErrorCode::PermissionDenied,
             "private board must return PermissionDenied"
         );
         cleanup_project(&pool, project_id).await;
@@ -2684,55 +2771,56 @@ mod tests {
         let project_id = create_test_project(&pool, &owner).await;
 
         // Public board.
-        svc.create_board(authed_request_with_object(
-            CreateBoardRequest {
+        svc.create_board(
+            authed_ctx_with_object(&owner, &project_id.to_string()),
+            connect_request(&CreateBoardRequest {
                 project_id: project_id.to_string(),
                 name: "Public".to_string(),
                 description: String::new(),
                 icon: String::new(),
                 idempotency_key: String::new(),
-                visibility: crate::pb::BoardVisibility::Public as i32,
-            },
-            &owner,
-            &project_id.to_string(),
-        ))
+                visibility: BoardVisibility::Public.into(),
+                ..Default::default()
+            }),
+        )
         .await
         .expect("create public board failed");
 
         // Internal board.
-        svc.create_board(authed_request_with_object(
-            CreateBoardRequest {
+        svc.create_board(
+            authed_ctx_with_object(&owner, &project_id.to_string()),
+            connect_request(&CreateBoardRequest {
                 project_id: project_id.to_string(),
                 name: "Internal".to_string(),
                 description: String::new(),
                 icon: String::new(),
                 idempotency_key: String::new(),
-                visibility: crate::pb::BoardVisibility::Internal as i32,
-            },
-            &owner,
-            &project_id.to_string(),
-        ))
+                visibility: BoardVisibility::Internal.into(),
+                ..Default::default()
+            }),
+        )
         .await
         .expect("create internal board failed");
 
         // Private board.
         let private_board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&owner, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Private".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &owner,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create private board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         // Grant stranger an explicit viewer role on the private board so it appears.
@@ -2747,16 +2835,16 @@ mod tests {
             .expect("grant viewer failed");
 
         let list = svc
-            .list_boards(authed_request_with_object(
-                ListBoardsRequest {
+            .list_boards(
+                authed_ctx_with_object(&stranger, &project_id.to_string()),
+                connect_request(&ListBoardsRequest {
                     project_id: project_id.to_string(),
-                },
-                &stranger,
-                &project_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_boards failed")
-            .into_inner();
+            .body;
 
         let names: Vec<&str> = list.boards.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"Public"), "public board must be listed");
@@ -2778,16 +2866,16 @@ mod tests {
             .ok();
 
         let list_after = svc
-            .list_boards(authed_request_with_object(
-                ListBoardsRequest {
+            .list_boards(
+                authed_ctx_with_object(&stranger, &project_id.to_string()),
+                connect_request(&ListBoardsRequest {
                     project_id: project_id.to_string(),
-                },
-                &stranger,
-                &project_id.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_boards failed")
-            .into_inner();
+            .body;
 
         let names_after: Vec<&str> = list_after.boards.iter().map(|b| b.name.as_str()).collect();
         assert!(
@@ -2813,22 +2901,23 @@ mod tests {
         let project_id = create_test_project(&pool, &owner).await;
 
         let board = svc
-            .create_board(authed_request_with_object(
-                CreateBoardRequest {
+            .create_board(
+                authed_ctx_with_object(&owner, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
                     project_id: project_id.to_string(),
                     name: "Visibility Patch".to_string(),
                     description: String::new(),
                     icon: String::new(),
                     idempotency_key: String::new(),
-                    visibility: crate::pb::BoardVisibility::Private as i32,
-                },
-                &owner,
-                &project_id.to_string(),
-            ))
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_board failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         // Board manage is computed from the parent project; grant project
@@ -2839,8 +2928,9 @@ mod tests {
             .expect("grant admin failed");
 
         let updated = svc
-            .update_board(authed_request_with_object(
-                UpdateBoardRequest {
+            .update_board(
+                authed_ctx_with_object(&owner, &board.id),
+                connect_request(&UpdateBoardRequest {
                     board_id: board.id.clone(),
                     board: Some(Board {
                         id: String::new(),
@@ -2848,35 +2938,40 @@ mod tests {
                         name: String::new(),
                         description: String::new(),
                         icon: String::new(),
-                        visibility: crate::pb::BoardVisibility::Public as i32,
-                        created_at: None,
-                        updated_at: None,
+                        visibility: BoardVisibility::Public.into(),
+                        created_at: None.into(),
+                        updated_at: None.into(),
                         columns_count: 0,
                         cards_count: 0,
-                    }),
+                        ..Default::default()
+                    })
+                    .into(),
                     update_mask: Some(FieldMask {
                         paths: vec!["visibility".to_string()],
-                    }),
-                },
-                &owner,
-                &board.id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update visibility failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         assert_eq!(
             updated.visibility,
-            crate::pb::BoardVisibility::Public as i32,
+            BoardVisibility::Public,
             "visibility must be persisted as public"
         );
 
         // Change back to private.
         let updated_private = svc
-            .update_board(authed_request_with_object(
-                UpdateBoardRequest {
+            .update_board(
+                authed_ctx_with_object(&owner, &board.id),
+                connect_request(&UpdateBoardRequest {
                     board_id: board.id.clone(),
                     board: Some(Board {
                         id: String::new(),
@@ -2884,28 +2979,32 @@ mod tests {
                         name: String::new(),
                         description: String::new(),
                         icon: String::new(),
-                        visibility: crate::pb::BoardVisibility::Private as i32,
-                        created_at: None,
-                        updated_at: None,
+                        visibility: BoardVisibility::Private.into(),
+                        created_at: None.into(),
+                        updated_at: None.into(),
                         columns_count: 0,
                         cards_count: 0,
-                    }),
+                        ..Default::default()
+                    })
+                    .into(),
                     update_mask: Some(FieldMask {
                         paths: vec!["visibility".to_string()],
-                    }),
-                },
-                &owner,
-                &board.id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update visibility failed")
-            .into_inner()
+            .body
             .board
+            .into_option()
             .expect("board missing");
 
         assert_eq!(
             updated_private.visibility,
-            crate::pb::BoardVisibility::Private as i32,
+            BoardVisibility::Private,
             "visibility must be persisted as private"
         );
 
@@ -2945,7 +3044,12 @@ mod tests {
             .expect("stream ended without first envelope")
             .expect("first envelope was an error");
 
-        match first.envelope.expect("envelope missing").payload {
+        match first
+            .envelope
+            .into_option()
+            .expect("envelope missing")
+            .payload
+        {
             Some(Payload::Cutover(c)) => {
                 assert_eq!(
                     c.last_replay_nats_seq, 0,

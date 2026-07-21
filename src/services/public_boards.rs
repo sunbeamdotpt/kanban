@@ -15,13 +15,12 @@
 //! not collide across tenants.
 
 use crate::id::Id;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use sqlx::Row;
-use tonic::{Request, Response, Status};
 
-use crate::pb::public_board_service_server::PublicBoardService;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     GetPublicBoardRequest, GetPublicBoardResponse, ListPublicBoardsRequest,
-    ListPublicBoardsResponse,
+    ListPublicBoardsResponse, PublicBoardService,
 };
 use crate::services::boards::{board_from_row, fetch_cards_count, fetch_columns_count};
 use crate::services::visibility::is_public;
@@ -30,22 +29,23 @@ pub struct PublicBoardServiceImpl {
     pub pool: sqlx::PgPool,
 }
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     tracing::error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl PublicBoardService for PublicBoardServiceImpl {
     async fn get_public_board(
         &self,
-        request: Request<GetPublicBoardRequest>,
-    ) -> Result<Response<GetPublicBoardResponse>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, GetPublicBoardRequest>,
+    ) -> ServiceResult<GetPublicBoardResponse> {
+        let req = request.to_owned_message();
         let board_id = req
             .board_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
         let row = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
@@ -55,30 +55,34 @@ impl PublicBoardService for PublicBoardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board", e))?
-        .ok_or_else(|| Status::not_found("board not found"))?;
+        .ok_or_else(|| ConnectError::not_found("board not found"))?;
 
         let visibility: String = row.get("visibility");
         if !is_public(&visibility) {
             // Treat non-public boards as not found from the public endpoint.
-            return Err(Status::not_found("board not found"));
+            return Err(ConnectError::not_found("board not found"));
         }
 
         let columns_count = fetch_columns_count(&self.pool, board_id, None).await;
         let cards_count = fetch_cards_count(&self.pool, board_id, None).await;
         let board = board_from_row(&row, columns_count, cards_count);
 
-        Ok(Response::new(GetPublicBoardResponse { board: Some(board) }))
+        Ok(Response::new(GetPublicBoardResponse {
+            board: Some(board).into(),
+            ..Default::default()
+        }))
     }
 
     async fn list_public_boards(
         &self,
-        request: Request<ListPublicBoardsRequest>,
-    ) -> Result<Response<ListPublicBoardsResponse>, Status> {
-        let req = request.into_inner();
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, ListPublicBoardsRequest>,
+    ) -> ServiceResult<ListPublicBoardsResponse> {
+        let req = request.to_owned_message();
         let project_id = req
             .project_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid project_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let rows = sqlx::query(
             "SELECT id, project_id, name, slug, description, icon, visibility, created_at, updated_at \
@@ -97,7 +101,10 @@ impl PublicBoardService for PublicBoardServiceImpl {
             boards.push(board_from_row(row, columns_count, cards_count));
         }
 
-        Ok(Response::new(ListPublicBoardsResponse { boards }))
+        Ok(Response::new(ListPublicBoardsResponse {
+            boards,
+            ..Default::default()
+        }))
     }
 }
 
@@ -105,21 +112,15 @@ impl PublicBoardService for PublicBoardServiceImpl {
 mod tests {
     use super::*;
     use crate::id::Id;
-    use tonic::Request;
 
-    use crate::pb::public_board_service_server::PublicBoardService;
+    use crate::cpb::sunbeam::kanban::v1::BoardVisibility;
     use crate::services::visibility::DEFAULT_VISIBILITY;
-    use crate::test_support::containers;
+    use crate::test_support::{connect_request, containers};
 
     fn make_service(infra: &containers::TestInfra) -> PublicBoardServiceImpl {
         PublicBoardServiceImpl {
             pool: infra.pool.clone(),
         }
-    }
-
-    fn public_request<T>(body: T) -> Request<T> {
-        // No auth context — these RPCs skip the auth middleware entirely.
-        Request::new(body)
     }
 
     async fn create_test_project(pool: &sqlx::PgPool, subject: &str) -> Id {
@@ -169,16 +170,21 @@ mod tests {
         let board_id = insert_board(&infra.pool, project_id, "Public Board", "public").await;
 
         let resp = svc
-            .get_public_board(public_request(GetPublicBoardRequest {
-                board_id: board_id.to_string(),
-            }))
+            .get_public_board(
+                // No auth context — these RPCs skip the auth middleware entirely.
+                RequestContext::default(),
+                connect_request(&GetPublicBoardRequest {
+                    board_id: board_id.to_string(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_public_board failed")
-            .into_inner();
+            .body;
 
-        let board = resp.board.expect("board missing");
+        let board = resp.board.into_option().expect("board missing");
         assert_eq!(board.id, board_id.to_string());
-        assert_eq!(board.visibility, 3); // PUBLIC
+        assert_eq!(board.visibility, BoardVisibility::Public);
     }
 
     #[tokio::test]
@@ -193,17 +199,21 @@ mod tests {
 
         for id in &[internal_id, private_id] {
             let result = svc
-                .get_public_board(public_request(GetPublicBoardRequest {
-                    board_id: id.to_string(),
-                }))
+                .get_public_board(
+                    RequestContext::default(),
+                    connect_request(&GetPublicBoardRequest {
+                        board_id: id.to_string(),
+                        ..Default::default()
+                    }),
+                )
                 .await;
             assert!(
                 result.is_err(),
                 "public endpoint must hide non-public board {id}"
             );
             assert_eq!(
-                result.unwrap_err().code(),
-                tonic::Code::NotFound,
+                result.unwrap_err().code,
+                connectrpc::ErrorCode::NotFound,
                 "non-public board must return NotFound"
             );
         }
@@ -223,15 +233,19 @@ mod tests {
             insert_board(&infra.pool, project_id, "Private Board", DEFAULT_VISIBILITY).await;
 
         let resp = svc
-            .list_public_boards(public_request(ListPublicBoardsRequest {
-                project_id: project_id.to_string(),
-            }))
+            .list_public_boards(
+                RequestContext::default(),
+                connect_request(&ListPublicBoardsRequest {
+                    project_id: project_id.to_string(),
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_public_boards failed")
-            .into_inner();
+            .body;
 
         assert_eq!(resp.boards.len(), 1);
         assert_eq!(resp.boards[0].id, public_id.to_string());
-        assert_eq!(resp.boards[0].visibility, 3); // PUBLIC
+        assert_eq!(resp.boards[0].visibility, BoardVisibility::Public);
     }
 }

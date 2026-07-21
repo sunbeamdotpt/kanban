@@ -33,11 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let kanban_includes = &["proto"];
 
-    // ---- tonic-prost: server traits + client stubs ----
-    tonic_prost_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .compile_protos(kanban_protos, kanban_includes)?;
+    // ---- connectrpc-build: Connect-RPC server traits + clients ----
+    connectrpc_build::Config::new()
+        .include_file("_kanban_connect.rs")
+        .files(kanban_protos)
+        .includes(kanban_includes)
+        .compile()?;
 
     for p in kanban_protos {
         println!("cargo:rerun-if-changed={p}");

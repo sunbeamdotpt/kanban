@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sunbeam_g2v::client::{BearerToken, ClientBuilder, ConnectTransport, OAuth2ClientCredentials};
+use sunbeam_g2v::client::{ClientBuilder, ConnectTransport, OAuth2ClientCredentials};
 
 use crate::iam_proto::iam::v1::{
     CheckPermissionRequest, CreateRelationTupleRequest, DeleteRelationTupleRequest,
@@ -126,8 +126,8 @@ impl PermissionClient {
     /// provisioned for that tenant on first use.
     ///
     /// Only available on clients built from service credentials
-    /// ([`PermissionClient::new`]); bearer-token and unauthenticated clients
-    /// resolve their tenant implicitly and cannot be re-scoped.
+    /// ([`PermissionClient::new`]); unauthenticated clients resolve their
+    /// tenant implicitly and cannot be re-scoped.
     pub async fn tenant_client(
         &self,
         tenant_id: &str,
@@ -159,35 +159,6 @@ impl PermissionClient {
             .await?;
 
         Ok(client.clone())
-    }
-
-    /// Create a client that acts on behalf of the bearer token from an incoming
-    /// request. Used by `permission_dispatch` to forward the caller's authorization.
-    pub fn with_bearer_token(
-        base_url: impl Into<String>,
-        token: impl Into<String>,
-    ) -> Result<Self> {
-        let base_url = base_url.into();
-        let base_uri = base_url
-            .parse::<http::Uri>()
-            .context("invalid permission service base URL")?;
-
-        let client = ClientBuilder::new(&base_url)
-            .auth(BearerToken::new(token.into()))
-            .build()
-            .context("failed to build permission service client")?;
-
-        let transport = ConnectTransport::new(client, base_uri.clone());
-        let inner = PermissionServiceClient::new(
-            transport,
-            connectrpc::client::ClientConfig::new(base_uri),
-        );
-
-        Ok(Self {
-            inner,
-            config: None,
-            tenant_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        })
     }
 
     /// Create a client without authentication. Useful for tests and local dev

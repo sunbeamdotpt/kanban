@@ -10,17 +10,18 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::id::Id;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use serde_json::{Value, json};
-use tonic::{Request, Response, Status};
 use tracing::error;
 
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_expand::{ExpandQuery, expand_objects};
+use crate::cpb::sunbeam::kanban::v1::{
+    CardSearchHit, SearchCardsRequest, SearchCardsResponse, SearchService,
+};
 use crate::integrations::opensearch::{KANBAN_CARDS_INDEX, OpenSearchClient};
-use crate::pb::search_service_server::SearchService;
-use crate::pb::{CardSearchHit, SearchCardsRequest, SearchCardsResponse};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -43,32 +44,32 @@ pub struct SearchServiceImpl {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 /// Extract the caller's tenant from the auth context and derive a permission
 /// client scoped to that tenant's store (see `TENANT_HEADER`).
-async fn tenant_client_for<T>(
+async fn tenant_client_for(
     permission: &PermissionClient,
-    req: &Request<T>,
-) -> Result<PermissionClient, Status> {
-    let tenant = tenant_id_from_request(req)?;
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = tenant_id_from_request(ctx)?;
     permission
         .tenant_client(&tenant)
         .await
@@ -110,7 +111,7 @@ async fn fetch_public_internal_board_ids(
 ///   * `sort` — `_score` descending then `id` ascending for stable pagination.
 ///   * `search_after` — the decoded cursor, when one is provided.
 ///   * `size` — the clamped page limit.
-fn build_query(req: &SearchCardsRequest, tenant_id: &str) -> Result<Value, Status> {
+fn build_query(req: &SearchCardsRequest, tenant_id: &str) -> Result<Value, ConnectError> {
     let limit = {
         let l = if req.limit <= 0 {
             DEFAULT_LIMIT
@@ -176,7 +177,7 @@ fn build_query(req: &SearchCardsRequest, tenant_id: &str) -> Result<Value, Statu
     // Decode cursor → search_after array.
     if !req.cursor.is_empty() {
         let decoded = decode_cursor(&req.cursor)
-            .map_err(|e| Status::invalid_argument(format!("invalid cursor: {e}")))?;
+            .map_err(|e| ConnectError::invalid_argument(format!("invalid cursor: {e}")))?;
         body["search_after"] = decoded;
     }
 
@@ -266,18 +267,19 @@ fn base64_decode(input: &str) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-// ── tonic impl ────────────────────────────────────────────────────────────────
+// ── Connect-RPC impl ──────────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl SearchService for SearchServiceImpl {
     async fn search_cards(
         &self,
-        request: Request<SearchCardsRequest>,
-    ) -> Result<Response<SearchCardsResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SearchCardsRequest>,
+    ) -> ServiceResult<SearchCardsResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         // ── 1. Build OpenSearch query ────────────────────────────────────────
         let limit = {
@@ -306,6 +308,7 @@ impl SearchService for SearchServiceImpl {
                     hits: vec![],
                     next_cursor: String::new(),
                     total: 0,
+                    ..Default::default()
                 }));
             }
             Some(r) => r,
@@ -319,6 +322,7 @@ impl SearchService for SearchServiceImpl {
                 hits: vec![],
                 next_cursor: String::new(),
                 total,
+                ..Default::default()
             }));
         }
 
@@ -389,6 +393,7 @@ impl SearchService for SearchServiceImpl {
                 label_names: src.labels.clone(),
                 assignee_subjects: src.assignees.clone(),
                 score: hit.score.unwrap_or(0.0) as f32,
+                ..Default::default()
             });
 
             if let Some(sort) = hit.sort {
@@ -412,6 +417,7 @@ impl SearchService for SearchServiceImpl {
             hits,
             next_cursor,
             total,
+            ..Default::default()
         }))
     }
 }
@@ -428,6 +434,7 @@ mod tests {
     use crate::auth::permission_retry::PermissionRetryExt;
     use crate::integrations::opensearch::{CardDocument, OpenSearchClient, OpenSearchConfig};
     use crate::test_support::containers;
+    use crate::test_support::{connect_ctx, connect_request};
 
     // Mock-server support for service-level tests.
     use axum::{
@@ -439,20 +446,19 @@ mod tests {
 
     #[test]
     fn subject_from_request_returns_subject() {
-        let mut req = Request::new(SearchCardsRequest::default());
-        req.extensions_mut().insert(AuthContext {
+        let ctx = connect_ctx(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:alice".to_string()),
             ..Default::default()
         });
-        assert_eq!(subject_from_request(&req).unwrap(), "user:alice");
+        assert_eq!(subject_from_request(&ctx).unwrap(), "user:alice");
     }
 
     #[test]
     fn subject_from_request_missing_returns_unauthenticated() {
-        let req = Request::new(SearchCardsRequest::default());
-        let err = subject_from_request(&req).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        let ctx = RequestContext::default();
+        let err = subject_from_request(&ctx).unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Unauthenticated);
     }
 
     #[test]
@@ -543,7 +549,7 @@ mod tests {
             ..Default::default()
         };
         let err = build_query(&req, "test-tenant").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -563,8 +569,8 @@ mod tests {
     #[test]
     fn internal_returns_internal_status() {
         let err = internal("boom", std::io::Error::other("ouch"));
-        assert_eq!(err.code(), tonic::Code::Internal);
-        assert!(err.message().contains("boom"));
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
+        assert!(err.message.unwrap_or_default().contains("boom"));
     }
 
     // ── Integration helpers ────────────────────────────────────────────────────
@@ -667,20 +673,16 @@ mod tests {
         );
 
         // Also exercise the full handler — it must return empty SearchCardsResponse.
-        let mut req = Request::new(SearchCardsRequest {
-            query: "anything".to_string(),
-            project_ids: vec![],
-            board_ids: vec![],
-            label_names: vec![],
-            assignee_subjects: vec![],
-            limit: 10,
-            cursor: String::new(),
-        });
-        req.extensions_mut().insert(AuthContext {
+        let _ctx = connect_ctx(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-missing-index".to_string()),
             ..Default::default()
         });
+        let _req = SearchCardsRequest {
+            query: "anything".to_string(),
+            limit: 10,
+            ..Default::default()
+        };
 
         // We need a service pointed at the non-existent index.  Since the index
         // constant is module-level, we can't override it in production code; but
@@ -1112,22 +1114,18 @@ mod tests {
         .expect("failed to insert test board");
     }
 
-    fn search_request(query: &str) -> Request<SearchCardsRequest> {
-        let mut req = Request::new(SearchCardsRequest {
-            query: query.to_string(),
-            project_ids: vec![],
-            board_ids: vec![],
-            label_names: vec![],
-            assignee_subjects: vec![],
-            limit: 10,
-            cursor: String::new(),
-        });
-        req.extensions_mut().insert(AuthContext {
+    fn search_request(query: &str) -> (RequestContext, SearchCardsRequest) {
+        let ctx = connect_ctx(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-search".to_string()),
             ..Default::default()
         });
-        req
+        let req = SearchCardsRequest {
+            query: query.to_string(),
+            limit: 10,
+            ..Default::default()
+        };
+        (ctx, req)
     }
 
     #[tokio::test]
@@ -1160,8 +1158,8 @@ mod tests {
         os.index_card(&index, &doc).await.expect("index card");
         os.refresh(&index).await.expect("refresh");
 
-        let mut req = search_request("Public Visibility Hit");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("Public Visibility Hit");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject),
             ..Default::default()
@@ -1175,10 +1173,10 @@ mod tests {
         };
 
         let resp = svc
-            .search_cards(req)
+            .search_cards(ctx, connect_request(&req))
             .await
             .expect("search_cards failed")
-            .into_inner();
+            .body;
 
         assert_eq!(resp.hits.len(), 1, "public board hit must be returned");
         assert_eq!(resp.hits[0].card_id, card_id);
@@ -1216,8 +1214,8 @@ mod tests {
         os.index_card(&index, &doc).await.expect("index card");
         os.refresh(&index).await.expect("refresh");
 
-        let mut req = search_request("Private Visibility Hit");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("Private Visibility Hit");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
@@ -1231,10 +1229,10 @@ mod tests {
         };
 
         let resp = svc
-            .search_cards(req)
+            .search_cards(ctx, connect_request(&req))
             .await
             .expect("search_cards failed")
-            .into_inner();
+            .body;
 
         assert!(
             resp.hits.is_empty(),
@@ -1248,18 +1246,18 @@ mod tests {
             .await
             .expect("grant view failed");
 
-        let mut req2 = search_request("Private Visibility Hit");
-        req2.extensions_mut().insert(AuthContext {
+        let (mut ctx2, req2) = search_request("Private Visibility Hit");
+        ctx2.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
 
         let resp2 = svc
-            .search_cards(req2)
+            .search_cards(ctx2, connect_request(&req2))
             .await
             .expect("search_cards failed")
-            .into_inner();
+            .body;
 
         assert_eq!(
             resp2.hits.len(),
@@ -1307,8 +1305,8 @@ mod tests {
         os.index_card(&index, &doc).await.expect("index card");
         os.refresh(&index).await.expect("refresh");
 
-        let mut req = search_request("Cross Tenant Card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("Cross Tenant Card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject),
             ..Default::default()
@@ -1322,10 +1320,10 @@ mod tests {
         };
 
         let resp = svc
-            .search_cards(req)
+            .search_cards(ctx, connect_request(&req))
             .await
             .expect("search_cards failed")
-            .into_inner();
+            .body;
 
         assert!(
             resp.hits.is_empty(),
@@ -1355,14 +1353,18 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let mut req = search_request("no-such-card-xyz");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("no-such-card-xyz");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-empty".to_string()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert!(resp.hits.is_empty());
         assert_eq!(resp.total, 0);
 
@@ -1388,13 +1390,13 @@ mod tests {
             index_public_card(&os, &index, board_id, project_b, "Card B", vec![], vec![]).await;
         os.refresh(&index).await.unwrap();
 
-        let mut req = search_request("Card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("Card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-project-filter".to_string()),
             ..Default::default()
         });
-        req.get_mut().project_ids = vec![project_a.to_string()];
+        req.project_ids = vec![project_a.to_string()];
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
@@ -1403,7 +1405,11 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_a);
 
@@ -1430,13 +1436,13 @@ mod tests {
             index_public_card(&os, &index, board_b, project_id, "Card B", vec![], vec![]).await;
         os.refresh(&index).await.unwrap();
 
-        let mut req = search_request("Card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("Card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-board-filter".to_string()),
             ..Default::default()
         });
-        req.get_mut().board_ids = vec![board_a.to_string()];
+        req.board_ids = vec![board_a.to_string()];
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
@@ -1445,7 +1451,11 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_a);
 
@@ -1486,13 +1496,13 @@ mod tests {
         .await;
         os.refresh(&index).await.unwrap();
 
-        let mut req = search_request("card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-label-filter".to_string()),
             ..Default::default()
         });
-        req.get_mut().label_names = vec!["bug".to_string()];
+        req.label_names = vec!["bug".to_string()];
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
@@ -1501,7 +1511,11 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_bug);
 
@@ -1542,13 +1556,13 @@ mod tests {
         .await;
         os.refresh(&index).await.unwrap();
 
-        let mut req = search_request("card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-assignee-filter".to_string()),
             ..Default::default()
         });
-        req.get_mut().assignee_subjects = vec!["user:alice".to_string()];
+        req.assignee_subjects = vec!["user:alice".to_string()];
 
         let svc = SearchServiceImpl {
             pool: infra.pool.clone(),
@@ -1557,7 +1571,11 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_alice);
 
@@ -1592,8 +1610,8 @@ mod tests {
         os.index_card(&index, &doc).await.unwrap();
         os.refresh(&index).await.unwrap();
 
-        let mut req = search_request("Done card");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("Done card");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-status".to_string()),
             ..Default::default()
@@ -1606,7 +1624,11 @@ mod tests {
             index_name: Some(index.clone()),
         };
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].status, "completed");
 
@@ -1731,14 +1753,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("anything");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("anything");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-missing".to_string()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert!(resp.hits.is_empty());
         assert_eq!(resp.total, 0);
         assert!(resp.next_cursor.is_empty());
@@ -1765,14 +1791,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("find me");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("find me");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-public-mock".to_string()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_id);
         assert_eq!(resp.hits[0].status, "open");
@@ -1874,15 +1904,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("anything");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("anything");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-500".to_string()),
             ..Default::default()
         });
 
-        let err = svc.search_cards(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Internal);
+        let err = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
     }
 
     #[tokio::test]
@@ -1906,15 +1939,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("anything");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("anything");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-404".to_string()),
             ..Default::default()
         });
 
-        let err = svc.search_cards(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Internal);
+        let err = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, connectrpc::ErrorCode::Internal);
     }
 
     #[tokio::test]
@@ -1943,14 +1979,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("anything");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("anything");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-empty-hits".to_string()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert!(resp.hits.is_empty());
         assert_eq!(resp.total, 0);
         assert!(resp.next_cursor.is_empty());
@@ -1978,14 +2018,18 @@ mod tests {
         };
 
         let subject = format!("user:test-private-drop-{}", Id::new());
-        let mut req = search_request("find me");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("find me");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert!(resp.hits.is_empty());
     }
 
@@ -2017,14 +2061,18 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("find me");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, req) = search_request("find me");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some(subject.clone()),
             ..Default::default()
         });
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert_eq!(resp.hits[0].card_id, card_id);
 
@@ -2121,15 +2169,19 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("find me");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("find me");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-cursor-full".to_string()),
             ..Default::default()
         });
-        req.get_mut().limit = 1;
+        req.limit = 1;
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert!(!resp.next_cursor.is_empty());
     }
@@ -2156,15 +2208,19 @@ mod tests {
             index_name: None,
         };
 
-        let mut req = search_request("find me");
-        req.extensions_mut().insert(AuthContext {
+        let (mut ctx, mut req) = search_request("find me");
+        ctx.extensions_mut().insert(AuthContext {
             tenant_id: Some(crate::test_support::test_tenant_id()),
             subject: Some("user:test-cursor-partial".to_string()),
             ..Default::default()
         });
-        req.get_mut().limit = 2;
+        req.limit = 2;
 
-        let resp = svc.search_cards(req).await.unwrap().into_inner();
+        let resp = svc
+            .search_cards(ctx, connect_request(&req))
+            .await
+            .unwrap()
+            .body;
         assert_eq!(resp.hits.len(), 1);
         assert!(resp.next_cursor.is_empty());
     }

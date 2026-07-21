@@ -42,7 +42,7 @@ Sunbeam Kanban is a real-time collaborative board-management service for creativ
 ## Architecture at a glance
 
 ```
-Connect-RPC clients  →  Axum/Tonic server
+Connect-RPC clients  →  Axum/Connect-RPC server
                               │
                               ├── Postgres (projections + event_log)
                               ├── NATS JetStream (real-time fanout)

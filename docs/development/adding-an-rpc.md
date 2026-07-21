@@ -58,35 +58,32 @@ Run `cargo run --bin permission-coverage` and verify it exits 0.
 
 ## 4. Implement the handler
 
-In `src/services/cards.rs`:
+In `src/services/cards.rs`, as a method on the generated Connect-RPC service
+trait:
 
 ```rust
-pub async fn update_card_color(
-    State(AppState { db, .. }): State<AppState>,
-    Extension(checked_id): Extension<CheckedObjectId>,
-    req: UpdateCardColorRequest,
-) -> Result<Card, ApiError> {
-    let card_id = checked_id.0; // ALWAYS use checked_id, never req.card_id
+async fn update_card_color(
+    &self,
+    ctx: RequestContext,
+    request: ServiceRequest<'_, UpdateCardColorRequest>,
+) -> ServiceResult<Card> {
+    let checked_id = ctx
+        .extensions()
+        .get::<CheckedObjectId>()
+        .ok_or_else(|| ConnectError::internal("missing checked object id"))?;
+    let req = request.to_owned_message();
+    let card_id = &checked_id.0; // ALWAYS use checked_id, never req.card_id
 
-    let card = sqlx::query_as::<_, Card>(
+    let card = sqlx::query(
         "UPDATE cards SET color = $1, revision = revision + 1 WHERE id = $2 RETURNING *"
     )
     .bind(&req.color)
-    .bind(&card_id)
-    .fetch_one(&db)
-    .await?;
+    .bind(card_id)
+    .fetch_one(&self.pool)
+    .await
+    .map_err(|e| internal("failed to update card color", e))?;
 
-    // Emit event via outbox
-    infra.publish_event(
-        &format!("kanban.board.{}", card.board_id),
-        BoardEvent {
-            card_updated: Some(CardUpdated { card: Some(card.clone()) }),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    Ok(card)
+    Ok(Response::new(card_from_row(&card)))
 }
 ```
 
@@ -101,4 +98,4 @@ Add a `#[cfg(test)]` module at the bottom of `src/services/cards.rs`:
 - The color is persisted.
 - An event_log row is written.
 
-The RPC is now available to any Connect-RPC client over HTTP/2 (or SSE fallback over HTTP/1.1).
+The RPC is now available to any Connect-RPC client over HTTP/2 (gRPC and gRPC-Web are also served).

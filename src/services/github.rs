@@ -1,62 +1,67 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Stub implementation of the GitHub issue link service.
 
-use tonic::{Request, Response, Status};
+use connectrpc::{ConnectError, RequestContext, ServiceRequest, ServiceResult};
 
-use crate::pb::github_link_service_server::GithubLinkService;
-use crate::pb::{
-    LinkIssueRequest, LinkIssueResponse, ListLinksByCardRequest, ListLinksByCardResponse,
-    ResyncLinkRequest, ResyncLinkResponse, SearchGithubIssuesRequest, SearchGithubIssuesResponse,
-    UnlinkIssueRequest, UnlinkIssueResponse,
+use crate::cpb::sunbeam::kanban::v1::{
+    GithubLinkService, LinkIssueRequest, LinkIssueResponse, ListLinksByCardRequest,
+    ListLinksByCardResponse, ResyncLinkRequest, ResyncLinkResponse, SearchGithubIssuesRequest,
+    SearchGithubIssuesResponse, UnlinkIssueRequest, UnlinkIssueResponse,
 };
 
 pub struct GitHubServiceImpl;
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl GithubLinkService for GitHubServiceImpl {
     async fn link_issue(
         &self,
-        _request: Request<LinkIssueRequest>,
-    ) -> Result<Response<LinkIssueResponse>, Status> {
-        Err(Status::unimplemented("Stage 3 stub"))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, LinkIssueRequest>,
+    ) -> ServiceResult<LinkIssueResponse> {
+        Err(ConnectError::unimplemented("Stage 3 stub"))
     }
 
     async fn unlink_issue(
         &self,
-        _request: Request<UnlinkIssueRequest>,
-    ) -> Result<Response<UnlinkIssueResponse>, Status> {
-        Err(Status::unimplemented("Stage 3 stub"))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, UnlinkIssueRequest>,
+    ) -> ServiceResult<UnlinkIssueResponse> {
+        Err(ConnectError::unimplemented("Stage 3 stub"))
     }
 
     async fn list_links_by_card(
         &self,
-        _request: Request<ListLinksByCardRequest>,
-    ) -> Result<Response<ListLinksByCardResponse>, Status> {
-        Err(Status::unimplemented("Stage 3 stub"))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, ListLinksByCardRequest>,
+    ) -> ServiceResult<ListLinksByCardResponse> {
+        Err(ConnectError::unimplemented("Stage 3 stub"))
     }
 
     async fn search_github_issues(
         &self,
-        _request: Request<SearchGithubIssuesRequest>,
-    ) -> Result<Response<SearchGithubIssuesResponse>, Status> {
-        Err(Status::unimplemented("Stage 3 stub"))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, SearchGithubIssuesRequest>,
+    ) -> ServiceResult<SearchGithubIssuesResponse> {
+        Err(ConnectError::unimplemented("Stage 3 stub"))
     }
 
     async fn resync_link(
         &self,
-        _request: Request<ResyncLinkRequest>,
-    ) -> Result<Response<ResyncLinkResponse>, Status> {
-        Err(Status::unimplemented("Stage 3 stub"))
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, ResyncLinkRequest>,
+    ) -> ServiceResult<ResyncLinkResponse> {
+        Err(ConnectError::unimplemented("Stage 3 stub"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::connect_request;
 
-    fn unimplemented_status<T>(result: Result<Response<T>, Status>) -> String {
+    fn unimplemented_message<T>(result: ServiceResult<T>) -> String {
         match result {
-            Err(e) => e.message().to_string(),
+            Err(e) => e.message.unwrap_or_default(),
             Ok(_) => panic!("expected unimplemented status"),
         }
     }
@@ -64,50 +69,65 @@ mod tests {
     #[tokio::test]
     async fn link_issue_returns_unimplemented() {
         let svc = GitHubServiceImpl;
-        let status = unimplemented_status(
-            svc.link_issue(Request::new(LinkIssueRequest::default()))
-                .await,
+        let msg = unimplemented_message(
+            svc.link_issue(
+                RequestContext::default(),
+                connect_request(&LinkIssueRequest::default()),
+            )
+            .await,
         );
-        assert!(status.contains("Stage 3 stub"));
+        assert!(msg.contains("Stage 3 stub"));
     }
 
     #[tokio::test]
     async fn unlink_issue_returns_unimplemented() {
         let svc = GitHubServiceImpl;
-        let status = unimplemented_status(
-            svc.unlink_issue(Request::new(UnlinkIssueRequest::default()))
-                .await,
+        let msg = unimplemented_message(
+            svc.unlink_issue(
+                RequestContext::default(),
+                connect_request(&UnlinkIssueRequest::default()),
+            )
+            .await,
         );
-        assert!(status.contains("Stage 3 stub"));
+        assert!(msg.contains("Stage 3 stub"));
     }
 
     #[tokio::test]
     async fn list_links_by_card_returns_unimplemented() {
         let svc = GitHubServiceImpl;
-        let status = unimplemented_status(
-            svc.list_links_by_card(Request::new(ListLinksByCardRequest::default()))
-                .await,
+        let msg = unimplemented_message(
+            svc.list_links_by_card(
+                RequestContext::default(),
+                connect_request(&ListLinksByCardRequest::default()),
+            )
+            .await,
         );
-        assert!(status.contains("Stage 3 stub"));
+        assert!(msg.contains("Stage 3 stub"));
     }
 
     #[tokio::test]
     async fn search_github_issues_returns_unimplemented() {
         let svc = GitHubServiceImpl;
-        let status = unimplemented_status(
-            svc.search_github_issues(Request::new(SearchGithubIssuesRequest::default()))
-                .await,
+        let msg = unimplemented_message(
+            svc.search_github_issues(
+                RequestContext::default(),
+                connect_request(&SearchGithubIssuesRequest::default()),
+            )
+            .await,
         );
-        assert!(status.contains("Stage 3 stub"));
+        assert!(msg.contains("Stage 3 stub"));
     }
 
     #[tokio::test]
     async fn resync_link_returns_unimplemented() {
         let svc = GitHubServiceImpl;
-        let status = unimplemented_status(
-            svc.resync_link(Request::new(ResyncLinkRequest::default()))
-                .await,
+        let msg = unimplemented_message(
+            svc.resync_link(
+                RequestContext::default(),
+                connect_request(&ResyncLinkRequest::default()),
+            )
+            .await,
         );
-        assert!(status.contains("Stage 3 stub"));
+        assert!(msg.contains("Stage 3 stub"));
     }
 }

@@ -19,6 +19,37 @@
 use crate::id::Id;
 use sqlx::{PgPool, Row};
 
+/// Build a Connect-RPC [`ServiceRequest`] for calling service handlers
+/// directly in tests.
+///
+/// Uses `Box::leak` to satisfy the `'static` bound; acceptable in tests where
+/// each request lives for the process duration anyway.
+#[cfg(test)]
+pub(crate) fn connect_request<Req>(msg: &Req) -> connectrpc::ServiceRequest<'static, Req>
+where
+    Req: buffa::Message + buffa::HasMessageView,
+{
+    use buffa::MessageView;
+
+    let bytes = bytes::Bytes::from(msg.encode_to_vec());
+    let bytes: &'static bytes::Bytes = Box::leak(Box::new(bytes));
+    let view = Req::View::decode_view(bytes).expect("test request should decode");
+    let view: &'static Req::View<'static> = Box::leak(Box::new(view));
+    connectrpc::ServiceRequest::from_parts(view, bytes)
+}
+
+/// Build a [`RequestContext`] carrying the given auth extensions, mirroring
+/// what the auth middleware inserts in front of handlers.
+#[cfg(test)]
+#[allow(dead_code)] // used as services migrate to Connect-RPC handlers
+pub(crate) fn connect_ctx(
+    auth: sunbeam_g2v::middleware::auth::AuthContext,
+) -> connectrpc::RequestContext {
+    let mut ctx = connectrpc::RequestContext::default();
+    ctx.extensions_mut().insert(auth);
+    ctx
+}
+
 /// Create a minimal project and return its id.
 pub(crate) async fn seed_project(pool: &PgPool) -> Id {
     let project_id = Id::new();
@@ -917,10 +948,7 @@ pub(crate) mod containers {
                             redirect_uris: vec![],
                             grant_types: vec!["client_credentials".to_string()],
                             response_types: vec!["token".to_string()],
-                            scope: vec![
-                                "permission:admin".to_string(),
-                                "tenant:admin".to_string(),
-                            ],
+                            scope: vec!["permission:admin".to_string(), "tenant:admin".to_string()],
                             token_endpoint_auth_method: "client_secret_post".to_string(),
                             cross_tenant: true,
                             __buffa_unknown_fields: Default::default(),

@@ -14,25 +14,25 @@
 use std::sync::Arc;
 
 use crate::id::Id;
+use buffa_types::google::protobuf::{FieldMask, Timestamp};
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use sqlx::{PgPool, Row};
-use tonic::{Request, Response, Status};
 use tracing::error;
 
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_retry::PermissionRetryExt;
-use crate::pb::templates_service_server::TemplatesService;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     BoardTemplate, CardTemplate, CreateCardTemplateRequest, CreateCardTemplateResponse,
     CreateTemplateRequest, CreateTemplateResponse, DeleteCardTemplateRequest,
     DeleteCardTemplateResponse, DeleteTemplateRequest, DeleteTemplateResponse,
     GetCardTemplateRequest, GetCardTemplateResponse, GetTemplateRequest, GetTemplateResponse,
     ListCardTemplatesRequest, ListCardTemplatesResponse, ListTemplatesRequest,
-    ListTemplatesResponse, TemplateChecklistItem, TemplateColumn, UpdateCardTemplateRequest,
-    UpdateCardTemplateResponse, UpdateTemplateRequest, UpdateTemplateResponse,
+    ListTemplatesResponse, TemplateChecklistItem, TemplateColumn, TemplatesService,
+    UpdateCardTemplateRequest, UpdateCardTemplateResponse, UpdateTemplateRequest,
+    UpdateTemplateResponse,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -47,57 +47,58 @@ pub struct TemplatesServiceImpl {
     pub permission: Arc<PermissionClient>,
 }
 
-// ── Timestamp helpers (chrono ↔ prost_types) ─────────────────────────────────
+// ── Timestamp helpers (chrono ↔ buffa_types) ────────────────────────────────
 
 fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
     }
 }
 
 // ── Error helpers ────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 /// Extract the caller's tenant from the auth context and derive a permission
 /// client scoped to that tenant's store (see `TENANT_HEADER`).
-async fn tenant_client_for<T>(
+async fn tenant_client_for(
     permission: &PermissionClient,
-    req: &Request<T>,
-) -> Result<PermissionClient, Status> {
-    let tenant = req
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = ctx
         .extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))?;
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
     permission
         .tenant_client(&tenant)
         .await
         .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
-fn parse_id(s: &str, field: &str) -> Result<Id, Status> {
+fn parse_id(s: &str, field: &str) -> Result<Id, ConnectError> {
     match s.parse::<Id>() {
         Ok(id) => Ok(id),
-        Err(_) => Err(Status::invalid_argument(format!("invalid {field}"))),
+        Err(_) => Err(ConnectError::invalid_argument(format!("invalid {field}"))),
     }
 }
 
@@ -108,7 +109,7 @@ async fn check_project_permission(
     project_id: Id,
     relation: &str,
     subject: &str,
-) -> Result<(), Status> {
+) -> Result<(), ConnectError> {
     let allowed = permission
         .check_permission_with_retry(
             PERMISSION_TYPE_PROJECT,
@@ -122,7 +123,7 @@ async fn check_project_permission(
     if allowed {
         Ok(())
     } else {
-        Err(Status::permission_denied("permission denied"))
+        Err(ConnectError::permission_denied("permission denied"))
     }
 }
 
@@ -160,6 +161,7 @@ fn columns_from_json(value: &serde_json::Value) -> Vec<TemplateColumn> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
+            ..Default::default()
         })
         .collect()
 }
@@ -188,6 +190,7 @@ fn checklist_from_json(value: &serde_json::Value) -> Vec<TemplateChecklistItem> 
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
+            ..Default::default()
         })
         .collect()
 }
@@ -211,8 +214,9 @@ fn board_template_from_row(row: &sqlx::postgres::PgRow) -> BoardTemplate {
         description: description.unwrap_or_default(),
         columns: columns_from_json(&columns),
         is_global,
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        ..Default::default()
     }
 }
 
@@ -239,34 +243,35 @@ fn card_template_from_row(row: &sqlx::postgres::PgRow) -> CardTemplate {
         label_names,
         checklist_items: checklist_from_json(&checklist_items),
         is_global,
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        ..Default::default()
     }
 }
 
 // ── Field-mask helper ────────────────────────────────────────────────────────
 
-fn mask_contains(mask: &Option<prost_types::FieldMask>, path: &str) -> bool {
-    match mask {
-        Some(m) => m.paths.iter().any(|p| p == path),
-        None => false,
-    }
+fn mask_contains(mask: &buffa::MessageField<FieldMask>, path: &str) -> bool {
+    mask.as_option()
+        .map(|m| m.paths.iter().any(|p| p == path))
+        .unwrap_or(false)
 }
 
 // ── impl TemplatesService ────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl TemplatesService for TemplatesServiceImpl {
     // ── Board templates ──────────────────────────────────────────────────────
 
     async fn list_templates(
         &self,
-        request: Request<ListTemplatesRequest>,
-    ) -> Result<Response<ListTemplatesResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListTemplatesRequest>,
+    ) -> ServiceResult<ListTemplatesResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         // Global templates are visible to any authenticated user within the
         // caller's tenant. The legacy `system` tenant seeds remain available
@@ -295,10 +300,11 @@ impl TemplatesService for TemplatesServiceImpl {
                 .is_ok();
 
             if visible {
+                // Globals are already in the list; only add project-scoped rows.
                 let project_rows = sqlx::query(
                     "SELECT id, project_id, name, description, columns, is_global, created_at, updated_at \
                      FROM board_templates \
-                     WHERE tenant_id IN ($1, $2) AND (project_id = $3 OR is_global = true) \
+                     WHERE tenant_id IN ($1, $2) AND project_id = $3 AND is_global = false \
                      ORDER BY name",
                 )
                 .bind(&tenant_id)
@@ -312,17 +318,21 @@ impl TemplatesService for TemplatesServiceImpl {
             }
         }
 
-        Ok(Response::new(ListTemplatesResponse { templates }))
+        Ok(Response::new(ListTemplatesResponse {
+            templates,
+            ..Default::default()
+        }))
     }
 
     async fn get_template(
         &self,
-        request: Request<GetTemplateRequest>,
-    ) -> Result<Response<GetTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetTemplateRequest>,
+    ) -> ServiceResult<GetTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
@@ -336,7 +346,7 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board template", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = row.get("is_global");
         if !is_global {
@@ -347,26 +357,28 @@ impl TemplatesService for TemplatesServiceImpl {
         }
 
         Ok(Response::new(GetTemplateResponse {
-            template: Some(board_template_from_row(&row)),
+            template: Some(board_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn create_template(
         &self,
-        request: Request<CreateTemplateRequest>,
-    ) -> Result<Response<CreateTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateTemplateRequest>,
+    ) -> ServiceResult<CreateTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+            return Err(ConnectError::invalid_argument("name is required"));
         }
 
         // Global templates are read-only in v1.
         if req.project_id.is_empty() {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be created via API",
             ));
         }
@@ -396,18 +408,20 @@ impl TemplatesService for TemplatesServiceImpl {
         .map_err(|e| internal("failed to create board template", e))?;
 
         Ok(Response::new(CreateTemplateResponse {
-            template: Some(board_template_from_row(&row)),
+            template: Some(board_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn update_template(
         &self,
-        request: Request<UpdateTemplateRequest>,
-    ) -> Result<Response<UpdateTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateTemplateRequest>,
+    ) -> ServiceResult<UpdateTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing = sqlx::query(
@@ -418,11 +432,11 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board template for update", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be modified",
             ));
         }
@@ -469,18 +483,20 @@ impl TemplatesService for TemplatesServiceImpl {
         .map_err(|e| internal("failed to update board template", e))?;
 
         Ok(Response::new(UpdateTemplateResponse {
-            template: Some(board_template_from_row(&row)),
+            template: Some(board_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn delete_template(
         &self,
-        request: Request<DeleteTemplateRequest>,
-    ) -> Result<Response<DeleteTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteTemplateRequest>,
+    ) -> ServiceResult<DeleteTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing = sqlx::query(
@@ -491,11 +507,11 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch board template for delete", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be deleted",
             ));
         }
@@ -513,22 +529,23 @@ impl TemplatesService for TemplatesServiceImpl {
             .map_err(|e| internal("failed to delete board template", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("template not found"));
+            return Err(ConnectError::not_found("template not found"));
         }
 
-        Ok(Response::new(DeleteTemplateResponse {}))
+        Ok(Response::new(DeleteTemplateResponse::default()))
     }
 
     // ── Card templates ───────────────────────────────────────────────────────
 
     async fn list_card_templates(
         &self,
-        request: Request<ListCardTemplatesRequest>,
-    ) -> Result<Response<ListCardTemplatesResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListCardTemplatesRequest>,
+    ) -> ServiceResult<ListCardTemplatesResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         let global_rows = sqlx::query(
             "SELECT id, project_id, name, description, title, default_description, \
@@ -553,11 +570,12 @@ impl TemplatesService for TemplatesServiceImpl {
                 .is_ok();
 
             if visible {
+                // Globals are already in the list; only add project-scoped rows.
                 let project_rows = sqlx::query(
                     "SELECT id, project_id, name, description, title, default_description, \
                      label_names, checklist_items, is_global, created_at, updated_at \
                      FROM card_templates \
-                     WHERE tenant_id IN ($1, $2) AND (project_id = $3 OR is_global = true) \
+                     WHERE tenant_id IN ($1, $2) AND project_id = $3 AND is_global = false \
                      ORDER BY name",
                 )
                 .bind(&tenant_id)
@@ -571,17 +589,21 @@ impl TemplatesService for TemplatesServiceImpl {
             }
         }
 
-        Ok(Response::new(ListCardTemplatesResponse { templates }))
+        Ok(Response::new(ListCardTemplatesResponse {
+            templates,
+            ..Default::default()
+        }))
     }
 
     async fn get_card_template(
         &self,
-        request: Request<GetCardTemplateRequest>,
-    ) -> Result<Response<GetCardTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, GetCardTemplateRequest>,
+    ) -> ServiceResult<GetCardTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let row = sqlx::query(
@@ -596,7 +618,7 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card template", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = row.get("is_global");
         if !is_global {
@@ -607,25 +629,27 @@ impl TemplatesService for TemplatesServiceImpl {
         }
 
         Ok(Response::new(GetCardTemplateResponse {
-            template: Some(card_template_from_row(&row)),
+            template: Some(card_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn create_card_template(
         &self,
-        request: Request<CreateCardTemplateRequest>,
-    ) -> Result<Response<CreateCardTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateCardTemplateRequest>,
+    ) -> ServiceResult<CreateCardTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
 
         if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+            return Err(ConnectError::invalid_argument("name is required"));
         }
 
         if req.project_id.is_empty() {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be created via API",
             ));
         }
@@ -662,18 +686,20 @@ impl TemplatesService for TemplatesServiceImpl {
         .map_err(|e| internal("failed to create card template", e))?;
 
         Ok(Response::new(CreateCardTemplateResponse {
-            template: Some(card_template_from_row(&row)),
+            template: Some(card_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn update_card_template(
         &self,
-        request: Request<UpdateCardTemplateRequest>,
-    ) -> Result<Response<UpdateCardTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateCardTemplateRequest>,
+    ) -> ServiceResult<UpdateCardTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing = sqlx::query(
@@ -684,11 +710,11 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card template for update", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be modified",
             ));
         }
@@ -757,18 +783,20 @@ impl TemplatesService for TemplatesServiceImpl {
         .map_err(|e| internal("failed to update card template", e))?;
 
         Ok(Response::new(UpdateCardTemplateResponse {
-            template: Some(card_template_from_row(&row)),
+            template: Some(card_template_from_row(&row)).into(),
+            ..Default::default()
         }))
     }
 
     async fn delete_card_template(
         &self,
-        request: Request<DeleteCardTemplateRequest>,
-    ) -> Result<Response<DeleteCardTemplateResponse>, Status> {
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let permission = tenant_client_for(&self.permission, &request).await?;
-        let req = request.into_inner();
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteCardTemplateRequest>,
+    ) -> ServiceResult<DeleteCardTemplateResponse> {
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let req = request.to_owned_message();
         let template_id = parse_id(&req.template_id, "template_id")?;
 
         let existing = sqlx::query(
@@ -779,11 +807,11 @@ impl TemplatesService for TemplatesServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card template for delete", e))?
-        .ok_or_else(|| Status::not_found("template not found"))?;
+        .ok_or_else(|| ConnectError::not_found("template not found"))?;
 
         let is_global: bool = existing.get("is_global");
         if is_global {
-            return Err(Status::permission_denied(
+            return Err(ConnectError::permission_denied(
                 "global templates cannot be deleted",
             ));
         }
@@ -801,10 +829,10 @@ impl TemplatesService for TemplatesServiceImpl {
             .map_err(|e| internal("failed to delete card template", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("template not found"));
+            return Err(ConnectError::not_found("template not found"));
         }
 
-        Ok(Response::new(DeleteCardTemplateResponse {}))
+        Ok(Response::new(DeleteCardTemplateResponse::default()))
     }
 }
 
@@ -816,7 +844,7 @@ impl TemplatesService for TemplatesServiceImpl {
 mod tests {
     use super::*;
 
-    use crate::test_support::containers;
+    use crate::test_support::{connect_ctx, connect_request, containers};
 
     async fn make_service() -> TemplatesServiceImpl {
         let infra = containers::setup().await;
@@ -826,14 +854,12 @@ mod tests {
         }
     }
 
-    /// Build a request with an authenticated subject in its extensions.
-    fn authed_request<T>(body: T, subject: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut().insert(AuthContext::authenticated(
+    /// Build a request context with an authenticated subject in its extensions.
+    fn authed_ctx(subject: &str) -> RequestContext {
+        connect_ctx(AuthContext::authenticated(
             crate::test_support::test_tenant_id(),
             subject,
-        ));
-        req
+        ))
     }
 
     /// Create a minimal project and grant the test subject manage and view on it.
@@ -906,15 +932,16 @@ mod tests {
         let subject = format!("user:test-{}", Id::new());
 
         let list = svc
-            .list_templates(authed_request(
-                ListTemplatesRequest {
+            .list_templates(
+                authed_ctx(&subject),
+                connect_request(&ListTemplatesRequest {
                     project_id: String::new(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_templates failed")
-            .into_inner();
+            .body;
 
         assert!(
             list.templates
@@ -931,8 +958,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_template(authed_request(
-                CreateTemplateRequest {
+            .create_template(
+                authed_ctx(&subject),
+                connect_request(&CreateTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Sprint Retro".to_string(),
                     description: "Retro columns".to_string(),
@@ -941,20 +969,23 @@ mod tests {
                             title: "What went well".to_string(),
                             position: 0,
                             accent: "green".to_string(),
+                            ..Default::default()
                         },
                         TemplateColumn {
                             title: "What to improve".to_string(),
                             position: 1,
                             accent: "amber".to_string(),
+                            ..Default::default()
                         },
                     ],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert!(!created.id.is_empty());
@@ -965,16 +996,18 @@ mod tests {
         assert_eq!(created.columns[0].title, "What went well");
 
         let fetched = svc
-            .get_template(authed_request(
-                GetTemplateRequest {
+            .get_template(
+                authed_ctx(&subject),
+                connect_request(&GetTemplateRequest {
                     template_id: created.id.clone(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert_eq!(fetched.id, created.id);
@@ -996,8 +1029,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_template(authed_request(
-                CreateTemplateRequest {
+            .create_template(
+                authed_ctx(&subject),
+                connect_request(&CreateTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Project Template".to_string(),
                     description: String::new(),
@@ -1005,26 +1039,29 @@ mod tests {
                         title: "Only".to_string(),
                         position: 0,
                         accent: "blue".to_string(),
+                        ..Default::default()
                     }],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         let list_all = svc
-            .list_templates(authed_request(
-                ListTemplatesRequest {
+            .list_templates(
+                authed_ctx(&subject),
+                connect_request(&ListTemplatesRequest {
                     project_id: project_id.to_string(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_templates failed")
-            .into_inner();
+            .body;
 
         assert!(
             list_all
@@ -1040,17 +1077,26 @@ mod tests {
                 .any(|t| t.id == created.id && !t.is_global),
             "project template should appear"
         );
+        {
+            // Global templates must not be duplicated by the project-scoped arm.
+            let mut ids: Vec<&str> = list_all.templates.iter().map(|t| t.id.as_str()).collect();
+            ids.sort_unstable();
+            let before = ids.len();
+            ids.dedup();
+            assert_eq!(before, ids.len(), "list_templates returned duplicate rows");
+        }
 
         let list_global = svc
-            .list_templates(authed_request(
-                ListTemplatesRequest {
+            .list_templates(
+                authed_ctx(&subject),
+                connect_request(&ListTemplatesRequest {
                     project_id: String::new(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_templates failed")
-            .into_inner();
+            .body;
 
         assert!(
             !list_global.templates.iter().any(|t| t.id == created.id),
@@ -1073,8 +1119,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_template(authed_request(
-                CreateTemplateRequest {
+            .create_template(
+                authed_ctx(&subject),
+                connect_request(&CreateTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Original".to_string(),
                     description: "Original desc".to_string(),
@@ -1082,37 +1129,44 @@ mod tests {
                         title: "Old".to_string(),
                         position: 0,
                         accent: "red".to_string(),
+                        ..Default::default()
                     }],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         let updated = svc
-            .update_template(authed_request(
-                UpdateTemplateRequest {
+            .update_template(
+                authed_ctx(&subject),
+                connect_request(&UpdateTemplateRequest {
                     template_id: created.id.clone(),
-                    update_mask: Some(prost_types::FieldMask {
+                    update_mask: Some(FieldMask {
                         paths: vec!["name".to_string(), "columns".to_string()],
-                    }),
+                        ..Default::default()
+                    })
+                    .into(),
                     name: "Updated".to_string(),
                     description: String::new(),
                     columns: vec![TemplateColumn {
                         title: "New".to_string(),
                         position: 0,
                         accent: "green".to_string(),
+                        ..Default::default()
                     }],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert_eq!(updated.name, "Updated");
@@ -1136,37 +1190,41 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_template(authed_request(
-                CreateTemplateRequest {
+            .create_template(
+                authed_ctx(&subject),
+                connect_request(&CreateTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "To Delete".to_string(),
                     description: String::new(),
                     columns: vec![],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
-        svc.delete_template(authed_request(
-            DeleteTemplateRequest {
+        svc.delete_template(
+            authed_ctx(&subject),
+            connect_request(&DeleteTemplateRequest {
                 template_id: created.id.clone(),
-            },
-            &subject,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete_template failed");
 
         let result = svc
-            .get_template(authed_request(
-                GetTemplateRequest {
+            .get_template(
+                authed_ctx(&subject),
+                connect_request(&GetTemplateRequest {
                     template_id: created.id.clone(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
         assert!(result.is_err(), "deleted template should not be found");
 
@@ -1182,8 +1240,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_card_template(authed_request(
-                CreateCardTemplateRequest {
+            .create_card_template(
+                authed_ctx(&subject),
+                connect_request(&CreateCardTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Bug Card".to_string(),
                     description: "Bug template".to_string(),
@@ -1193,18 +1252,21 @@ mod tests {
                     checklist_items: vec![
                         TemplateChecklistItem {
                             title: "Reproduce".to_string(),
+                            ..Default::default()
                         },
                         TemplateChecklistItem {
                             title: "Fix".to_string(),
+                            ..Default::default()
                         },
                     ],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert!(!created.id.is_empty());
@@ -1214,16 +1276,18 @@ mod tests {
         assert_eq!(created.checklist_items.len(), 2);
 
         let fetched = svc
-            .get_card_template(authed_request(
-                GetCardTemplateRequest {
+            .get_card_template(
+                authed_ctx(&subject),
+                connect_request(&GetCardTemplateRequest {
                     template_id: created.id.clone(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert_eq!(fetched.id, created.id);
@@ -1244,8 +1308,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_card_template(authed_request(
-                CreateCardTemplateRequest {
+            .create_card_template(
+                authed_ctx(&subject),
+                connect_request(&CreateCardTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Task Card".to_string(),
                     description: String::new(),
@@ -1253,25 +1318,27 @@ mod tests {
                     default_description: String::new(),
                     label_names: vec![],
                     checklist_items: vec![],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         let list = svc
-            .list_card_templates(authed_request(
-                ListCardTemplatesRequest {
+            .list_card_templates(
+                authed_ctx(&subject),
+                connect_request(&ListCardTemplatesRequest {
                     project_id: project_id.to_string(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("list_card_templates failed")
-            .into_inner();
+            .body;
 
         assert!(
             list.templates
@@ -1296,8 +1363,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_card_template(authed_request(
-                CreateCardTemplateRequest {
+            .create_card_template(
+                authed_ctx(&subject),
+                connect_request(&CreateCardTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "Original".to_string(),
                     description: "Original desc".to_string(),
@@ -1305,35 +1373,40 @@ mod tests {
                     default_description: "Old body".to_string(),
                     label_names: vec!["old".to_string()],
                     checklist_items: vec![],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         let updated = svc
-            .update_card_template(authed_request(
-                UpdateCardTemplateRequest {
+            .update_card_template(
+                authed_ctx(&subject),
+                connect_request(&UpdateCardTemplateRequest {
                     template_id: created.id.clone(),
-                    update_mask: Some(prost_types::FieldMask {
+                    update_mask: Some(FieldMask {
                         paths: vec!["title".to_string(), "label_names".to_string()],
-                    }),
+                        ..Default::default()
+                    })
+                    .into(),
                     name: String::new(),
                     description: String::new(),
                     title: "New title".to_string(),
                     default_description: String::new(),
                     label_names: vec!["new".to_string()],
                     checklist_items: vec![],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
         assert_eq!(updated.title, "New title");
@@ -1357,8 +1430,9 @@ mod tests {
         let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
 
         let created = svc
-            .create_card_template(authed_request(
-                CreateCardTemplateRequest {
+            .create_card_template(
+                authed_ctx(&subject),
+                connect_request(&CreateCardTemplateRequest {
                     project_id: project_id.to_string(),
                     name: "To Delete".to_string(),
                     description: String::new(),
@@ -1366,31 +1440,34 @@ mod tests {
                     default_description: String::new(),
                     label_names: vec![],
                     checklist_items: vec![],
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("create_card_template failed")
-            .into_inner()
+            .body
             .template
+            .into_option()
             .expect("template missing");
 
-        svc.delete_card_template(authed_request(
-            DeleteCardTemplateRequest {
+        svc.delete_card_template(
+            authed_ctx(&subject),
+            connect_request(&DeleteCardTemplateRequest {
                 template_id: created.id.clone(),
-            },
-            &subject,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete_card_template failed");
 
         let result = svc
-            .get_card_template(authed_request(
-                GetCardTemplateRequest {
+            .get_card_template(
+                authed_ctx(&subject),
+                connect_request(&GetCardTemplateRequest {
                     template_id: created.id.clone(),
-                },
-                &subject,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
         assert!(result.is_err(), "deleted card template should not be found");
 

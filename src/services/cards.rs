@@ -11,30 +11,30 @@
 use std::sync::Arc;
 
 use crate::id::Id;
+use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
-use prost_types::Timestamp;
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_dispatch::CheckedObjectId;
-use crate::pb::card_service_server::CardService;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     AddCardDependencyRequest, AddCardDependencyResponse, AddChecklistItemRequest,
     AddChecklistItemResponse, AddCommentRequest, AddCommentResponse, AssignCardRequest,
     AssignCardResponse, Assignee, BatchGetCardsRequest, BatchGetCardsResponse,
-    BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card, ChecklistItem, Comment,
-    CreateCardRequest, CreateCardResponse, DeleteCardRequest, DeleteCardResponse,
-    DeleteCommentRequest, DeleteCommentResponse, EditCommentRequest, EditCommentResponse,
-    GetCardRequest, GetCardResponse, Label, ListCardsByBoardRequest, ListCardsByBoardResponse,
-    ListCommentsRequest, ListCommentsResponse, MoveCardRequest, MoveCardResponse,
-    RemoveCardDependencyRequest, RemoveCardDependencyResponse, RemoveChecklistItemRequest,
-    RemoveChecklistItemResponse, UnassignCardRequest, UnassignCardResponse, UpdateCardRequest,
-    UpdateCardResponse, UpdateChecklistItemRequest, UpdateChecklistItemResponse,
+    BulkUpdateCardLabelsRequest, BulkUpdateCardLabelsResponse, Card, CardPriority, CardService,
+    CardUrgency, ChecklistItem, Comment, CreateCardRequest, CreateCardResponse, DeleteCardRequest,
+    DeleteCardResponse, DeleteCommentRequest, DeleteCommentResponse, EditCommentRequest,
+    EditCommentResponse, GetCardRequest, GetCardResponse, Label, ListCardsByBoardRequest,
+    ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse, MoveCardRequest,
+    MoveCardResponse, RemoveCardDependencyRequest, RemoveCardDependencyResponse,
+    RemoveChecklistItemRequest, RemoveChecklistItemResponse, UnassignCardRequest,
+    UnassignCardResponse, UpdateCardRequest, UpdateCardResponse, UpdateChecklistItemRequest,
+    UpdateChecklistItemResponse,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -55,41 +55,42 @@ pub(crate) fn to_proto_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+        ..Default::default()
     }
 }
 
-pub(crate) fn opt_to_proto_ts(dt: Option<DateTime<Utc>>) -> Option<Timestamp> {
-    dt.map(to_proto_ts)
+pub(crate) fn opt_to_proto_ts(dt: Option<DateTime<Utc>>) -> buffa::MessageField<Timestamp> {
+    dt.map(to_proto_ts).into()
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
-fn internal(msg: &str, err: impl std::fmt::Display) -> Status {
+fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
-    Status::internal(msg)
+    ConnectError::internal(msg)
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-fn checked_object_id<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn checked_object_id(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<CheckedObjectId>()
         .map(|c| c.0.clone())
-        .ok_or_else(|| Status::internal("missing CheckedObjectId extension"))
+        .ok_or_else(|| ConnectError::internal("missing CheckedObjectId extension"))
 }
 
-fn subject_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn subject_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.subject.clone())
-        .ok_or_else(|| Status::unauthenticated("missing auth context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))
 }
 
-fn tenant_id_from_request<T>(req: &Request<T>) -> Result<String, Status> {
-    req.extensions()
+fn tenant_id_from_request(ctx: &RequestContext) -> Result<String, ConnectError> {
+    ctx.extensions()
         .get::<AuthContext>()
         .and_then(|a| a.tenant_id.clone())
-        .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))
 }
 
 // ── Priority mapping ──────────────────────────────────────────────────────────
@@ -180,7 +181,7 @@ pub(crate) fn card_from_row(
         r#ref: ref_,
         title,
         description: description.unwrap_or_default(),
-        priority: priority_to_i32(priority.as_deref().unwrap_or("medium")),
+        priority: priority_to_i32(priority.as_deref().unwrap_or("medium")).into(),
         due: opt_to_proto_ts(due_date),
         completed_at: opt_to_proto_ts(completed_at),
         blocked,
@@ -194,11 +195,12 @@ pub(crate) fn card_from_row(
         comments_count: aggregates.comments_count,
         attachments_count: aggregates.attachments_count,
         revision: revision as u64,
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
-        urgency: urgency_to_i32(urgency.as_deref().unwrap_or("medium")),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        urgency: urgency_to_i32(urgency.as_deref().unwrap_or("medium")).into(),
         depends_on_card_ids: aggregates.depends_on_card_ids,
         dependent_card_ids: aggregates.dependent_card_ids,
+        ..Default::default()
     }
 }
 
@@ -215,8 +217,9 @@ fn comment_from_row(row: &sqlx::postgres::PgRow) -> Comment {
         card_id: card_id.to_string(),
         author_sub,
         body,
-        created_at: Some(to_proto_ts(created_at)),
-        updated_at: Some(to_proto_ts(updated_at)),
+        created_at: Some(to_proto_ts(created_at)).into(),
+        updated_at: Some(to_proto_ts(updated_at)).into(),
+        ..Default::default()
     }
 }
 
@@ -230,6 +233,7 @@ fn checklist_item_from_row(row: &sqlx::postgres::PgRow) -> ChecklistItem {
         text,
         done,
         position,
+        ..Default::default()
     }
 }
 
@@ -257,6 +261,7 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id, tenant_id: &str) ->
             project_id: pid.to_string(),
             name: r.get("name"),
             style: r.get("style"),
+            ..Default::default()
         }
     })
     .collect()
@@ -274,6 +279,7 @@ pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id, tenant_id: &str)
             subject: r.get("subject"),
             display_name: String::new(),
             avatar_url: String::new(),
+            ..Default::default()
         })
         .collect()
 }
@@ -366,7 +372,11 @@ pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id, tenant_id: &str
 }
 
 /// Load a complete card, including its relationships, by id.
-async fn fetch_full_card(pool: &PgPool, card_id: Id, tenant_id: &str) -> Result<Card, Status> {
+async fn fetch_full_card(
+    pool: &PgPool,
+    card_id: Id,
+    tenant_id: &str,
+) -> Result<Card, ConnectError> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
                 position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
@@ -378,7 +388,7 @@ async fn fetch_full_card(pool: &PgPool, card_id: Id, tenant_id: &str) -> Result<
     .fetch_optional(pool)
     .await
     .map_err(|e| internal("failed to fetch card", e))?
-    .ok_or_else(|| Status::not_found("card not found"))?;
+    .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
     let labels = fetch_labels(pool, card_id, tenant_id).await;
     let assignees = fetch_assignees(pool, card_id, tenant_id).await;
@@ -421,7 +431,7 @@ async fn allocate_card_ref(
     tx: &mut Transaction<'_, Postgres>,
     project_id: Id,
     tenant_id: &str,
-) -> Result<String, Status> {
+) -> Result<String, ConnectError> {
     // Advisory lock scoped to this transaction — serialises per project.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
         .bind(project_id.to_string())
@@ -460,7 +470,7 @@ async fn insert_event_log(
     event_type: &str,
     payload: serde_json::Value,
     card_revision: i64,
-) -> Result<(), Status> {
+) -> Result<(), ConnectError> {
     sqlx::query(
         "INSERT INTO event_log (id, tenant_id, board_id, event_type, payload, created_at)
          VALUES ($1, $2, $3, $4, $5::jsonb, now())",
@@ -490,7 +500,7 @@ async fn check_idempotency_card(
     pool: &PgPool,
     tenant_id: &str,
     key: &str,
-) -> Result<Option<Id>, Status> {
+) -> Result<Option<Id>, ConnectError> {
     if key.is_empty() {
         return Ok(None);
     }
@@ -531,7 +541,7 @@ async fn store_idempotency_card(pool: &PgPool, tenant_id: &str, key: &str, card_
 
 // ── impl CardService ──────────────────────────────────────────────────────────
 
-#[tonic::async_trait]
+#[allow(refining_impl_trait)]
 impl CardService for CardServiceImpl {
     // ── GetCard ───────────────────────────────────────────────────────────────
     //
@@ -540,16 +550,20 @@ impl CardService for CardServiceImpl {
 
     async fn get_card(
         &self,
-        request: Request<GetCardRequest>,
-    ) -> Result<Response<GetCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, GetCardRequest>,
+    ) -> ServiceResult<GetCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
-        Ok(Response::new(GetCardResponse { card: Some(card) }))
+        Ok(Response::new(GetCardResponse {
+            card: Some(card).into(),
+            ..Default::default()
+        }))
     }
 
     // ── BatchGetCards ─────────────────────────────────────────────────────────
@@ -560,17 +574,21 @@ impl CardService for CardServiceImpl {
 
     async fn batch_get_cards(
         &self,
-        request: Request<BatchGetCardsRequest>,
-    ) -> Result<Response<BatchGetCardsResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, BatchGetCardsRequest>,
+    ) -> ServiceResult<BatchGetCardsResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         if req.card_ids.is_empty() {
-            return Ok(Response::new(BatchGetCardsResponse { cards: vec![] }));
+            return Ok(Response::new(BatchGetCardsResponse {
+                cards: vec![],
+                ..Default::default()
+            }));
         }
 
         // Parse card_ids; skip invalid ones rather than erroring.
@@ -620,7 +638,10 @@ impl CardService for CardServiceImpl {
             ));
         }
 
-        Ok(Response::new(BatchGetCardsResponse { cards }))
+        Ok(Response::new(BatchGetCardsResponse {
+            cards,
+            ..Default::default()
+        }))
     }
 
     // ── ListCardsByBoard ──────────────────────────────────────────────────────
@@ -630,15 +651,16 @@ impl CardService for CardServiceImpl {
 
     async fn list_cards_by_board(
         &self,
-        request: Request<ListCardsByBoardRequest>,
-    ) -> Result<Response<ListCardsByBoardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListCardsByBoardRequest>,
+    ) -> ServiceResult<ListCardsByBoardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
         let limit = if limit == 0 {
             DEFAULT_PAGE_LIMIT
@@ -652,7 +674,7 @@ impl CardService for CardServiceImpl {
             Some(
                 req.column_id
                     .parse::<Id>()
-                    .map_err(|_| Status::invalid_argument("invalid column_id"))?,
+                    .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?,
             )
         };
 
@@ -662,7 +684,7 @@ impl CardService for CardServiceImpl {
             Some(
                 req.cursor
                     .parse::<Id>()
-                    .map_err(|_| Status::invalid_argument("invalid cursor"))?,
+                    .map_err(|_| ConnectError::invalid_argument("invalid cursor"))?,
             )
         };
 
@@ -775,6 +797,7 @@ impl CardService for CardServiceImpl {
         Ok(Response::new(ListCardsByBoardResponse {
             cards,
             next_cursor,
+            ..Default::default()
         }))
     }
 
@@ -786,19 +809,20 @@ impl CardService for CardServiceImpl {
 
     async fn create_card(
         &self,
-        request: Request<CreateCardRequest>,
-    ) -> Result<Response<CreateCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateCardRequest>,
+    ) -> ServiceResult<CreateCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.title.is_empty() {
-            return Err(Status::invalid_argument("title is required"));
+            return Err(ConnectError::invalid_argument("title is required"));
         }
 
         // Idempotency check.
@@ -807,7 +831,12 @@ impl CardService for CardServiceImpl {
         {
             return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
-                .map(|card| Response::new(CreateCardResponse { card: Some(card) }));
+                .map(|card| {
+                    Response::new(CreateCardResponse {
+                        card: Some(card).into(),
+                        ..Default::default()
+                    })
+                });
         }
 
         // Verify board exists and get project_id.
@@ -818,7 +847,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch board", e))?
-                .ok_or_else(|| Status::not_found("board not found"))?;
+                .ok_or_else(|| ConnectError::not_found("board not found"))?;
 
         let project_id: Id = board_row.get("project_id");
 
@@ -826,7 +855,7 @@ impl CardService for CardServiceImpl {
         let col_id = req
             .column_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid column_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
 
         let col_row = sqlx::query(
             "SELECT id FROM columns WHERE id = $1 AND board_id = $2 AND tenant_id = $3",
@@ -837,7 +866,7 @@ impl CardService for CardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to verify column", e))?
-        .ok_or_else(|| Status::not_found("column not found on this board"))?;
+        .ok_or_else(|| ConnectError::not_found("column not found on this board"))?;
         let _ = col_row;
 
         // Begin transaction.
@@ -879,10 +908,11 @@ impl CardService for CardServiceImpl {
         };
 
         // Parse optional fields.
-        let priority_str = priority_from_i32(req.priority);
-        let urgency_str = urgency_from_i32(req.urgency);
+        let priority_str = priority_from_i32(req.priority.to_i32());
+        let urgency_str = urgency_from_i32(req.urgency.to_i32());
         let due_date: Option<DateTime<Utc>> = req
             .due
+            .into_option()
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
         let milestone_id: Option<Id> = if req.milestone_id.is_empty() {
             None
@@ -939,7 +969,10 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
-        Ok(Response::new(CreateCardResponse { card: Some(card) }))
+        Ok(Response::new(CreateCardResponse {
+            card: Some(card).into(),
+            ..Default::default()
+        }))
     }
 
     // ── UpdateCard ────────────────────────────────────────────────────────────
@@ -949,16 +982,17 @@ impl CardService for CardServiceImpl {
 
     async fn update_card(
         &self,
-        request: Request<UpdateCardRequest>,
-    ) -> Result<Response<UpdateCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateCardRequest>,
+    ) -> ServiceResult<UpdateCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
-        let patch = req.card.unwrap_or_default();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
+        let patch = req.card.into_option().unwrap_or_default();
 
         // Idempotency check.
         if let Some(_existing) =
@@ -966,7 +1000,12 @@ impl CardService for CardServiceImpl {
         {
             return fetch_full_card(&self.pool, card_id, &tenant_id)
                 .await
-                .map(|card| Response::new(UpdateCardResponse { card: Some(card) }));
+                .map(|card| {
+                    Response::new(UpdateCardResponse {
+                        card: Some(card).into(),
+                        ..Default::default()
+                    })
+                });
         }
 
         // Fetch current card for board_id + revision.
@@ -977,25 +1016,26 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
 
-        let priority_str: Option<&str> = if patch.priority != 0 {
-            Some(priority_from_i32(patch.priority))
+        let priority_str: Option<&str> = if patch.priority != CardPriority::Unspecified {
+            Some(priority_from_i32(patch.priority.to_i32()))
         } else {
             None
         };
 
-        let urgency_str: Option<&str> = if patch.urgency != 0 {
-            Some(urgency_from_i32(patch.urgency))
+        let urgency_str: Option<&str> = if patch.urgency != CardUrgency::Unspecified {
+            Some(urgency_from_i32(patch.urgency.to_i32()))
         } else {
             None
         };
 
         let due_date: Option<DateTime<Utc>> = patch
             .due
+            .into_option()
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
 
         let milestone_id: Option<Id> = if patch.milestone_id.is_empty() {
@@ -1032,7 +1072,7 @@ impl CardService for CardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update card", e))?
-        .ok_or_else(|| Status::not_found("card not found"))?;
+        .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let new_revision: i64 = row.get("revision");
 
@@ -1073,7 +1113,10 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
-        Ok(Response::new(UpdateCardResponse { card: Some(card) }))
+        Ok(Response::new(UpdateCardResponse {
+            card: Some(card).into(),
+            ..Default::default()
+        }))
     }
 
     // ── MoveCard ──────────────────────────────────────────────────────────────
@@ -1085,19 +1128,20 @@ impl CardService for CardServiceImpl {
 
     async fn move_card(
         &self,
-        request: Request<MoveCardRequest>,
-    ) -> Result<Response<MoveCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, MoveCardRequest>,
+    ) -> ServiceResult<MoveCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let to_col_id = req
             .to_column_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid to_column_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid to_column_id"))?;
 
         // Idempotency check.
         if check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key)
@@ -1106,7 +1150,12 @@ impl CardService for CardServiceImpl {
         {
             return fetch_full_card(&self.pool, card_id, &tenant_id)
                 .await
-                .map(|card| Response::new(MoveCardResponse { card: Some(card) }));
+                .map(|card| {
+                    Response::new(MoveCardResponse {
+                        card: Some(card).into(),
+                        ..Default::default()
+                    })
+                });
         }
 
         // Fetch card's current state.
@@ -1118,7 +1167,7 @@ impl CardService for CardServiceImpl {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to fetch card", e))?
-        .ok_or_else(|| Status::not_found("card not found"))?;
+        .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = card_row.get("board_id");
         let from_col_id: Id = card_row.get("column_id");
@@ -1134,7 +1183,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch target column", e))?
-                .ok_or_else(|| Status::not_found("target column not found"))?;
+                .ok_or_else(|| ConnectError::not_found("target column not found"))?;
 
         let target_board_id: Id = target_col_row.get("board_id");
 
@@ -1146,12 +1195,12 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch target board", e))?
-                .ok_or_else(|| Status::not_found("target board not found"))?;
+                .ok_or_else(|| ConnectError::not_found("target board not found"))?;
 
         let target_project_id: Id = target_board_row.get("project_id");
 
         if card_project_id != target_project_id {
-            return Err(Status::invalid_argument(
+            return Err(ConnectError::invalid_argument(
                 "cards do not move between projects",
             ));
         }
@@ -1265,7 +1314,10 @@ impl CardService for CardServiceImpl {
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
-        Ok(Response::new(MoveCardResponse { card: Some(card) }))
+        Ok(Response::new(MoveCardResponse {
+            card: Some(card).into(),
+            ..Default::default()
+        }))
     }
 
     // ── DeleteCard ────────────────────────────────────────────────────────────
@@ -1276,14 +1328,15 @@ impl CardService for CardServiceImpl {
 
     async fn delete_card(
         &self,
-        request: Request<DeleteCardRequest>,
-    ) -> Result<Response<DeleteCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, DeleteCardRequest>,
+    ) -> ServiceResult<DeleteCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
 
         // Fetch board_id + revision before deleting.
         let cur =
@@ -1293,7 +1346,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1312,7 +1365,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to delete card", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("card not found"));
+            return Err(ConnectError::not_found("card not found"));
         }
 
         // event_log: CardDeleted.
@@ -1335,7 +1388,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(DeleteCardResponse {}))
+        Ok(Response::new(DeleteCardResponse::default()))
     }
 
     // ── AddCardDependency ─────────────────────────────────────────────────────
@@ -1347,31 +1400,36 @@ impl CardService for CardServiceImpl {
 
     async fn add_card_dependency(
         &self,
-        request: Request<AddCardDependencyRequest>,
-    ) -> Result<Response<AddCardDependencyResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddCardDependencyRequest>,
+    ) -> ServiceResult<AddCardDependencyResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.idempotency_key.is_empty() {
-            return Err(Status::invalid_argument("idempotency_key is required"));
+            return Err(ConnectError::invalid_argument(
+                "idempotency_key is required",
+            ));
         }
 
         let card_id = req
             .card_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
         let depends_on_id = req
             .depends_on_card_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid depends_on_card_id"))?;
 
         if card_id == depends_on_id {
-            return Err(Status::invalid_argument("a card cannot depend on itself"));
+            return Err(ConnectError::invalid_argument(
+                "a card cannot depend on itself",
+            ));
         }
 
         if let Some(existing_id) =
@@ -1379,7 +1437,12 @@ impl CardService for CardServiceImpl {
         {
             return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
-                .map(|card| Response::new(AddCardDependencyResponse { card: Some(card) }));
+                .map(|card| {
+                    Response::new(AddCardDependencyResponse {
+                        card: Some(card).into(),
+                        ..Default::default()
+                    })
+                });
         }
 
         let mut tx = self
@@ -1399,7 +1462,7 @@ impl CardService for CardServiceImpl {
                 .map_err(|e| internal("failed to verify cards", e))?;
 
         if rows.len() != 2 {
-            return Err(Status::invalid_argument(
+            return Err(ConnectError::invalid_argument(
                 "both cards must belong to the authorized board",
             ));
         }
@@ -1459,7 +1522,8 @@ impl CardService for CardServiceImpl {
 
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(AddCardDependencyResponse {
-            card: Some(card),
+            card: Some(card).into(),
+            ..Default::default()
         }))
     }
 
@@ -1471,35 +1535,43 @@ impl CardService for CardServiceImpl {
 
     async fn remove_card_dependency(
         &self,
-        request: Request<RemoveCardDependencyRequest>,
-    ) -> Result<Response<RemoveCardDependencyResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RemoveCardDependencyRequest>,
+    ) -> ServiceResult<RemoveCardDependencyResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.idempotency_key.is_empty() {
-            return Err(Status::invalid_argument("idempotency_key is required"));
+            return Err(ConnectError::invalid_argument(
+                "idempotency_key is required",
+            ));
         }
 
         let card_id = req
             .card_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
         let depends_on_id = req
             .depends_on_card_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid depends_on_card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid depends_on_card_id"))?;
 
         if let Some(existing_id) =
             check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
         {
             return fetch_full_card(&self.pool, existing_id, &tenant_id)
                 .await
-                .map(|card| Response::new(RemoveCardDependencyResponse { card: Some(card) }));
+                .map(|card| {
+                    Response::new(RemoveCardDependencyResponse {
+                        card: Some(card).into(),
+                        ..Default::default()
+                    })
+                });
         }
 
         let mut tx = self
@@ -1522,7 +1594,7 @@ impl CardService for CardServiceImpl {
         let prev_revision = match card_row {
             Some(row) => row.get::<i64, _>("revision"),
             None => {
-                return Err(Status::invalid_argument(
+                return Err(ConnectError::invalid_argument(
                     "card does not belong to the authorized board",
                 ));
             }
@@ -1538,7 +1610,7 @@ impl CardService for CardServiceImpl {
                 .map_err(|e| internal("failed to verify dependency card", e))?;
 
         if depends_row.is_none() {
-            return Err(Status::invalid_argument(
+            return Err(ConnectError::invalid_argument(
                 "dependency card does not belong to the authorized board",
             ));
         }
@@ -1593,7 +1665,8 @@ impl CardService for CardServiceImpl {
 
         let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
         Ok(Response::new(RemoveCardDependencyResponse {
-            card: Some(card),
+            card: Some(card).into(),
+            ..Default::default()
         }))
     }
 
@@ -1606,19 +1679,21 @@ impl CardService for CardServiceImpl {
 
     async fn bulk_update_card_labels(
         &self,
-        request: Request<BulkUpdateCardLabelsRequest>,
-    ) -> Result<Response<BulkUpdateCardLabelsResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, BulkUpdateCardLabelsRequest>,
+    ) -> ServiceResult<BulkUpdateCardLabelsResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let board_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid board_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.card_ids.is_empty() {
             return Ok(Response::new(BulkUpdateCardLabelsResponse {
                 cards: vec![],
+                ..Default::default()
             }));
         }
 
@@ -1646,7 +1721,10 @@ impl CardService for CardServiceImpl {
                     cards.push(c);
                 }
             }
-            return Ok(Response::new(BulkUpdateCardLabelsResponse { cards }));
+            return Ok(Response::new(BulkUpdateCardLabelsResponse {
+                cards,
+                ..Default::default()
+            }));
         }
 
         let mut tx = self
@@ -1670,7 +1748,7 @@ impl CardService for CardServiceImpl {
                     .map(|r| r.get::<bool, _>(0))?;
 
             if !exists {
-                return Err(Status::invalid_argument(format!(
+                return Err(ConnectError::invalid_argument(format!(
                     "card {} does not belong to board {}",
                     cid, board_id
                 )));
@@ -1741,7 +1819,10 @@ impl CardService for CardServiceImpl {
             cards.push(fetch_full_card(&self.pool, cid, &tenant_id).await?);
         }
 
-        Ok(Response::new(BulkUpdateCardLabelsResponse { cards }))
+        Ok(Response::new(BulkUpdateCardLabelsResponse {
+            cards,
+            ..Default::default()
+        }))
     }
 
     // ── AssignCard ────────────────────────────────────────────────────────────
@@ -1752,17 +1833,18 @@ impl CardService for CardServiceImpl {
 
     async fn assign_card(
         &self,
-        request: Request<AssignCardRequest>,
-    ) -> Result<Response<AssignCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AssignCardRequest>,
+    ) -> ServiceResult<AssignCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         if req.subject.is_empty() {
-            return Err(Status::invalid_argument("subject is required"));
+            return Err(ConnectError::invalid_argument("subject is required"));
         }
 
         let cur =
@@ -1772,7 +1854,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1827,7 +1909,12 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
-            .map(|card| Response::new(AssignCardResponse { card: Some(card) }))
+            .map(|card| {
+                Response::new(AssignCardResponse {
+                    card: Some(card).into(),
+                    ..Default::default()
+                })
+            })
     }
 
     // ── UnassignCard ──────────────────────────────────────────────────────────
@@ -1837,15 +1924,16 @@ impl CardService for CardServiceImpl {
 
     async fn unassign_card(
         &self,
-        request: Request<UnassignCardRequest>,
-    ) -> Result<Response<UnassignCardResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UnassignCardRequest>,
+    ) -> ServiceResult<UnassignCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -1854,7 +1942,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -1909,7 +1997,12 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
-            .map(|card| Response::new(UnassignCardResponse { card: Some(card) }))
+            .map(|card| {
+                Response::new(UnassignCardResponse {
+                    card: Some(card).into(),
+                    ..Default::default()
+                })
+            })
     }
 
     // ── AddChecklistItem ──────────────────────────────────────────────────────
@@ -1920,17 +2013,18 @@ impl CardService for CardServiceImpl {
 
     async fn add_checklist_item(
         &self,
-        request: Request<AddChecklistItemRequest>,
-    ) -> Result<Response<AddChecklistItemResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddChecklistItemRequest>,
+    ) -> ServiceResult<AddChecklistItemResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         if req.text.is_empty() {
-            return Err(Status::invalid_argument("text is required"));
+            return Err(ConnectError::invalid_argument("text is required"));
         }
 
         let cur =
@@ -1940,7 +2034,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2027,7 +2121,12 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
-            .map(|card| Response::new(AddChecklistItemResponse { card: Some(card) }))
+            .map(|card| {
+                Response::new(AddChecklistItemResponse {
+                    card: Some(card).into(),
+                    ..Default::default()
+                })
+            })
     }
 
     // ── UpdateChecklistItem ───────────────────────────────────────────────────
@@ -2038,20 +2137,21 @@ impl CardService for CardServiceImpl {
 
     async fn update_checklist_item(
         &self,
-        request: Request<UpdateChecklistItemRequest>,
-    ) -> Result<Response<UpdateChecklistItemResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateChecklistItemRequest>,
+    ) -> ServiceResult<UpdateChecklistItemResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let item_id = req
             .item_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid item_id"))?;
-        let patch = req.item.unwrap_or_default();
+            .map_err(|_| ConnectError::invalid_argument("invalid item_id"))?;
+        let patch = req.item.into_option().unwrap_or_default();
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -2060,7 +2160,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2088,7 +2188,9 @@ impl CardService for CardServiceImpl {
         .map_err(|e| internal("failed to update checklist item", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("checklist item not found on this card"));
+            return Err(ConnectError::not_found(
+                "checklist item not found on this card",
+            ));
         }
 
         let rev_row = sqlx::query(
@@ -2125,7 +2227,12 @@ impl CardService for CardServiceImpl {
 
         fetch_full_card(&self.pool, card_id, &tenant_id)
             .await
-            .map(|card| Response::new(UpdateChecklistItemResponse { card: Some(card) }))
+            .map(|card| {
+                Response::new(UpdateChecklistItemResponse {
+                    card: Some(card).into(),
+                    ..Default::default()
+                })
+            })
     }
 
     // ── RemoveChecklistItem ───────────────────────────────────────────────────
@@ -2135,19 +2242,20 @@ impl CardService for CardServiceImpl {
 
     async fn remove_checklist_item(
         &self,
-        request: Request<RemoveChecklistItemRequest>,
-    ) -> Result<Response<RemoveChecklistItemResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, RemoveChecklistItemRequest>,
+    ) -> ServiceResult<RemoveChecklistItemResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let item_id = req
             .item_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid item_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid item_id"))?;
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -2156,7 +2264,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2178,7 +2286,9 @@ impl CardService for CardServiceImpl {
         .map_err(|e| internal("failed to remove checklist item", e))?;
 
         if result.rows_affected() == 0 {
-            return Err(Status::not_found("checklist item not found on this card"));
+            return Err(ConnectError::not_found(
+                "checklist item not found on this card",
+            ));
         }
 
         let rev_row = sqlx::query(
@@ -2213,7 +2323,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(RemoveChecklistItemResponse {}))
+        Ok(Response::new(RemoveChecklistItemResponse::default()))
     }
 
     // ── AddComment ────────────────────────────────────────────────────────────
@@ -2223,19 +2333,20 @@ impl CardService for CardServiceImpl {
 
     async fn add_comment(
         &self,
-        request: Request<AddCommentRequest>,
-    ) -> Result<Response<AddCommentResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, AddCommentRequest>,
+    ) -> ServiceResult<AddCommentResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
 
         if req.body.is_empty() {
-            return Err(Status::invalid_argument("body is required"));
+            return Err(ConnectError::invalid_argument("body is required"));
         }
 
         // Idempotency.
@@ -2266,7 +2377,8 @@ impl CardService for CardServiceImpl {
                     .map_err(|e| internal("failed to fetch cached comment", e))?;
                     if let Some(r) = comment_row {
                         return Ok(Response::new(AddCommentResponse {
-                            comment: Some(comment_from_row(&r)),
+                            comment: Some(comment_from_row(&r)).into(),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -2280,7 +2392,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2357,7 +2469,8 @@ impl CardService for CardServiceImpl {
         }
 
         Ok(Response::new(AddCommentResponse {
-            comment: Some(comment_from_row(&comment_row)),
+            comment: Some(comment_from_row(&comment_row)).into(),
+            ..Default::default()
         }))
     }
 
@@ -2369,23 +2482,24 @@ impl CardService for CardServiceImpl {
 
     async fn edit_comment(
         &self,
-        request: Request<EditCommentRequest>,
-    ) -> Result<Response<EditCommentResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, EditCommentRequest>,
+    ) -> ServiceResult<EditCommentResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let comment_id = req
             .comment_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid comment_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid comment_id"))?;
 
         if req.body.is_empty() {
-            return Err(Status::invalid_argument("body is required"));
+            return Err(ConnectError::invalid_argument("body is required"));
         }
 
         let cur =
@@ -2395,7 +2509,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2419,7 +2533,9 @@ impl CardService for CardServiceImpl {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to edit comment", e))?
-        .ok_or_else(|| Status::permission_denied("comment not found or not authored by you"))?;
+        .ok_or_else(|| {
+            ConnectError::permission_denied("comment not found or not authored by you")
+        })?;
 
         let rev_row = sqlx::query(
             "UPDATE cards SET revision = revision + 1, updated_at = now() \
@@ -2454,7 +2570,8 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(EditCommentResponse {
-            comment: Some(comment_from_row(&comment_row)),
+            comment: Some(comment_from_row(&comment_row)).into(),
+            ..Default::default()
         }))
     }
 
@@ -2469,20 +2586,21 @@ impl CardService for CardServiceImpl {
 
     async fn delete_comment(
         &self,
-        request: Request<DeleteCommentRequest>,
-    ) -> Result<Response<DeleteCommentResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteCommentRequest>,
+    ) -> ServiceResult<DeleteCommentResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let subject = subject_from_request(&request)?;
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let subject = subject_from_request(&ctx)?;
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let comment_id = req
             .comment_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid comment_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid comment_id"))?;
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -2491,7 +2609,7 @@ impl CardService for CardServiceImpl {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| Status::not_found("card not found"))?;
+                .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
         let prev_revision: i64 = cur.get("revision");
@@ -2527,7 +2645,7 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to delete comment (admin path)", e))?;
 
             if result2.rows_affected() == 0 {
-                return Err(Status::not_found("comment not found on this card"));
+                return Err(ConnectError::not_found("comment not found on this card"));
             }
         }
 
@@ -2563,7 +2681,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        Ok(Response::new(DeleteCommentResponse {}))
+        Ok(Response::new(DeleteCommentResponse::default()))
     }
 
     // ── ListComments ──────────────────────────────────────────────────────────
@@ -2573,15 +2691,16 @@ impl CardService for CardServiceImpl {
 
     async fn list_comments(
         &self,
-        request: Request<ListCommentsRequest>,
-    ) -> Result<Response<ListCommentsResponse>, Status> {
-        let object_id = checked_object_id(&request)?;
+        ctx: RequestContext,
+        request: ServiceRequest<'_, ListCommentsRequest>,
+    ) -> ServiceResult<ListCommentsResponse> {
+        let object_id = checked_object_id(&ctx)?;
         let card_id = object_id
             .parse::<Id>()
-            .map_err(|_| Status::invalid_argument("invalid card_id"))?;
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
-        let tenant_id = tenant_id_from_request(&request)?;
-        let req = request.into_inner();
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
         let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
         let limit = if limit == 0 {
             DEFAULT_PAGE_LIMIT
@@ -2595,7 +2714,7 @@ impl CardService for CardServiceImpl {
             Some(
                 req.cursor
                     .parse::<Id>()
-                    .map_err(|_| Status::invalid_argument("invalid cursor"))?,
+                    .map_err(|_| ConnectError::invalid_argument("invalid cursor"))?,
             )
         };
 
@@ -2609,7 +2728,7 @@ impl CardService for CardServiceImpl {
                 .map_err(|e| internal("failed to verify card", e))
                 .map(|r| r.get::<bool, _>(0))?;
         if !exists {
-            return Err(Status::not_found("card not found"));
+            return Err(ConnectError::not_found("card not found"));
         }
 
         let rows = if let Some(after) = cursor_id {
@@ -2661,6 +2780,7 @@ impl CardService for CardServiceImpl {
         Ok(Response::new(ListCommentsResponse {
             comments,
             next_cursor,
+            ..Default::default()
         }))
     }
 }
@@ -2672,7 +2792,8 @@ impl CardService for CardServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost_types::FieldMask;
+    use crate::test_support::{connect_ctx, connect_request};
+    use buffa_types::google::protobuf::FieldMask;
     use sunbeam_g2v::middleware::auth::AuthContext;
 
     // ── Setup helpers ────────────────────────────────────────────────────────
@@ -2689,34 +2810,32 @@ mod tests {
         CardServiceImpl { pool, permission }
     }
 
-    fn authed_request<T>(body: T, subject: &str) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut().insert(AuthContext::authenticated(
+    /// Create an authenticated context that only carries the caller subject.
+    fn authed_ctx(subject: &str) -> RequestContext {
+        connect_ctx(AuthContext::authenticated(
             crate::test_support::test_tenant_id(),
             subject,
-        ));
-        req
+        ))
     }
 
-    fn authed_request_with_object<T>(body: T, subject: &str, object_id: &str) -> Request<T> {
-        let mut req = authed_request(body, subject);
-        req.extensions_mut()
+    /// Create an authenticated context that also carries a `CheckedObjectId`.
+    fn authed_ctx_with_object(subject: &str, object_id: &str) -> RequestContext {
+        let mut ctx = authed_ctx(subject);
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
-    fn authed_request_with_object_for_tenant<T>(
-        body: T,
+    /// Same, but with an explicit tenant id in the auth context.
+    fn authed_ctx_with_object_for_tenant(
         tenant_id: &str,
         subject: &str,
         object_id: &str,
-    ) -> Request<T> {
-        let mut req = Request::new(body);
-        req.extensions_mut()
-            .insert(AuthContext::authenticated(tenant_id.to_string(), subject));
-        req.extensions_mut()
+    ) -> RequestContext {
+        let mut ctx = connect_ctx(AuthContext::authenticated(tenant_id.to_string(), subject));
+        ctx.extensions_mut()
             .insert(CheckedObjectId(object_id.to_string()));
-        req
+        ctx
     }
 
     // ── Seed helpers ─────────────────────────────────────────────────────────
@@ -2823,57 +2942,57 @@ mod tests {
         let ikey = |n: u8| format!("ikey-{}-{}", Id::new(), n);
 
         let c1 = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Card One".to_string(),
                     idempotency_key: ikey(1),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create 1 failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let c2 = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Card Two".to_string(),
                     idempotency_key: ikey(2),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create 2 failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let c3 = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Card Three".to_string(),
                     idempotency_key: ikey(3),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create 3 failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(c1.r#ref, "REF-001", "first card ref");
@@ -2899,39 +3018,39 @@ mod tests {
         let col_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let ca = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid_a.to_string(),
                     column_id: col_a.to_string(),
                     title: "Alpha card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid_a.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create alpha failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let cb = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_b.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid_b.to_string(),
                     column_id: col_b.to_string(),
                     title: "Beta card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid_b.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create beta failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(ca.r#ref, "ALPHA-001");
@@ -2967,38 +3086,39 @@ mod tests {
         .unwrap();
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: col_a.to_string(),
                     title: "Moving card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let moved = svc
-            .move_card(authed_request_with_object(
-                MoveCardRequest {
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
                     card_id: card.id.clone(),
                     to_column_id: col_b_id.to_string(),
                     to_position: 1,
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("move failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(
@@ -3027,40 +3147,40 @@ mod tests {
         let col_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid_a.to_string(),
                     column_id: col_a.to_string(),
                     title: "Cross-project card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid_a.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let result = svc
-            .move_card(authed_request_with_object(
-                MoveCardRequest {
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
                     card_id: card.id.clone(),
                     to_column_id: col_b.to_string(),
                     to_position: 1,
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         assert!(result.is_err());
         assert_eq!(
-            result.unwrap_err().code(),
-            tonic::Code::InvalidArgument,
+            result.unwrap_err().code,
+            connectrpc::ErrorCode::InvalidArgument,
             "cross-project move must return InvalidArgument"
         );
 
@@ -3091,56 +3211,58 @@ mod tests {
         .unwrap();
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: col_a.to_string(),
                     title: "Idempotent move".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let move_key = Id::new().to_string();
         let first = svc
-            .move_card(authed_request_with_object(
-                MoveCardRequest {
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
                     card_id: card.id.clone(),
                     to_column_id: col_b_id.to_string(),
                     to_position: 1,
                     idempotency_key: move_key.clone(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("first move failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let second = svc
-            .move_card(authed_request_with_object(
-                MoveCardRequest {
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
                     card_id: card.id.clone(),
                     to_column_id: col_b_id.to_string(),
                     to_position: 1,
                     idempotency_key: move_key.clone(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("second move (replay) failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(
@@ -3164,43 +3286,45 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Original".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_id = card.id.parse::<Id>().unwrap();
 
         let updated = svc
-            .update_card(authed_request_with_object(
-                UpdateCardRequest {
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
                     card_id: card.id.clone(),
                     card: Some(Card {
                         title: "Updated Title".to_string(),
                         ..Default::default()
-                    }),
-                    update_mask: None,
+                    })
+                    .into(),
+                    update_mask: None.into(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(updated.title, "Updated Title");
@@ -3235,34 +3359,34 @@ mod tests {
         let label_id = seed_label(&pool, pid, &tenant_id, "bug").await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "To Delete".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_id = card.id.parse::<Id>().unwrap();
 
         // Add assignee, label, checklist item, comment.
-        svc.assign_card(authed_request_with_object(
-            AssignCardRequest {
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
                 subject: subject.clone(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("assign failed");
 
@@ -3273,38 +3397,37 @@ mod tests {
             .await
             .unwrap();
 
-        svc.add_checklist_item(authed_request_with_object(
-            AddChecklistItemRequest {
+        svc.add_checklist_item(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AddChecklistItemRequest {
                 card_id: card.id.clone(),
                 text: "step 1".to_string(),
                 ..Default::default()
-            },
-            &subject,
-            &card.id,
-        ))
+            }),
+        )
         .await
         .expect("add checklist failed");
 
-        svc.add_comment(authed_request_with_object(
-            AddCommentRequest {
+        svc.add_comment(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AddCommentRequest {
                 card_id: card.id.clone(),
                 body: "hello".to_string(),
                 idempotency_key: Id::new().to_string(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add comment failed");
 
         // Delete.
-        svc.delete_card(authed_request_with_object(
-            DeleteCardRequest {
+        svc.delete_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&DeleteCardRequest {
                 card_id: card.id.clone(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("delete failed");
 
@@ -3343,54 +3466,54 @@ mod tests {
         let label_id = seed_label(&pool, pid, &tenant_id, "feature").await;
 
         let card1 = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "C1".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("c1 create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card2 = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "C2".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("c2 create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let resp = svc
-            .bulk_update_card_labels(authed_request_with_object(
-                BulkUpdateCardLabelsRequest {
+            .bulk_update_card_labels(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&BulkUpdateCardLabelsRequest {
                     card_ids: vec![card1.id.clone(), card2.id.clone()],
                     label_ids: vec![label_id.to_string()],
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("bulk update failed")
-            .into_inner();
+            .body;
 
         assert_eq!(resp.cards.len(), 2, "two cards returned");
         for c in &resp.cards {
@@ -3427,43 +3550,43 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Assign me".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         // Assign twice — should not duplicate.
-        svc.assign_card(authed_request_with_object(
-            AssignCardRequest {
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
                 subject: subject.clone(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("assign 1 failed");
 
-        svc.assign_card(authed_request_with_object(
-            AssignCardRequest {
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
                 subject: subject.clone(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("assign 2 failed");
 
@@ -3488,34 +3611,34 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         for text in &["Step A", "Step B", "Step C"] {
-            svc.add_checklist_item(authed_request_with_object(
-                AddChecklistItemRequest {
+            svc.add_checklist_item(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&AddChecklistItemRequest {
                     card_id: card.id.clone(),
                     text: text.to_string(),
                     position: 0,
                     idempotency_key: String::new(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add checklist failed");
         }
@@ -3550,55 +3673,57 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Comment card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let comment = svc
-            .add_comment(authed_request_with_object(
-                AddCommentRequest {
+            .add_comment(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&AddCommentRequest {
                     card_id: card.id.clone(),
                     body: "original body".to_string(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add comment failed")
-            .into_inner()
+            .body
             .comment
+            .into_option()
             .expect("comment missing");
 
         assert_eq!(comment.body, "original body");
 
         let edited = svc
-            .edit_comment(authed_request_with_object(
-                EditCommentRequest {
+            .edit_comment(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&EditCommentRequest {
                     card_id: card.id.clone(),
                     comment_id: comment.id.clone(),
                     body: "edited body".to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("edit comment failed")
-            .into_inner()
+            .body
             .comment
+            .into_option()
             .expect("comment missing");
 
         assert_eq!(edited.body, "edited body");
@@ -3636,37 +3761,38 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&author, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Auth card".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &author,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let comment = svc
-            .add_comment(authed_request_with_object(
-                AddCommentRequest {
+            .add_comment(
+                authed_ctx_with_object(&author, &card.id),
+                connect_request(&AddCommentRequest {
                     card_id: card.id.clone(),
                     body: "author comment".to_string(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &author,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add comment failed")
-            .into_inner()
+            .body
             .comment
+            .into_option()
             .expect("comment missing");
 
         // `other` tries to delete — they are not author AND the permission backend (already checked by middleware)
@@ -3682,14 +3808,14 @@ mod tests {
         // Pure non-admin rejection is enforced at the permission layer (before this handler);
         // that path is tested in permission_dispatch tests. Here we verify the SQL behaviour:
         let result = svc
-            .delete_comment(authed_request_with_object(
-                DeleteCommentRequest {
+            .delete_comment(
+                authed_ctx_with_object(&other, &card.id),
+                connect_request(&DeleteCommentRequest {
                     card_id: card.id.clone(),
                     comment_id: comment.id.clone(),
-                },
-                &other,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await;
 
         // With edit relation granted (CheckedObjectId present), the admin fallback deletes.
@@ -3725,35 +3851,36 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Get me".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let fetched = svc
-            .get_card(authed_request_with_object(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&GetCardRequest {
                     card_id: card.id.clone(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(fetched.id, card.id);
@@ -3775,37 +3902,36 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Get me".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         // Same object id, but auth context claims a different tenant.
         let err = svc
-            .get_card(authed_request_with_object_for_tenant(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object_for_tenant("other-tenant", &subject, &card.id),
+                connect_request(&GetCardRequest {
                     card_id: card.id.clone(),
-                },
-                "other-tenant",
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
 
         cleanup_project(&pool, pid).await;
     }
@@ -3823,35 +3949,35 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Batch".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let resp = svc
-            .batch_get_cards(authed_request_with_object(
-                BatchGetCardsRequest {
+            .batch_get_cards(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&BatchGetCardsRequest {
                     board_id: bid.to_string(),
                     card_ids: vec![card.id.clone(), Id::new().to_string()],
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner();
+            .body;
 
         assert_eq!(resp.cards.len(), 1);
         assert_eq!(resp.cards[0].id, card.id);
@@ -3872,35 +3998,34 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         for i in 0..3 {
-            svc.create_card(authed_request_with_object(
-                CreateCardRequest {
+            svc.create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: format!("Card {i}"),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap();
         }
 
         let resp = svc
-            .list_cards_by_board(authed_request_with_object(
-                ListCardsByBoardRequest {
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
                     board_id: bid.to_string(),
                     column_id: String::new(),
                     limit: 2,
                     cursor: String::new(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner();
+            .body;
 
         assert_eq!(resp.cards.len(), 2);
         assert!(!resp.next_cursor.is_empty(), "expected next cursor");
@@ -3921,47 +4046,48 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Assigned".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        svc.assign_card(authed_request_with_object(
-            AssignCardRequest {
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
                 subject: "user:alice".to_string(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
 
         let updated = svc
-            .unassign_card(authed_request_with_object(
-                UnassignCardRequest {
+            .unassign_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UnassignCardRequest {
                     card_id: card.id.clone(),
                     subject: "user:alice".to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert!(
@@ -3985,62 +4111,66 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let item = svc
-            .add_checklist_item(authed_request_with_object(
-                AddChecklistItemRequest {
+            .add_checklist_item(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&AddChecklistItemRequest {
                     card_id: card.id.clone(),
                     text: "step".to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &card.id,
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let item_id = item.checklist.first().unwrap().id.clone();
 
         let updated = svc
-            .update_checklist_item(authed_request_with_object(
-                UpdateChecklistItemRequest {
+            .update_checklist_item(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateChecklistItemRequest {
                     card_id: card.id.clone(),
                     item_id: item_id.clone(),
                     item: Some(ChecklistItem {
                         text: "done step".to_string(),
                         done: true,
                         ..Default::default()
-                    }),
+                    })
+                    .into(),
                     update_mask: Some(FieldMask {
                         paths: vec!["text".to_string(), "done".to_string()],
-                    }),
-                },
-                &subject,
-                &card.id,
-            ))
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let updated_item = updated
@@ -4067,64 +4197,65 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Checklist".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let item = svc
-            .add_checklist_item(authed_request_with_object(
-                AddChecklistItemRequest {
+            .add_checklist_item(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&AddChecklistItemRequest {
                     card_id: card.id.clone(),
                     text: "step".to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &card.id,
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let item_id = item.checklist.first().unwrap().id.clone();
 
-        svc.remove_checklist_item(authed_request_with_object(
-            RemoveChecklistItemRequest {
+        svc.remove_checklist_item(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&RemoveChecklistItemRequest {
                 card_id: card.id.clone(),
                 item_id: item_id.clone(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
 
         let fetched = svc
-            .get_card(authed_request_with_object(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&GetCardRequest {
                     card_id: card.id.clone(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert!(
@@ -4148,48 +4279,48 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Comments".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .unwrap()
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        svc.add_comment(authed_request_with_object(
-            AddCommentRequest {
+        svc.add_comment(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&AddCommentRequest {
                 card_id: card.id.clone(),
                 body: "first".to_string(),
                 idempotency_key: Id::new().to_string(),
-            },
-            &subject,
-            &card.id,
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
 
         let resp = svc
-            .list_comments(authed_request_with_object(
-                ListCommentsRequest {
+            .list_comments(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&ListCommentsRequest {
                     card_id: card.id.clone(),
                     limit: 10,
                     cursor: String::new(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .into_inner();
+            .body;
 
         assert_eq!(resp.comments.len(), 1);
         assert_eq!(resp.comments[0].body, "first");
@@ -4210,40 +4341,49 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Urgent".to_string(),
-                    urgency: 4, // critical
+                    urgency: CardUrgency::Critical.into(), // critical
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        assert_eq!(card.urgency, 4, "created urgency should be critical");
+        assert_eq!(
+            card.urgency,
+            CardUrgency::Critical,
+            "created urgency should be critical"
+        );
 
         let fetched = svc
-            .get_card(authed_request_with_object(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&GetCardRequest {
                     card_id: card.id.clone(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
-        assert_eq!(fetched.urgency, 4, "fetched urgency should be critical");
+        assert_eq!(
+            fetched.urgency,
+            CardUrgency::Critical,
+            "fetched urgency should be critical"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -4261,24 +4401,28 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Default urgency".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        assert_eq!(card.urgency, 2, "default urgency should be medium");
+        assert_eq!(
+            card.urgency,
+            CardUrgency::Medium,
+            "default urgency should be medium"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -4296,44 +4440,50 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Update urgency".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let updated = svc
-            .update_card(authed_request_with_object(
-                UpdateCardRequest {
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
                     card_id: card.id.clone(),
                     card: Some(Card {
-                        urgency: 3, // high
+                        urgency: CardUrgency::High.into(), // high
                         ..Default::default()
-                    }),
-                    update_mask: None,
+                    })
+                    .into(),
+                    update_mask: None.into(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &card.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("update failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        assert_eq!(updated.urgency, 3, "updated urgency should be high");
+        assert_eq!(
+            updated.urgency,
+            CardUrgency::High,
+            "updated urgency should be high"
+        );
         assert!(updated.revision > card.revision, "revision should bump");
 
         cleanup_project(&pool, pid).await;
@@ -4352,25 +4502,29 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Priority enum".to_string(),
-                    priority: 3, // high
+                    priority: CardPriority::High.into(), // high
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        assert_eq!(card.priority, 3, "priority should round-trip");
+        assert_eq!(
+            card.priority,
+            CardPriority::High,
+            "priority should round-trip"
+        );
 
         cleanup_project(&pool, pid).await;
     }
@@ -4388,71 +4542,73 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create a failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_b = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let dep = svc
-            .add_card_dependency(authed_request_with_object(
-                AddCardDependencyRequest {
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add dependency failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(dep.depends_on_card_ids, vec![card_b.id.clone()]);
 
         let b = svc
-            .get_card(authed_request_with_object(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object(&subject, &card_b.id),
+                connect_request(&GetCardRequest {
                     card_id: card_b.id.clone(),
-                },
-                &subject,
-                &card_b.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
         assert_eq!(b.dependent_card_ids, vec![card_a.id.clone()]);
 
@@ -4472,83 +4628,85 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create a failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_b = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
-        svc.add_card_dependency(authed_request_with_object(
-            AddCardDependencyRequest {
+        svc.add_card_dependency(
+            authed_ctx_with_object(&subject, &bid.to_string()),
+            connect_request(&AddCardDependencyRequest {
                 card_id: card_a.id.clone(),
                 depends_on_card_id: card_b.id.clone(),
                 idempotency_key: Id::new().to_string(),
-            },
-            &subject,
-            &bid.to_string(),
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add dependency failed");
 
         let removed = svc
-            .remove_card_dependency(authed_request_with_object(
-                RemoveCardDependencyRequest {
+            .remove_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&RemoveCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("remove dependency failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert!(removed.depends_on_card_ids.is_empty());
 
         let b = svc
-            .get_card(authed_request_with_object(
-                GetCardRequest {
+            .get_card(
+                authed_ctx_with_object(&subject, &card_b.id),
+                connect_request(&GetCardRequest {
                     card_id: card_b.id.clone(),
-                },
-                &subject,
-                &card_b.id,
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("get b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
         assert!(b.dependent_card_ids.is_empty());
 
@@ -4568,37 +4726,37 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "Self".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let err = svc
-            .add_card_dependency(authed_request_with_object(
-                AddCardDependencyRequest {
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&AddCardDependencyRequest {
                     card_id: card.id.clone(),
                     depends_on_card_id: card.id.clone(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect_err("self dependency should fail");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
 
         cleanup_project(&pool, pid).await;
     }
@@ -4618,55 +4776,55 @@ mod tests {
         let cid_b = seed_column(&pool, bid_b, &tenant_id).await;
 
         let card_a = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid_a.to_string(),
                     column_id: cid_a.to_string(),
                     title: "A".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid_a.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create a failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_b = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_b.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid_b.to_string(),
                     column_id: cid_b.to_string(),
                     title: "B".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid_b.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let err = svc
-            .add_card_dependency(authed_request_with_object(
-                AddCardDependencyRequest {
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid_a.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect_err("cross-board dependency should fail");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
 
         cleanup_project(&pool, pid).await;
     }
@@ -4684,68 +4842,69 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create a failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_b = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let key = Id::new().to_string();
-        svc.add_card_dependency(authed_request_with_object(
-            AddCardDependencyRequest {
+        svc.add_card_dependency(
+            authed_ctx_with_object(&subject, &bid.to_string()),
+            connect_request(&AddCardDependencyRequest {
                 card_id: card_a.id.clone(),
                 depends_on_card_id: card_b.id.clone(),
                 idempotency_key: key.clone(),
-            },
-            &subject,
-            &bid.to_string(),
-        ))
+                ..Default::default()
+            }),
+        )
         .await
         .expect("add 1 failed");
 
         let replay = svc
-            .add_card_dependency(authed_request_with_object(
-                AddCardDependencyRequest {
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: key.clone(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add replay failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         assert_eq!(replay.depends_on_card_ids, vec![card_b.id.clone()]);
@@ -4766,55 +4925,56 @@ mod tests {
         let cid = seed_column(&pool, bid, &tenant_id).await;
 
         let card_a = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "A".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create a failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let card_b = svc
-            .create_card(authed_request_with_object(
-                CreateCardRequest {
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
                     board_id: bid.to_string(),
                     column_id: cid.to_string(),
                     title: "B".to_string(),
                     idempotency_key: Id::new().to_string(),
                     ..Default::default()
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                }),
+            )
             .await
             .expect("create b failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing");
 
         let add_rev = svc
-            .add_card_dependency(authed_request_with_object(
-                AddCardDependencyRequest {
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&AddCardDependencyRequest {
                     card_id: card_a.id.clone(),
                     depends_on_card_id: card_b.id.clone(),
                     idempotency_key: Id::new().to_string(),
-                },
-                &subject,
-                &bid.to_string(),
-            ))
+                    ..Default::default()
+                }),
+            )
             .await
             .expect("add failed")
-            .into_inner()
+            .body
             .card
+            .into_option()
             .expect("card missing")
             .revision;
 

@@ -281,10 +281,7 @@ mod tests {
         let (addr, _handle) = start_mock_introspection_server(move |_| {
             let n = attempts_clone.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    json!({"error": "invalid_token"}),
-                )
+                (StatusCode::UNAUTHORIZED, json!({"error": "invalid_token"}))
             } else {
                 (
                     StatusCode::OK,
@@ -311,10 +308,7 @@ mod tests {
     #[tokio::test]
     async fn to_session_rejects_persistent_401() {
         let (addr, _handle) = start_mock_introspection_server(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "invalid_token"}),
-            )
+            (StatusCode::UNAUTHORIZED, json!({"error": "invalid_token"}))
         })
         .await;
 
@@ -380,19 +374,21 @@ mod tests {
             )
             .route(
                 "/oauth2/introspect",
-                post(|headers: HeaderMap, Form(form): Form<IntrospectForm>| async move {
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    assert_eq!(auth, "Bearer service-access-token");
-                    assert_eq!(form.token, "end-user-token");
-                    Json(json!({
-                        "active": true,
-                        "sub": "user:test",
-                        "tenant_id": "tenant-42",
-                    }))
-                }),
+                post(
+                    |headers: HeaderMap, Form(form): Form<IntrospectForm>| async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        assert_eq!(auth, "Bearer service-access-token");
+                        assert_eq!(form.token, "end-user-token");
+                        Json(json!({
+                            "active": true,
+                            "sub": "user:test",
+                            "tenant_id": "tenant-42",
+                        }))
+                    },
+                ),
             );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,14 +488,9 @@ mod tests {
             .await
             .expect("introspection against the real gateway should succeed");
 
-        assert_eq!(
-            session["tenant_id"],
-            crate::test_support::test_tenant_id()
-        );
+        assert_eq!(session["tenant_id"], crate::test_support::test_tenant_id());
         assert!(
-            session["sub"]
-                .as_str()
-                .is_some_and(|sub| !sub.is_empty()),
+            session["sub"].as_str().is_some_and(|sub| !sub.is_empty()),
             "introspected session must carry a subject"
         );
     }

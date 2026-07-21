@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 [package]
 name = "kanban"
-version = "2026.7.1"
+version = "2026.7.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/sunbeamdotpt/kanban"
@@ -42,8 +42,6 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
 parking_lot = "0.12"
 prometheus = "0.14"
-prost = "0.14"
-prost-types = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -53,8 +51,6 @@ sunbeam-g2v = { version = "0.5.2", features = ["client-connectrpc"] }
 connectrpc = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tonic = "0.14"
-tonic-prost = "0.14"
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic", "cors"] }
 tracing = "0.1"
@@ -64,9 +60,6 @@ ulid = { version = "1.2", features = ["serde"] }
 url = "2"
 
 [dev-dependencies]
-# Pinned to an immutable rev because no tag yet contains the OpenFGA
-# permission-backend orchestration (feat eb26009). Cut a tag and switch back
-# to `tag = "..."` when one is available.
 sdk = { git = "https://github.com/sunbeamdotpt/sdk", tag = "v3.0.0", default-features = false, features = ["testing"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "nats", "minio"] }
@@ -74,7 +67,6 @@ futures = "0.3"
 
 [build-dependencies]
 connectrpc-build = "0.7"
-tonic-prost-build = "0.14"
 
 [workspace]
 members = ["."]

@@ -58,10 +58,10 @@ use std::time::Duration;
 
 use crate::id::Id;
 use anyhow::{Context, Result};
+use buffa::Message;
+use buffa_types::google::protobuf::Timestamp;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use prost::Message;
-use prost_types::Timestamp;
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
@@ -69,7 +69,7 @@ use tracing::{error, info, warn};
 use sunbeam_g2v::mq::NatsClient;
 
 use super::jetstream_bootstrap::board_subject;
-use crate::pb::{
+use crate::cpb::sunbeam::kanban::v1::{
     BoardEventEnvelope, CardCreated, CardDeleted, CardMoved, CardUpdated,
     board_event_envelope::Payload,
 };
@@ -323,7 +323,9 @@ fn build_envelope(
     let emitted_at = Some(Timestamp {
         seconds: created_at.timestamp(),
         nanos: created_at.timestamp_subsec_nanos() as i32,
-    });
+        ..Default::default()
+    })
+    .into();
 
     // Build the oneof payload from the JSONB fields.
     //
@@ -350,6 +352,7 @@ fn build_envelope(
             .unwrap_or("system")
             .to_string(),
         payload,
+        ..Default::default()
     }
 }
 
@@ -373,8 +376,8 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
             // TODO(4d.5): hydrate the full Card proto from the payload JSON.
             // For now we emit the minimal variant with just the card_id
             // embedded in an empty Card so consumers can dedupe by event_id.
-            Some(Payload::CardCreated(CardCreated {
-                card: None,
+            Some(Payload::CardCreated(Box::new(CardCreated {
+                card: None.into(),
                 column_id: json
                     .get("column_id")
                     .and_then(|v| v.as_str())
@@ -382,7 +385,8 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                     .to_string(),
                 position: json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 idempotency_key,
-            }))
+                ..Default::default()
+            })))
         }
         "CardUpdated" => {
             let prev_revision = json
@@ -393,13 +397,14 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 .get("new_revision")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            Some(Payload::CardUpdated(CardUpdated {
+            Some(Payload::CardUpdated(Box::new(CardUpdated {
                 card_id,
                 prev_revision,
                 new_revision,
-                patch: None, // TODO(4d.5): map JSONB diff to google.protobuf.Struct
+                patch: None.into(), // TODO(4d.5): map JSONB diff to google.protobuf.Struct
                 idempotency_key,
-            }))
+                ..Default::default()
+            })))
         }
         "CardMoved" => {
             let prev_revision = json
@@ -421,7 +426,7 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 .unwrap_or_default()
                 .to_string();
             let to_position = json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            Some(Payload::CardMoved(CardMoved {
+            Some(Payload::CardMoved(Box::new(CardMoved {
                 card_id,
                 from_column,
                 to_column,
@@ -429,18 +434,20 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 prev_revision,
                 new_revision,
                 idempotency_key,
-            }))
+                ..Default::default()
+            })))
         }
         "CardDeleted" => {
             let prev_revision = json
                 .get("prev_revision")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            Some(Payload::CardDeleted(CardDeleted {
+            Some(Payload::CardDeleted(Box::new(CardDeleted {
                 card_id,
                 prev_revision,
                 idempotency_key,
-            }))
+                ..Default::default()
+            })))
         }
         // ColumnAdded, ColumnRenamed, ColumnRemoved, BoardRenamed, MembershipChanged:
         // TODO(4d.5): map these event types. They require Column/BoardRenamed
@@ -768,7 +775,7 @@ mod tests {
         assert_eq!(env.board_id, board_id.to_string());
         assert_eq!(env.event_id, row_id.to_string());
         assert_eq!(env.actor_subject, "user:alice");
-        assert!(env.emitted_at.is_some());
+        assert!(env.emitted_at.is_set());
     }
 
     #[test]
