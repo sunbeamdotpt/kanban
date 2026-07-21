@@ -37,6 +37,15 @@ it in [log.md](log.md). Verify against the repo before trusting an entry.
   containers + `docker network prune -f`. Proper fix: explicit teardown at
   process exit.
 
+## Cascades skip event_log
+
+- `RemoveColumn` (and `DeleteBoard`) cascade-delete cards via FK without
+  writing `CardDeleted` rows to `event_log`. Consequences: the outbox never
+  publishes deletes for those cards, their `KanbanCard` permission tuples
+  linger, and their OpenSearch documents stay in the index (visible in search
+  until the tuple/doc drift is reconciled). The planned reconciler (Stage 7a)
+  is the intended fix; alternatively issue per-card deletes in the handler.
+
 ## Small debt
 
 - Untracked coverage artifacts at repo root (`coverage.lcov`,

@@ -6,6 +6,19 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.3] - 2026-07-21
+
+### Fixed
+
+- **Card permissions:** `CreateCard` now writes the `KanbanCard:{id}#parent@KanbanBoard:{board_id}` tuple the authorization model expects, so card-scoped RPCs no longer return 403 for everyone. `DeleteCard` removes the card's tuples, and cross-board `MoveCard` re-homes the parent tuple (and the card's `board_id`, which previously stayed behind). A `backfill_card_parent_tuples` system migration repairs existing cards at boot.
+- **Card refs:** `CreateProject` now persists the `prefix` column it previously only echoed back from the slug, so new cards mint `TRI-001`-style refs instead of `-001`. Migration `0027_projects_prefix_backfill` repairs existing projects.
+- **Search indexing:** card events flowing through the outbox dispatcher are now mirrored into OpenSearch (create/update/move index the document, delete removes it), and a `backfill_opensearch_cards` system migration indexes all existing cards. Previously nothing fed the index, so `SearchCards` always returned zero hits.
+- `AddMember` rejects free-form subject strings; subjects must be typed ids (`user:<id>` or `agent:<id>`).
+
+### Known issues
+
+- `RemoveColumn`/`DeleteBoard` cascade-delete cards via FK without emitting `CardDeleted` events; those cards' permission tuples and search documents linger until a reconciler lands (see `.maintainer/known-issues.md`).
+
 ## [2026.07.2] - 2026-07-20
 
 ### Changed
@@ -168,6 +181,7 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
+[2026.07.3]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.3
 [2026.07.2]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.2
 [2026.07.1]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.1
 [2026.07.0]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.0

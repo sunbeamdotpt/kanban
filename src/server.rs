@@ -600,6 +600,15 @@ pub async fn run_with_config(
     // Stable pod identity used by the outbox dispatcher and NATS consumers.
     let pod_id = config.pod_name.unwrap_or_else(|| Id::new().to_string());
 
+    // ── 4c. OpenSearch client (search service + outbox indexing) ──────────────
+    let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig {
+        url: config.opensearch_url.clone(),
+    }));
+    info!(
+        "OpenSearch client initialised (url={})",
+        config.opensearch_url
+    );
+
     // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
     // Drains undispatched event_log rows to NATS JetStream at 250ms poll
     // cadence. Hold the handle so the task is not immediately dropped.
@@ -612,6 +621,10 @@ pub async fn run_with_config(
             batch_size: config.outbox_batch_size,
             pod_name: pod_id.clone(),
         },
+    )
+    .with_opensearch(
+        Arc::clone(&opensearch_client),
+        config.opensearch_index_name.clone(),
     )
     .spawn();
 
@@ -657,15 +670,6 @@ pub async fn run_with_config(
         bucket: config.s3_bucket.clone(),
     }));
     info!("S3 client initialised (endpoint={})", s3_endpoint);
-
-    // ── 8b. OpenSearch client for SearchService ─────────────────────────────
-    let opensearch_client = Arc::new(OpenSearchClient::new(OpenSearchConfig {
-        url: config.opensearch_url.clone(),
-    }));
-    info!(
-        "OpenSearch client initialised (url={})",
-        config.opensearch_url
-    );
 
     // ── Build Connect-RPC router (sunbeam-g2v serving stack) ─────────────────
     let connect_router = connectrpc::Router::new();

@@ -45,11 +45,11 @@ Only the `kanban` server binary is included in the runtime image. The `permissio
 
 ## Release workflow and versioning
 
-Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.1`). The patch field counts releases within the month and resets to `0` on the first release of each new month. Pushing a tag matching `v*` triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR. The workflow can also be triggered manually from the Actions tab.
+Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.3`). The patch field counts releases within the month and resets to `0` on the first release of each new month. Pushing a tag matching `v*` triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR. The workflow can also be triggered manually from the Actions tab.
 
 Each release publishes multiple tags so deployments can choose their pinning level:
 
-- `v2026.07.1` — the exact release.
+- `v2026.07.3` — the exact release.
 - `v2026.07` — floats to the latest release in the month.
 - `v2026` — floats to the latest release in the year.
 - `latest` — floats to the most recent non-prerelease tag.

@@ -19,6 +19,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
+use crate::auth::permission_retry::PermissionRetryExt;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
 use crate::auth::permission_dispatch::CheckedObjectId;
@@ -41,12 +42,32 @@ use crate::cpb::sunbeam::kanban::v1::{
 
 const DEFAULT_PAGE_LIMIT: i32 = 50;
 const MAX_PAGE_LIMIT: i32 = 200;
+const PERMISSION_TYPE_CARD: &str = "KanbanCard";
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
 pub struct CardServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
+}
+
+// ── Permission helpers ─────────────────────────────────────────────────────────
+
+/// Extract the caller's tenant from the auth context and derive a permission
+/// client scoped to that tenant's store.
+async fn tenant_client_for(
+    permission: &PermissionClient,
+    ctx: &RequestContext,
+) -> Result<PermissionClient, ConnectError> {
+    let tenant = ctx
+        .extensions()
+        .get::<AuthContext>()
+        .and_then(|a| a.tenant_id.clone())
+        .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
+    permission
+        .tenant_client(&tenant)
+        .await
+        .map_err(|e| internal("failed to build tenant permission client", e))
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
@@ -965,6 +986,27 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
+        // Write the permission parent tuple so card access inherits from the
+        // board: KanbanCard:{card_id}#parent@KanbanBoard:{board_id}.
+        // Best-effort; the reconciler catches drift.
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        if let Err(e) = permission
+            .grant_with_retry(
+                PERMISSION_TYPE_CARD,
+                &card_id.to_string(),
+                "parent",
+                &format!("KanbanBoard:{board_id}"),
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                card_id = %card_id,
+                board_id = %board_id,
+                "mirror_drift: failed to write parent tuple to the permission backend for card; reconciler will catch"
+            );
+        }
+
         // Store idempotency.
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
@@ -1271,14 +1313,16 @@ impl CardService for CardServiceImpl {
             .map_err(|e| internal("failed to open target slot", e))?;
         }
 
-        // Place card at new position.
+        // Place card at new position. A cross-board move (same project) also
+        // re-homes the card's board_id.
         let new_revision_row = sqlx::query(
-            "UPDATE cards SET column_id = $2, position = $3, revision = revision + 1, \
+            "UPDATE cards SET column_id = $2, board_id = $3, position = $4, revision = revision + 1, \
                               updated_at = now() \
-             WHERE id = $1 AND tenant_id = $4 RETURNING revision",
+             WHERE id = $1 AND tenant_id = $5 RETURNING revision",
         )
         .bind(card_id)
         .bind(to_col_id)
+        .bind(target_board_id)
         .bind(to_pos)
         .bind(&tenant_id)
         .fetch_one(&mut *tx)
@@ -1310,6 +1354,43 @@ impl CardService for CardServiceImpl {
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
+
+        // A cross-board move re-homes the permission parent tuple so access
+        // follows the target board. Best-effort; the reconciler catches drift.
+        if target_board_id != board_id {
+            let permission = tenant_client_for(&self.permission, &ctx).await?;
+            if let Err(e) = permission
+                .delete_relation_tuples(
+                    PERMISSION_TYPE_CARD,
+                    Some(card_id.to_string()),
+                    Some("parent".to_string()),
+                    Some(format!("KanbanBoard:{board_id}")),
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    card_id = %card_id,
+                    "mirror_drift: failed to delete old parent tuple on cross-board move"
+                );
+            }
+            if let Err(e) = permission
+                .grant_with_retry(
+                    PERMISSION_TYPE_CARD,
+                    &card_id.to_string(),
+                    "parent",
+                    &format!("KanbanBoard:{target_board_id}"),
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    card_id = %card_id,
+                    target_board_id = %target_board_id,
+                    "mirror_drift: failed to write new parent tuple on cross-board move"
+                );
+            }
+        }
 
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
@@ -1387,6 +1468,20 @@ impl CardService for CardServiceImpl {
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
+
+        // Delete the card's permission tuples (object-scoped). Best-effort;
+        // the reconciler catches drift.
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        if let Err(e) = permission
+            .delete_relation_tuples(PERMISSION_TYPE_CARD, Some(card_id.to_string()), None, None)
+            .await
+        {
+            warn!(
+                error = %e,
+                card_id = %card_id,
+                "mirror_drift: failed to delete permission tuples for deleted card; reconciler will catch"
+            );
+        }
 
         Ok(Response::new(DeleteCardResponse::default()))
     }
@@ -4989,6 +5084,203 @@ mod tests {
         .unwrap()
         .get(0);
         assert_eq!(event_count, 1, "CardUpdated should be written");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    // ── Permission tuple regression tests ─────────────────────────────────────
+
+    /// CreateCard must write KanbanCard:{id}#parent@KanbanBoard:{board_id} so
+    /// card-scoped permission checks inherit board access.
+    #[tokio::test]
+    async fn create_card_writes_parent_tuple() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let viewer = format!("user:test-viewer-{}", Id::new());
+        let outsider = format!("user:test-outsider-{}", Id::new());
+        let pid = seed_project(&pool, &owner, "PTU").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        permission
+            .grant_with_retry("KanbanBoard", &bid.to_string(), "viewer", &viewer)
+            .await
+            .expect("grant board viewer failed");
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&owner, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Tuple Card".to_string(),
+                    idempotency_key: format!("ikey-{}", Id::new()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_card failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert!(
+            permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &viewer)
+                .await
+                .unwrap_or(false),
+            "board viewer must inherit card view via the parent tuple"
+        );
+        assert!(
+            !permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &outsider)
+                .await
+                .unwrap_or(false),
+            "subject without board access must not view the card"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// DeleteCard must remove the card's permission tuples.
+    #[tokio::test]
+    async fn delete_card_removes_tuples() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let viewer = format!("user:test-viewer-{}", Id::new());
+        let pid = seed_project(&pool, &owner, "PTD").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        permission
+            .grant_with_retry("KanbanBoard", &bid.to_string(), "viewer", &viewer)
+            .await
+            .expect("grant board viewer failed");
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&owner, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Delete Tuple Card".to_string(),
+                    idempotency_key: format!("ikey-{}", Id::new()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_card failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        svc.delete_card(
+            authed_ctx_with_object(&owner, &card.id),
+            connect_request(&DeleteCardRequest::default()),
+        )
+        .await
+        .expect("delete_card failed");
+
+        assert!(
+            !permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &viewer)
+                .await
+                .unwrap_or(false),
+            "card tuples must be gone after delete"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// A cross-board move (same project) must re-home the card's board_id and
+    /// its permission parent tuple.
+    #[tokio::test]
+    async fn move_card_across_boards_updates_parent_tuple() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let viewer = format!("user:test-viewer-{}", Id::new());
+        let pid = seed_project(&pool, &owner, "PTM").await;
+        let board_a = seed_board(&pool, pid, &tenant_id).await;
+        let board_b = seed_board(&pool, pid, &tenant_id).await;
+        let col_a = seed_column(&pool, board_a, &tenant_id).await;
+        let col_b = seed_column(&pool, board_b, &tenant_id).await;
+
+        // The viewer can only see board B.
+        permission
+            .grant_with_retry("KanbanBoard", &board_b.to_string(), "viewer", &viewer)
+            .await
+            .expect("grant board viewer failed");
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&owner, &board_a.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: board_a.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Move Tuple Card".to_string(),
+                    idempotency_key: format!("ikey-{}", Id::new()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_card failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert!(
+            !permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &viewer)
+                .await
+                .unwrap_or(false),
+            "viewer of board B must not see the card while it lives on board A"
+        );
+
+        svc.move_card(
+            authed_ctx_with_object(&owner, &card.id),
+            connect_request(&MoveCardRequest {
+                card_id: card.id.clone(),
+                to_column_id: col_b.to_string(),
+                to_position: 1,
+                idempotency_key: format!("ikey-{}", Id::new()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("move_card failed");
+
+        let moved_board: Id = sqlx::query_scalar("SELECT board_id FROM cards WHERE id = $1")
+            .bind(card.id.parse::<Id>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("fetch moved card board_id");
+        assert_eq!(
+            moved_board, board_b,
+            "board_id must follow the target board"
+        );
+
+        assert!(
+            permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &viewer)
+                .await
+                .unwrap_or(false),
+            "viewer of board B must see the card after the move"
+        );
 
         cleanup_project(&pool, pid).await;
     }

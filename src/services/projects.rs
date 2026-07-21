@@ -120,10 +120,16 @@ fn project_from_row(row: &sqlx::postgres::PgRow, member_count: i32) -> Project {
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
 
+    let prefix: String = row
+        .try_get::<String, _>("prefix")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| slug.chars().take(4).collect::<String>().to_uppercase());
+
     Project {
         id: id.to_string(),
         name,
-        prefix: slug.to_uppercase(),
+        prefix,
         icon: String::new(),
         color: String::new(),
         description: description.unwrap_or_default(),
@@ -201,7 +207,7 @@ impl ProjectService for ProjectServiceImpl {
 
             if let Some(Some(project_id)) = cached_id {
                 let row = sqlx::query(
-                    "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
+                    "SELECT id, name, slug, prefix, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
                 )
                 .bind(&tenant_id)
                 .bind(project_id)
@@ -237,13 +243,22 @@ impl ProjectService for ProjectServiceImpl {
             req.prefix.to_uppercase()
         };
 
+        // Card refs are minted as `{prefix}-{seq}`; without an explicit prefix
+        // fall back to the first 4 slug chars (same convention as migration
+        // 0019's backfill).
+        let prefix = if req.prefix.is_empty() {
+            slug.chars().take(4).collect::<String>()
+        } else {
+            req.prefix.to_uppercase()
+        };
+
         let project_id = Id::new();
 
         // INSERT project.
         let row = sqlx::query(
             r#"
-            INSERT INTO projects (id, tenant_id, name, slug, description, owner_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO projects (id, tenant_id, name, slug, description, owner_id, prefix)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, name, slug, description, owner_id, created_at, updated_at
             "#,
         )
@@ -253,6 +268,7 @@ impl ProjectService for ProjectServiceImpl {
         .bind(&slug)
         .bind(&req.description)
         .bind(&subject)
+        .bind(&prefix)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -331,7 +347,7 @@ impl ProjectService for ProjectServiceImpl {
             .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
 
         let row = sqlx::query(
-            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
+            "SELECT id, name, slug, prefix, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = $2",
         )
         .bind(&tenant_id)
         .bind(project_id)
@@ -383,7 +399,7 @@ impl ProjectService for ProjectServiceImpl {
             .collect();
 
         let rows = sqlx::query(
-            "SELECT id, name, slug, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = ANY($2)",
+            "SELECT id, name, slug, prefix, description, owner_id, created_at, updated_at FROM projects WHERE tenant_id = $1 AND id = ANY($2)",
         )
         .bind(&tenant_id)
         .bind(&ids as &[Id])
@@ -503,6 +519,18 @@ impl ProjectService for ProjectServiceImpl {
 
         if req.subject.is_empty() {
             return Err(ConnectError::invalid_argument("subject is required"));
+        }
+        // Subjects are typed ids (`user:<id>` / `agent:<id>`) — the OpenFGA
+        // model only relates those types. Reject free-form strings so typos
+        // don't create unreachable tuples.
+        let subject_valid = req
+            .subject
+            .split_once(':')
+            .is_some_and(|(kind, id)| matches!(kind, "user" | "agent") && !id.is_empty());
+        if !subject_valid {
+            return Err(ConnectError::invalid_argument(
+                "subject must be of the form user:<id> or agent:<id>",
+            ));
         }
         if req.relation.is_empty() {
             return Err(ConnectError::invalid_argument("relation is required"));
@@ -840,6 +868,14 @@ mod tests {
         assert_eq!(fetched.name, created.name);
         assert_eq!(fetched.prefix, created.prefix);
         assert_eq!(fetched.description, created.description);
+
+        // The prefix must be persisted (card refs are minted from it).
+        let stored_prefix: String = sqlx::query_scalar("SELECT prefix FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch stored prefix");
+        assert_eq!(stored_prefix, "TPA");
 
         // Cleanup
         cleanup_project(&pool, &test_tenant_id(), project_id).await;
@@ -1334,6 +1370,58 @@ mod tests {
         }
         cleanup_permission_for_subject(&permission, &owner).await;
         cleanup_permission_for_subject(&permission, &member).await;
+    }
+
+    /// AddMember must reject free-form subject strings (typed ids only).
+    #[tokio::test]
+    async fn add_member_rejects_invalid_subject_format() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let created = svc
+            .create_project(
+                authed_ctx(&owner),
+                connect_request(&CreateProjectRequest {
+                    name: "Subject Validation".to_string(),
+                    prefix: "SVL".to_string(),
+                    icon: String::new(),
+                    color: String::new(),
+                    description: String::new(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .project
+            .into_option()
+            .expect("project missing");
+
+        for bad in ["not-a-subject", "group:admins", "user:", ":", ""] {
+            let err = svc
+                .add_member(
+                    authed_ctx_with_object(&owner, &created.id),
+                    connect_request(&AddMemberRequest {
+                        project_id: created.id.clone(),
+                        subject: bad.to_string(),
+                        relation: "viewer".to_string(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect_err("invalid subject must be rejected");
+            assert_eq!(
+                err.code,
+                connectrpc::ErrorCode::InvalidArgument,
+                "subject {bad:?}"
+            );
+        }
+
+        cleanup_project(&pool, &test_tenant_id(), created.id.parse::<Id>().unwrap()).await;
+        cleanup_permission_for_subject(&permission, &owner).await;
     }
 
     /// Re-adding a member with a different role must not leave a stale tuple

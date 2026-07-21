@@ -7,6 +7,7 @@
 
 pub mod context;
 pub mod migration;
+pub mod migrations;
 pub mod registry;
 pub mod runner;
 

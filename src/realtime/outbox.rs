@@ -73,6 +73,7 @@ use crate::cpb::sunbeam::kanban::v1::{
     BoardEventEnvelope, CardCreated, CardDeleted, CardMoved, CardUpdated,
     board_event_envelope::Payload,
 };
+use crate::integrations::opensearch::OpenSearchClient;
 
 // ── OutboxConfig ─────────────────────────────────────────────────────────────
 
@@ -110,6 +111,9 @@ pub struct OutboxDispatcher {
     batch_size: i64,
     /// Pod identity embedded in every emitted envelope.
     pod_name: String,
+    /// Search-index write target: the OpenSearch client and the cards index
+    /// name. `None` disables indexing (unit tests).
+    opensearch: Option<(Arc<OpenSearchClient>, String)>,
     /// Test-only board scope. `None` in production drains every undispatched
     /// row; `Some(board_id)` restricts to one board so concurrent integration
     /// tests don't eat each other's rows.
@@ -126,9 +130,23 @@ impl OutboxDispatcher {
             poll_interval: config.poll_interval,
             batch_size: config.batch_size,
             pod_name: config.pod_name,
+            opensearch: None,
             #[cfg(test)]
             board_filter: None,
         }
+    }
+
+    /// Enable search indexing: card events are mirrored into the OpenSearch
+    /// cards index as they are dispatched.
+    pub fn with_opensearch(
+        mut self,
+        opensearch: Arc<OpenSearchClient>,
+        index_name: String,
+    ) -> Self {
+        // Ensure the index exists before the drain loop starts. Best-effort:
+        // a failure here only means the first index writes may fail and log.
+        self.opensearch = Some((opensearch, index_name));
+        self
     }
 
     /// Restrict drain to a single board. Test-only — production drains every
@@ -167,6 +185,11 @@ impl OutboxDispatcher {
                 self.poll_interval.as_millis(),
                 self.batch_size
             );
+            if let Some((os, index)) = &self.opensearch
+                && let Err(e) = crate::search_indexing::ensure_cards_index(os, index).await
+            {
+                error!(error = %e, "outbox: failed to ensure search index; indexing will retry per event");
+            }
             loop {
                 match self.drain_once().await {
                     Ok(n) if n > 0 => {
@@ -199,7 +222,7 @@ impl OutboxDispatcher {
         let board_filter: Option<Id> = None;
 
         let rows = sqlx::query(
-            "SELECT id, board_id, aggregated_board_id, event_type, payload, created_at \
+            "SELECT id, tenant_id, board_id, aggregated_board_id, event_type, payload, created_at \
              FROM event_log \
              WHERE nats_seq IS NULL \
                AND ($2::text IS NULL OR board_id = $2 OR aggregated_board_id = $2) \
@@ -282,6 +305,32 @@ impl OutboxDispatcher {
             {
                 Ok(_) => {
                     dispatched += 1;
+
+                    // Step 6: keep the search index in sync for card events.
+                    // The card id rides in the payload; indexing failures are
+                    // logged inside the helpers and never block dispatch.
+                    if let Some((os, index)) = &self.opensearch {
+                        let tenant_id: String = row.get("tenant_id");
+                        let card_id = payload_json
+                            .get("card_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<Id>().ok());
+                        if let Some(card_id) = card_id {
+                            match event_type.as_str() {
+                                "CardCreated" | "CardUpdated" | "CardMoved" => {
+                                    crate::search_indexing::index_card_by_id(
+                                        os, index, &self.pool, card_id, &tenant_id,
+                                    )
+                                    .await;
+                                }
+                                "CardDeleted" => {
+                                    crate::search_indexing::delete_card_doc(os, index, card_id)
+                                        .await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -510,6 +559,88 @@ mod tests {
             .bind(project_id)
             .execute(pool)
             .await;
+    }
+
+    // ── Search indexing hook ─────────────────────────────────────────────────
+
+    /// Card events must be mirrored into OpenSearch: CardCreated/Updated/Moved
+    /// index the document, CardDeleted removes it.
+    #[tokio::test]
+    async fn drain_once_mirrors_card_events_into_opensearch() {
+        use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
+
+        let pool = setup_pool().await;
+        let nats = setup_nats().await;
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("stream bootstrap failed");
+
+        let (project_id, board_id, _col_id, card_id) = seed_card_chain(&pool).await;
+
+        let os = Arc::new(OpenSearchClient::new(OpenSearchConfig::from_env()));
+        let index = format!("kanban-cards-test-{}", Id::new().to_string().to_lowercase());
+        os.create_cards_index(&index).await.expect("create index");
+
+        async fn insert_event(
+            pool: &PgPool,
+            tenant_id: &str,
+            board_id: Id,
+            card_id: Id,
+            event_type: &str,
+        ) {
+            sqlx::query(
+                "INSERT INTO event_log (id, tenant_id, board_id, event_type, payload, created_at) \
+                 VALUES ($1, $2, $3, $4, $5::jsonb, now())",
+            )
+            .bind(Id::new())
+            .bind(tenant_id)
+            .bind(board_id)
+            .bind(event_type)
+            .bind(serde_json::json!({"card_id": card_id.to_string()}))
+            .execute(pool)
+            .await
+            .expect("insert event_log failed");
+        }
+
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .with_opensearch(Arc::clone(&os), index.clone());
+
+        // CardCreated → document indexed.
+        insert_event(&pool, &tenant_id, board_id, card_id, "CardCreated").await;
+        let n = dispatcher.drain_once().await.expect("drain_once failed");
+        assert_eq!(n, 1);
+        os.refresh(&index).await.expect("refresh");
+
+        let hits = os
+            .search(&index, &serde_json::json!({"query": {"match_all": {}}}))
+            .await
+            .expect("search failed")
+            .expect("results expected");
+        assert_eq!(hits.hits.hits.len(), 1, "card should be indexed");
+        assert_eq!(hits.hits.hits[0].source.id, card_id.to_string());
+        assert_eq!(hits.hits.hits[0].source.title, "test-card");
+
+        // CardDeleted → document removed.
+        insert_event(&pool, &tenant_id, board_id, card_id, "CardDeleted").await;
+        let n = dispatcher.drain_once().await.expect("drain_once failed");
+        assert_eq!(n, 1);
+        os.refresh(&index).await.expect("refresh");
+
+        let hits = os
+            .search(&index, &serde_json::json!({"query": {"match_all": {}}}))
+            .await
+            .expect("search failed");
+        let count = hits.map(|h| h.hits.hits.len()).unwrap_or(0);
+        assert_eq!(count, 0, "card document should be deleted");
+
+        // Cleanup.
+        let _ = os.delete_index(&index).await;
+        cleanup(&pool, board_id, project_id).await;
     }
 
     // ── drain_once_publishes_new_rows_and_marks_them ──────────────────────────

@@ -18,6 +18,7 @@ pub mod iam_proto;
 pub mod id;
 pub mod integrations;
 pub mod realtime;
+pub mod search_indexing;
 pub mod server;
 pub mod services;
 pub mod system_migrations;
