@@ -58,6 +58,7 @@ The sso-gateway base URL (permission API, token endpoint, readiness proxy) is no
 | Variable | Flag | Default | Purpose |
 | --- | --- | --- | --- |
 | `S3_ENDPOINT` | `--s3-endpoint` | — | S3-compatible endpoint. Required for attachments. |
+| `S3_PUBLIC_ENDPOINT` | `--s3-public-endpoint` | — | Optional public endpoint used only for presigned URLs. Set when `S3_ENDPOINT` is cluster-internal so browsers receive reachable URLs. |
 | `S3_REGION` | `--s3-region` | `us-east-1` | S3 region. |
 | `S3_ACCESS_KEY` | `--s3-access-key` | — | S3 access key. |
 | `S3_SECRET_KEY` | `--s3-secret-key` | — | S3 secret key. |
@@ -135,6 +136,7 @@ data:
   SSO_GATEWAY_INTROSPECTION_URL: "http://sso-gateway.sso.svc.cluster.local:8080/oauth2/introspect"
   OPENSEARCH_URL: "http://opensearch.opensearch.svc.cluster.local:9200"
   S3_ENDPOINT: "http://seaweedfs-s3.storage.svc.cluster.local:8333"
+  S3_PUBLIC_ENDPOINT: "https://s3.example.com"
   S3_REGION: "us-east-1"
   S3_BUCKET: "sunbeam-kanban"
 ```

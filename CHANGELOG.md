@@ -6,6 +6,16 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.4] - 2026-07-21
+
+### Added
+
+- New `S3_PUBLIC_ENDPOINT` / `--s3-public-endpoint` config: presigned upload/download URLs are signed for and built with this public host when set, while the service keeps using `S3_ENDPOINT` (possibly cluster-internal) for its own API calls. Deployments with an in-cluster filer should point this at the public S3 hostname.
+
+### Fixed
+
+- Card refs kept minting without the project prefix: the `project_ref_counter` upsert only bumped the sequence on conflict, so counter rows created before the v2026.07.3 prefix fix stayed empty forever. Allocation now always takes the project's current prefix, healing stale counter rows on next use.
+
 ## [2026.07.3] - 2026-07-21
 
 ### Fixed
@@ -181,6 +191,7 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 - Testcontainers are now stopped and removed when the test process exits, preventing dangling containers.
 - Dockerfile `cargo fetch` invocation uses `--locked` instead of the unsupported `-p` flag.
 
+[2026.07.4]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.4
 [2026.07.3]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.3
 [2026.07.2]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.2
 [2026.07.1]: https://github.com/sunbeamdotpt/kanban/releases/tag/v2026.07.1

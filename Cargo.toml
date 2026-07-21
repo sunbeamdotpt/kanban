@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 [package]
 name = "kanban"
-version = "2026.7.3"
+version = "2026.7.4"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/sunbeamdotpt/kanban"

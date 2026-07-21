@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag to build and push (e.g. v2026.07.3)'
+        description: 'Image tag to build and push (e.g. v2026.07.4)'
         required: true
-        default: 'v2026.07.3'
+        default: 'v2026.07.4'
 
 permissions:
   contents: read

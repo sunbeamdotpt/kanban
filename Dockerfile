@@ -3,10 +3,10 @@
 # Multi-stage, multi-architecture build for the Kanban backend.
 #
 # Build for a single platform:
-#   docker buildx build --platform linux/amd64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.3 .
+#   docker buildx build --platform linux/amd64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.4 .
 #
 # Build for both platforms:
-#   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.3 .
+#   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.4 .
 
 ARG VERSION=0.1.0
 

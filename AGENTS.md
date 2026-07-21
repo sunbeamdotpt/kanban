@@ -105,12 +105,12 @@ KANBAN_TEST_POSTGRES_IMAGE=postgres:16-alpine cargo test
 
 ### Releases
 
-Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.3`). The patch field counts releases within the month and resets to `0` on the first release of each new month. To cut a release: bump `version` in `Cargo.toml` (semver-compatible form without the zero-padded month, e.g. `2026.7.0`), add a `CHANGELOG.md` entry, commit, tag `vYYYY.0M.PATCH`, and push. The tag triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR under four tags: the exact release, the floating `vYYYY.0M` and `vYYYY`, and `latest` (skipped for prerelease tags).
+Releases use [Calendar Versioning](https://calver.org) (`YYYY.0M.PATCH`, e.g. `v2026.07.4`). The patch field counts releases within the month and resets to `0` on the first release of each new month. To cut a release: bump `version` in `Cargo.toml` (semver-compatible form without the zero-padded month, e.g. `2026.7.0`), add a `CHANGELOG.md` entry, commit, tag `vYYYY.0M.PATCH`, and push. The tag triggers `.github/workflows/release.yml`, which builds and pushes a multi-arch image to GHCR under four tags: the exact release, the floating `vYYYY.0M` and `vYYYY`, and `latest` (skipped for prerelease tags).
 
 To build the image locally for both architectures:
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.3 .
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/sunbeamdotpt/kanban:v2026.07.4 .
 ```
 
 The default buildx builder handles multi-platform builds even though `docker buildx ls` may not advertise them.
@@ -256,6 +256,7 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `S3_ENDPOINT` | — | S3-compatible endpoint |
+| `S3_PUBLIC_ENDPOINT` | — | Optional public endpoint for presigned URLs (set when `S3_ENDPOINT` is cluster-internal) |
 | `S3_REGION` | `us-east-1` | S3 region |
 | `S3_ACCESS_KEY` | — | S3 access key |
 | `S3_SECRET_KEY` | — | S3 secret key |

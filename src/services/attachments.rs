@@ -647,6 +647,122 @@ mod tests {
             .await;
     }
 
+    /// End-to-end with a public endpoint: presigned URLs carry the public host
+    /// (and are signed for it, so the browser-side PUT/GET works), while the
+    /// service's own HEAD check uses the internal endpoint.
+    #[tokio::test]
+    async fn presigned_urls_use_public_endpoint_end_to_end() {
+        let (infra, _svc) = setup().await;
+        let pool = infra.pool.clone();
+
+        // Internal vs public forms of the same MinIO (loopback alias swap;
+        // falls back to the same host for remote Docker setups).
+        let mut cfg = s3_config();
+        let public = if cfg.endpoint.contains("127.0.0.1") {
+            cfg.endpoint.replace("127.0.0.1", "localhost")
+        } else if cfg.endpoint.contains("localhost") {
+            cfg.endpoint.replace("localhost", "127.0.0.1")
+        } else {
+            cfg.endpoint.clone()
+        };
+        cfg.public_endpoint = Some(public);
+        let public_host = cfg.public_endpoint.clone().unwrap();
+
+        let svc = AttachmentServiceImpl {
+            pool: pool.clone(),
+            s3: Arc::new(S3Client::new(cfg.clone())),
+            upload_expires_secs: 900,
+            download_expires_secs: 300,
+        };
+        let http = reqwest::Client::new();
+
+        let card_id = seed_card_chain(&pool).await;
+        let subject = format!("user:test-{}", Id::new());
+
+        // Upload via a URL that must carry the public host.
+        let upload_resp = svc
+            .request_presigned_upload(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedUploadRequest {
+                    card_id: card_id.to_string(),
+                    filename: "public.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    size_bytes: 6,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("request_presigned_upload failed")
+            .body;
+
+        assert!(
+            upload_resp.presigned_url.starts_with(&public_host),
+            "upload URL must use the public endpoint: {}",
+            upload_resp.presigned_url
+        );
+
+        let file_content = b"public";
+        let put_resp = http
+            .put(&upload_resp.presigned_url)
+            .header("content-type", "text/plain")
+            .body(file_content.to_vec())
+            .send()
+            .await
+            .expect("PUT to presigned URL failed");
+        assert!(
+            put_resp.status().is_success(),
+            "PUT to public presigned URL failed: {}",
+            put_resp.status()
+        );
+
+        svc.confirm_upload(
+            authed_ctx_with_object(&subject, &card_id.to_string()),
+            connect_request(&ConfirmUploadRequest {
+                attachment_id: upload_resp.attachment_id.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("confirm_upload failed (internal HEAD)");
+
+        // Download via a URL that must also carry the public host.
+        let download_resp = svc
+            .request_presigned_download(
+                authed_ctx_with_object(&subject, &card_id.to_string()),
+                connect_request(&RequestPresignedDownloadRequest {
+                    attachment_id: upload_resp.attachment_id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("request_presigned_download failed")
+            .body;
+
+        assert!(
+            download_resp.presigned_url.starts_with(&public_host),
+            "download URL must use the public endpoint: {}",
+            download_resp.presigned_url
+        );
+
+        let get_resp = http
+            .get(&download_resp.presigned_url)
+            .send()
+            .await
+            .expect("GET from presigned URL failed");
+        assert!(get_resp.status().is_success(), "S3 GET failed");
+        assert_eq!(get_resp.bytes().await.unwrap().as_ref(), file_content);
+
+        // Teardown.
+        let s3_client = S3Client::new(cfg);
+        let _ = s3_client.delete_object(&upload_resp.s3_key).await;
+        let att_id = upload_resp.attachment_id.parse::<Id>().unwrap();
+        cleanup_attachment(&pool, att_id).await;
+        let _ = sqlx::query("DELETE FROM cards WHERE id = $1")
+            .bind(card_id)
+            .execute(&pool)
+            .await;
+    }
+
     #[tokio::test]
     async fn confirm_upload_rejects_when_file_not_in_s3() {
         let (infra, svc) = setup().await;

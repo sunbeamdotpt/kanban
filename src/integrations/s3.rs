@@ -29,8 +29,14 @@ type HmacSha256 = Hmac<Sha256>;
 /// S3 connection settings, normally read from environment variables.
 #[derive(Clone, Debug)]
 pub struct S3Config {
-    /// S3-compatible endpoint, e.g. `http://localhost:9000`.
+    /// S3-compatible endpoint used for direct API calls, e.g. `http://localhost:9000`.
     pub endpoint: String,
+    /// Optional public endpoint used only for presigned URLs (e.g.
+    /// `https://s3.example.com`). In-cluster deployments set this so browsers
+    /// receive reachable URLs while the service keeps talking to the
+    /// cluster-internal `endpoint` for API operations. Falls back to
+    /// `endpoint` when unset.
+    pub public_endpoint: Option<String>,
     /// AWS region, e.g. `us-east-1`.
     pub region: String,
     pub access_key: String,
@@ -45,11 +51,17 @@ impl S3Config {
             endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| {
                 "http://seaweedfs-filer.storage.svc.cluster.local:8333".to_string()
             }),
+            public_endpoint: std::env::var("S3_PUBLIC_ENDPOINT").ok(),
             region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
             access_key: std::env::var("S3_ACCESS_KEY").unwrap_or_default(),
             secret_key: std::env::var("S3_SECRET_KEY").unwrap_or_default(),
             bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "sunbeam-kanban".to_string()),
         }
+    }
+
+    /// Endpoint used for presigned URLs: the public one when configured.
+    fn presign_endpoint(&self) -> &str {
+        self.public_endpoint.as_deref().unwrap_or(&self.endpoint)
     }
 }
 
@@ -119,7 +131,7 @@ impl S3Client {
 
         // Construct the object URL path
         let path = format!("/{}/{}", self.config.bucket, key);
-        let host = endpoint_host(&self.config.endpoint);
+        let host = endpoint_host(self.config.presign_endpoint());
 
         // Canonical headers: host + optional content-type (for PUT)
         // Note: for presigned URLs, headers must be minimal (browser will send them).
@@ -198,7 +210,7 @@ impl S3Client {
 
         format!(
             "{}{}?{}",
-            self.config.endpoint.trim_end_matches('/'),
+            self.config.presign_endpoint().trim_end_matches('/'),
             path,
             final_qs
         )
@@ -529,6 +541,7 @@ mod tests {
     fn presign_put_contains_amz_signature() {
         let cfg = S3Config {
             endpoint: "http://localhost:9000".to_string(),
+            public_endpoint: None,
             region: "us-east-1".to_string(),
             access_key: "testkey".to_string(),
             secret_key: "testsecret".to_string(),
@@ -548,9 +561,32 @@ mod tests {
     }
 
     #[test]
+    fn presign_uses_public_endpoint_when_set() {
+        let cfg = S3Config {
+            endpoint: "http://seaweedfs-internal:8333".to_string(),
+            public_endpoint: Some("https://s3.example.com".to_string()),
+            region: "us-east-1".to_string(),
+            access_key: "testkey".to_string(),
+            secret_key: "testsecret".to_string(),
+            bucket: "test-bucket".to_string(),
+        };
+        let client = S3Client::new(cfg);
+        let url = client.presign_get("kanban/cards/test/file.pdf", 300);
+        assert!(
+            url.starts_with("https://s3.example.com/test-bucket/"),
+            "presigned URL must use the public endpoint, got {url}"
+        );
+        assert!(
+            !url.contains("seaweedfs-internal"),
+            "internal endpoint must not leak into presigned URLs"
+        );
+    }
+
+    #[test]
     fn presign_get_contains_amz_signature() {
         let cfg = S3Config {
             endpoint: "http://localhost:9000".to_string(),
+            public_endpoint: None,
             region: "us-east-1".to_string(),
             access_key: "testkey".to_string(),
             secret_key: "testsecret".to_string(),

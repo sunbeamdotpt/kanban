@@ -266,6 +266,11 @@ pub struct Cli {
     #[arg(long, env = "S3_ENDPOINT")]
     s3_endpoint: Option<String>,
 
+    /// Optional public S3 endpoint used only for presigned URLs. Set this when
+    /// `S3_ENDPOINT` is cluster-internal so browsers receive reachable URLs.
+    #[arg(long, env = "S3_PUBLIC_ENDPOINT")]
+    s3_public_endpoint: Option<String>,
+
     /// S3 region.
     #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
     s3_region: String,
@@ -424,6 +429,7 @@ impl Cli {
             opensearch_url: self.opensearch_url,
             opensearch_index_name: self.opensearch_index_name,
             s3_endpoint: self.s3_endpoint,
+            s3_public_endpoint: self.s3_public_endpoint,
             s3_region: self.s3_region,
             s3_access_key: self.s3_access_key,
             s3_secret_key: self.s3_secret_key,
@@ -468,6 +474,7 @@ pub struct AppConfig {
     pub opensearch_url: String,
     pub opensearch_index_name: String,
     pub s3_endpoint: Option<String>,
+    pub s3_public_endpoint: Option<String>,
     pub s3_region: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
@@ -664,6 +671,7 @@ pub async fn run_with_config(
         .unwrap_or_else(|| "http://seaweedfs-filer.storage.svc.cluster.local:8333".to_string());
     let s3_client = Arc::new(S3Client::new(S3Config {
         endpoint: s3_endpoint.clone(),
+        public_endpoint: config.s3_public_endpoint.clone(),
         region: config.s3_region.clone(),
         access_key: config.s3_access_key.clone(),
         secret_key: config.s3_secret_key.clone(),
@@ -1182,6 +1190,7 @@ mod tests {
                 .unwrap_or_else(|_| "http://localhost:9200".into()),
             opensearch_index_name: "sunbeam-kanban-cards-v1".into(),
             s3_endpoint: std::env::var("S3_ENDPOINT").ok(),
+            s3_public_endpoint: std::env::var("S3_PUBLIC_ENDPOINT").ok(),
             s3_region: "us-east-1".into(),
             s3_access_key: String::new(),
             s3_secret_key: String::new(),

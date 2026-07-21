@@ -464,7 +464,10 @@ async fn allocate_card_ref(
         "INSERT INTO project_ref_counter (project_id, prefix, next_seq, tenant_id)
          SELECT $1, p.prefix, 2, $2 FROM projects p WHERE p.id = $1 AND p.tenant_id = $2
          ON CONFLICT (project_id) DO UPDATE
-           SET next_seq = project_ref_counter.next_seq + 1
+           SET next_seq = project_ref_counter.next_seq + 1,
+               -- Heal counter rows created while projects.prefix was empty
+               -- (v2026.07.2 and earlier): always take the project's prefix.
+               prefix = EXCLUDED.prefix
          RETURNING prefix, (next_seq - 1) AS allocated_seq",
     )
     .bind(project_id)
@@ -5089,6 +5092,54 @@ mod tests {
     }
 
     // ── Permission tuple regression tests ─────────────────────────────────────
+
+    /// A ref-counter row created while projects.prefix was empty must heal on
+    /// the next allocation (ON CONFLICT takes the current prefix).
+    #[tokio::test]
+    async fn create_card_heals_stale_ref_counter_prefix() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "HEAL").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        // Simulate a counter row left over from before the prefix fix.
+        sqlx::query(
+            "INSERT INTO project_ref_counter (project_id, prefix, next_seq, tenant_id) \
+             VALUES ($1, '', 4, $2)",
+        )
+        .bind(pid)
+        .bind(&tenant_id)
+        .execute(&pool)
+        .await
+        .expect("seed stale counter failed");
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Heal Card".to_string(),
+                    idempotency_key: format!("ikey-{}", Id::new()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(card.r#ref, "HEAL-004", "stale counter prefix must heal");
+
+        cleanup_project(&pool, pid).await;
+    }
 
     /// CreateCard must write KanbanCard:{id}#parent@KanbanBoard:{board_id} so
     /// card-scoped permission checks inherit board access.
