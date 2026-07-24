@@ -10,14 +10,12 @@ timestamp: 2026-07-24T00:00:00Z
 
 ## In flight
 
-- **KANBAN-017 (MilestoneService) + KANBAN-018 (label CRUD) implemented** on
-  the working tree, unreleased: new `milestones.proto`/`labels.proto` (pushed
-  to buf.build/sunbeamdotpt/kanban), `src/services/milestones.rs` +
-  `labels.rs` (None-source dispatch, handler-side KanbanProject view/manage,
-  templates pattern; matrix 68→77), migration `0032_global_labels.sql`
-  (nullable project_id = global + partial unique indexes), UpdateCard
-  milestone set/clear/validate, CHANGELOG staged under [Unreleased].
-  **Release cut (2026.07.7 bump + tag) is the human's per charter.**
+- **v2026.07.7 released** (tag pushed, release workflow building): KANBAN-017
+  MilestoneService + KANBAN-018 label CRUD (incl. global labels, migration
+  0032), UpdateCard milestone set/clear/validate. Protos already live on
+  buf.build/sunbeamdotpt/kanban. Next: verify GHCR image published, then the
+  CLI repo can pick up CLI-007/CLI-009 + 3.2 milestone grouping — file a
+  heads-up card on cli/dev once deployed.
 - **v2026.07.6 deployed and verified** by sbbb (#105): cross-board/project
   card dependencies live in prod. Both queued edges wired:
   `KANBAN-009 depends_on CLI-004`, `CLI-005 depends_on KANBAN-001`.
@@ -50,11 +48,13 @@ timestamp: 2026-07-24T00:00:00Z
 
 ## Pick up first
 
-- Cut release 2026.07.7 (human): bump, CHANGELOG [Unreleased] → versioned,
-  tag, push; verify the GHCR image workflow.
-- Tell the CLI repo (card on cli/dev) that MilestoneService + LabelService
-  are live in the API so CLI-007/CLI-009 and the 3.2 milestone grouping can
-  proceed.
+- Verify the v2026.07.7 release workflow published the GHCR image (builds
+  take ~20 min), then file a heads-up card on cli/dev: MilestoneService +
+  LabelService live → CLI-007/CLI-009 and 3.2 milestone grouping unblocked.
+- **Dependabot: 1 moderate vulnerability** on the default branch
+  (github.com/sunbeamdotpt/kanban/security/dependabot/20) — surfaced by the
+  v2026.07.7 push; triage it.
+- Cut release 2026.07.7 — DONE this session.
 - Fix the testcontainers leak (see [known-issues.md](known-issues.md)) — it
   flakes permission tests and exhausts the VM ("too many open files",
   Docker network pools) on repeated full-suite runs. Cleanup: remove leaked
