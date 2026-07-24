@@ -6,24 +6,32 @@
 //! If the SQL write fails after the permission write succeeds, we log a `mirror_drift`
 //! warning so the background reconciler can catch up.
 //!
-// (original doc below)
+//! Member and project-field mutations write project-scoped `event_log`
+//! outbox rows (`MemberAdded` / `MemberRoleChanged` / `MemberRemoved` /
+//! `ProjectUpdated`) routed to `kanban.project.<id>.events`.
 //!
-//! `SubscribeProject` is intentionally left unimplemented for now; it will
-//! eventually merge live streams from every board visible to the caller.
+//! `SubscribeProject` merges the live streams of every board in the project
+//! (one `build_subscribe_board_stream` child per board) with the project
+//! subject (member/project events) into a single server stream.
 //!
 //! Uses the dynamic sqlx API (no macros) so the crate builds without a
 //! live DATABASE_URL.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::id::Id;
+use async_stream::stream;
 use buffa_types::google::protobuf::Timestamp;
 use chrono::{DateTime, Utc};
 use connectrpc::{
     ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
+use serde_json::json;
 use sqlx::PgPool;
 use sqlx::Row;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::StreamExt;
 use tracing::{error, warn};
 
 use crate::auth::permission_client::PermissionClient;
@@ -33,13 +41,20 @@ use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::auth::permission_expand::{ExpandQuery, expand_objects};
 use crate::auth::permission_retry::PermissionRetryExt;
 use crate::cpb::sunbeam::kanban::v1::{
-    AddMemberRequest, AddMemberResponse, CreateProjectRequest, CreateProjectResponse,
-    DeleteProjectRequest, DeleteProjectResponse, GetProjectRequest, GetProjectResponse,
-    ListMembersRequest, ListMembersResponse, ListProjectsRequest, ListProjectsResponse, Project,
-    ProjectMember, ProjectService, RemoveMemberRequest, RemoveMemberResponse,
-    SubscribeProjectRequest, SubscribeProjectResponse, UpdateProjectRequest, UpdateProjectResponse,
+    AddMemberRequest, AddMemberResponse, BoardEventEnvelope, CreateProjectRequest,
+    CreateProjectResponse, DeleteProjectRequest, DeleteProjectResponse, GetProjectRequest,
+    GetProjectResponse, ListMembersRequest, ListMembersResponse, ListProjectsRequest,
+    ListProjectsResponse, Project, ProjectMember, ProjectService, RemoveMemberRequest,
+    RemoveMemberResponse, SubscribeProjectRequest, SubscribeProjectResponse, UpdateProjectRequest,
+    UpdateProjectResponse, board_event_envelope::Payload,
 };
-use crate::realtime::registry::BoardSubscriberRegistry;
+use crate::event_log::insert_project_event;
+use crate::realtime::registry::{BoardSubscriberRegistry, StreamHandle};
+use crate::services::boards::{
+    SubscribeBoardArgs, build_subscribe_board_stream, heartbeat_envelope, revalidate_permission,
+    revalidate_token,
+};
+use crate::services::visibility::is_public_or_internal;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -52,6 +67,9 @@ pub struct ProjectServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
+    pub heartbeat_interval: Duration,
+    pub permission_recheck_interval: Duration,
+    pub cutover_seen_capacity: usize,
 }
 
 // ── Timestamp helpers (chrono ↔ buffa_types) ────────────────────────────────
@@ -436,16 +454,26 @@ impl ProjectService for ProjectServiceImpl {
         let req = request.to_owned_message();
         let patch = req.project.into_option().unwrap_or_default();
 
-        // Apply sparse patch — only non-empty fields are applied.
+        // Apply sparse patch — only non-empty fields are applied. `slug` is
+        // immutable identity (derived at create); the patch's `prefix` field
+        // updates the card-ref `prefix` column, never the slug. The
+        // ProjectUpdated outbox event (post-patch values) rides in the same
+        // transaction.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         let row = sqlx::query(
             r#"
             UPDATE projects SET
                 name        = CASE WHEN $3 != '' THEN $3 ELSE name END,
-                slug        = CASE WHEN $4 != '' THEN $4 ELSE slug END,
+                prefix      = CASE WHEN $4 != '' THEN $4 ELSE prefix END,
                 description = CASE WHEN $5 != '' THEN $5 ELSE description END,
                 updated_at  = now()
             WHERE tenant_id = $1 AND id = $2
-            RETURNING id, name, slug, description, owner_id, created_at, updated_at
+            RETURNING id, name, slug, prefix, description, owner_id, created_at, updated_at
             "#,
         )
         .bind(&tenant_id)
@@ -453,10 +481,31 @@ impl ProjectService for ProjectServiceImpl {
         .bind(&patch.name)
         .bind(patch.prefix.to_uppercase())
         .bind(&patch.description)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update project", e))?
         .ok_or_else(|| ConnectError::not_found("project not found"))?;
+
+        let name: String = row.get("name");
+        let prefix: String = row.get("prefix");
+        let description: Option<String> = row.get("description");
+        insert_project_event(
+            &mut tx,
+            &tenant_id,
+            project_id,
+            "ProjectUpdated",
+            json!({
+                "project_id": project_id.to_string(),
+                "name": name,
+                "prefix": prefix,
+                "description": description.unwrap_or_default(),
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         let member_count = fetch_member_count(&self.pool, &tenant_id, project_id).await;
         Ok(Response::new(UpdateProjectResponse {
@@ -617,6 +666,39 @@ impl ProjectService for ProjectServiceImpl {
             // Do not return error — reconciler will fix SQL drift.
         }
 
+        // Project-scoped outbox event: a role swap is MemberRoleChanged,
+        // anything else is MemberAdded.
+        let (event_type, payload) = match existing_role {
+            Some(ref old) if old != &req.relation => (
+                "MemberRoleChanged",
+                json!({
+                    "project_id": project_id.to_string(),
+                    "subject": req.subject,
+                    "old_relation": old,
+                    "new_relation": req.relation,
+                }),
+            ),
+            _ => (
+                "MemberAdded",
+                json!({
+                    "project_id": project_id.to_string(),
+                    "subject": req.subject,
+                    "relation": req.relation,
+                    "display_name": "",
+                    "email": "",
+                }),
+            ),
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+        insert_project_event(&mut tx, &tenant_id, project_id, event_type, payload).await?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
         Ok(Response::new(AddMemberResponse::default()))
     }
 
@@ -676,6 +758,27 @@ impl ProjectService for ProjectServiceImpl {
             return Err(ConnectError::not_found("member not found"));
         }
 
+        // Project-scoped outbox event.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+        insert_project_event(
+            &mut tx,
+            &tenant_id,
+            project_id,
+            "MemberRemoved",
+            json!({
+                "project_id": project_id.to_string(),
+                "subject": req.subject,
+            }),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
         Ok(Response::new(RemoveMemberResponse::default()))
     }
 
@@ -708,21 +811,255 @@ impl ProjectService for ProjectServiceImpl {
         }))
     }
 
-    // ── SubscribeProject (Stage 4c — deferred to 4c.5) ───────────────────────
+    // ── SubscribeProject ──────────────────────────────────────────────────────
     //
-    // TODO(4c.5): multi-board merge — enumerate all KanbanBoard objects visible
-    // to the subject via `permission_expand_objects(KanbanBoard, view, subject)`, then
-    // open one `build_subscribe_board_stream` per board and merge them via
-    // `tokio_stream::StreamExt::merge` / `select_all`.
+    // Multi-board merge: one `build_subscribe_board_stream` child per board in
+    // the project (each child replays that board's snapshot and tails its live
+    // events) plus the project subject (Member*/ProjectUpdated envelopes).
+    // Child heartbeats are filtered; the merge loop emits one heartbeat per
+    // interval itself. Token revalidation runs per yield and the KanbanProject
+    // view permission is rechecked per interval.
 
     async fn subscribe_project(
         &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, SubscribeProjectRequest>,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, SubscribeProjectRequest>,
     ) -> ServiceResult<SubscribeProjectStream> {
-        Err(ConnectError::unimplemented(
-            "Stage 4c.5 — per-project multi-board merge not yet implemented",
-        ))
+        let auth = ctx
+            .extensions()
+            .get::<AuthContext>()
+            .cloned()
+            .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))?;
+        let tenant = auth
+            .tenant_id
+            .clone()
+            .ok_or_else(|| ConnectError::unauthenticated("missing tenant context"))?;
+        let req = request.to_owned_message();
+        let project_id_str = req.project_id;
+        let project_id = project_id_str
+            .parse::<Id>()
+            .map_err(|_| ConnectError::invalid_argument("invalid project_id"))?;
+
+        let permission = Arc::new(
+            self.permission
+                .tenant_client(&tenant)
+                .await
+                .map_err(|e| internal("failed to build tenant permission client", e))?,
+        );
+
+        let board_rows = sqlx::query(
+            "SELECT id, visibility FROM boards WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at ASC",
+        )
+        .bind(&tenant)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| internal("failed to list project boards", e))?;
+
+        // Build one child stream per board. `since_seq` from the request is
+        // not forwarded: JetStream sequence spaces are per-board, so a project
+        // resume token cannot map onto them — children always replay a full
+        // snapshot, which is idempotent for the client.
+        let mut children = Vec::new();
+        for row in &board_rows {
+            let board_id: Id = row.get("id");
+            let visibility: String = row.get("visibility");
+            let board_id_str = board_id.to_string();
+            match build_subscribe_board_stream(SubscribeBoardArgs {
+                registry: Arc::clone(&self.registry),
+                permission: Arc::clone(&permission),
+                auth: auth.clone(),
+                board_id: board_id_str.clone(),
+                is_private: !is_public_or_internal(&visibility),
+                heartbeat_interval: self.heartbeat_interval,
+                permission_recheck_interval: self.permission_recheck_interval,
+                pool: self.pool.clone(),
+                tenant_id: tenant.clone(),
+                since_seq: 0,
+                cutover_seen_capacity: self.cutover_seen_capacity,
+            })
+            .await
+            {
+                Ok(child) => children.push((board_id_str, child)),
+                Err(e) => {
+                    warn!(
+                        board_id = %board_id_str,
+                        error = %e,
+                        "SubscribeProject: failed to build child board stream; board skipped"
+                    );
+                }
+            }
+        }
+
+        // Project-scoped events (Member*/ProjectUpdated) arrive on the
+        // project subject. A failure here must not kill the board streams.
+        let project_handle = match Arc::clone(&self.registry)
+            .subscribe_project(&project_id_str)
+            .await
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(
+                    project_id = %project_id_str,
+                    error = %e,
+                    "SubscribeProject: project subject subscribe failed; continuing with board streams"
+                );
+                None
+            }
+        };
+
+        let heartbeat_interval = self.heartbeat_interval;
+        let permission_recheck_interval = self.permission_recheck_interval;
+
+        let s = stream! {
+            // Forward every child board stream into one channel. A child that
+            // ends (board deleted mid-subscription) or errors is dropped
+            // without killing the merge.
+            let (child_tx, mut child_rx) = mpsc::channel::<BoardEventEnvelope>(256);
+            let mut children_open = !children.is_empty();
+            for (board_id, mut child) in children {
+                let tx = child_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(item) = child.next().await {
+                        match item {
+                            Ok(resp) => {
+                                let Some(envelope) = resp.envelope.into_option() else {
+                                    continue;
+                                };
+                                // The merge loop emits its own heartbeat.
+                                if matches!(envelope.payload, Some(Payload::Heartbeat(_))) {
+                                    continue;
+                                }
+                                if tx.send(envelope).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    board_id = %board_id,
+                                    error = %e,
+                                    "SubscribeProject: child board stream error; board dropped"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(child_tx);
+
+            let mut project_handle = project_handle;
+            let mut heartbeat = tokio::time::interval(heartbeat_interval);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            heartbeat.tick().await;
+            let mut last_permission_recheck = Instant::now();
+
+            loop {
+                // Token revalidation on every yield.
+                match revalidate_token(&auth) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        yield Err(ConnectError::unauthenticated("token expired"));
+                        break;
+                    }
+                    Err(status) => {
+                        yield Err(status);
+                        break;
+                    }
+                }
+
+                // Permission recheck on KanbanProject view per interval.
+                if last_permission_recheck.elapsed() >= permission_recheck_interval {
+                    match revalidate_permission(&permission, &auth, PERMISSION_TYPE, &project_id_str)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            yield Err(ConnectError::permission_denied(
+                                "permission revoked mid-stream",
+                            ));
+                            break;
+                        }
+                        Err(status) => {
+                            yield Err(status);
+                            break;
+                        }
+                    }
+                    last_permission_recheck = Instant::now();
+                }
+
+                tokio::select! {
+                    env = recv_child(&mut child_rx, children_open) => {
+                        match env {
+                            Some(envelope) => yield Ok(SubscribeProjectResponse {
+                                envelope: Some(envelope).into(),
+                                ..Default::default()
+                            }),
+                            None => {
+                                // Every child stream ended.
+                                children_open = false;
+                                if project_handle.is_none() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    msg = recv_project(&mut project_handle) => {
+                        match msg {
+                            Some(Ok(envelope)) => yield Ok(SubscribeProjectResponse {
+                                envelope: Some(envelope).into(),
+                                ..Default::default()
+                            }),
+                            Some(Err(broadcast::error::RecvError::Lagged(_))) => {
+                                // Skip lagged project events; the next ones still arrive.
+                            }
+                            Some(Err(broadcast::error::RecvError::Closed)) | None => {
+                                warn!("SubscribeProject: project event channel closed; continuing with board streams");
+                                project_handle = None;
+                                if !children_open {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = heartbeat.tick() => {
+                        yield Ok(SubscribeProjectResponse {
+                            envelope: Some(heartbeat_envelope()).into(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(s)))
+    }
+}
+
+// ── Merge-loop helpers ─────────────────────────────────────────────────────────
+
+/// Receive the next envelope forwarded from a child board stream. Pends
+/// forever once every child has ended (`open == false`).
+async fn recv_child(
+    rx: &mut mpsc::Receiver<BoardEventEnvelope>,
+    open: bool,
+) -> Option<BoardEventEnvelope> {
+    if open {
+        rx.recv().await
+    } else {
+        std::future::pending().await
+    }
+}
+
+/// Receive the next project-subject envelope. Pends forever when the project
+/// subscription is not active.
+#[allow(clippy::type_complexity)]
+async fn recv_project(
+    handle: &mut Option<StreamHandle>,
+) -> Option<Result<BoardEventEnvelope, broadcast::error::RecvError>> {
+    match handle.as_mut() {
+        Some(h) => Some(h.receiver.recv().await),
+        None => std::future::pending().await,
     }
 }
 
@@ -763,6 +1100,9 @@ mod tests {
             pool,
             permission,
             registry,
+            heartbeat_interval: Duration::from_millis(500),
+            permission_recheck_interval: Duration::from_millis(30_000),
+            cutover_seen_capacity: 1024,
         }
     }
 
@@ -1056,6 +1396,83 @@ mod tests {
 
         // Cleanup
         let pid = project_id.parse::<Id>().unwrap();
+        cleanup_project(&pool, &test_tenant_id(), pid).await;
+        cleanup_permission_for_subject(&permission, &subject).await;
+    }
+
+    /// KANBAN-006 regression: UpdateProject must write the patch's `prefix`
+    /// into the `prefix` column (uppercased) and leave the immutable `slug`
+    /// untouched. The response must echo the real prefix.
+    #[tokio::test]
+    async fn update_project_updates_prefix_without_touching_slug() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+
+        let created = svc
+            .create_project(
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
+                    name: "Prefix Update".to_string(),
+                    prefix: "PUPD".to_string(),
+                    icon: String::new(),
+                    color: String::new(),
+                    description: String::new(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .project
+            .into_option()
+            .expect("project missing");
+
+        let project_id = created.id.clone();
+        let pid = project_id.parse::<Id>().unwrap();
+
+        let updated = svc
+            .update_project(
+                authed_ctx_with_object(&subject, &project_id),
+                connect_request(&UpdateProjectRequest {
+                    project_id: project_id.clone(),
+                    project: Some(Project {
+                        prefix: "triforce".to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("update_project failed")
+            .body
+            .project
+            .into_option()
+            .expect("project missing");
+
+        // (c) The response echoes the real (uppercased) prefix.
+        assert_eq!(updated.prefix, "TRIFORCE");
+
+        // (a) prefix column updated, (b) slug unchanged.
+        let row = sqlx::query("SELECT slug, prefix FROM projects WHERE tenant_id = $1 AND id = $2")
+            .bind(test_tenant_id())
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .expect("project row missing");
+        let slug: String = row.get("slug");
+        let prefix: String = row.get("prefix");
+        assert_eq!(prefix, "TRIFORCE", "prefix column should be updated");
+        assert_eq!(
+            slug, "PUPD",
+            "slug is immutable identity and must not change"
+        );
+
+        // Cleanup
         cleanup_project(&pool, &test_tenant_id(), pid).await;
         cleanup_permission_for_subject(&permission, &subject).await;
     }
@@ -1736,49 +2153,184 @@ mod tests {
         cleanup_permission_for_subject(&permission, &subject_a).await;
     }
 
-    // ── Stage 4c SubscribeProject tests ──────────────────────────────────────
+    // ── SubscribeProject tests ───────────────────────────────────────────────
 
-    /// SubscribeProject is not implemented yet and returns `Unimplemented`.
+    /// Receive envelopes until `want` matches (heartbeats and child cutovers
+    /// are skipped by the predicate).
+    ///
+    /// 30s budget: under full-suite load the chain add_member → permission
+    /// grant → SQL → outbox drain → JetStream publish → registry pump can
+    /// individually exceed 10s against the shared containers (observed
+    /// acquire latencies >10s), and a tight timeout flakes the test without
+    /// any product defect.
+    async fn recv_until(
+        stream: &mut SubscribeProjectStream,
+        mut want: impl FnMut(&BoardEventEnvelope) -> bool,
+    ) -> BoardEventEnvelope {
+        use tokio_stream::StreamExt;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let env = stream
+                    .next()
+                    .await
+                    .expect("stream ended")
+                    .expect("stream error")
+                    .envelope
+                    .into_option()
+                    .expect("envelope missing");
+                if want(&env) {
+                    return env;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for expected envelope")
+    }
+
+    /// A project with two boards receives live events from both boards plus
+    /// project-scoped MemberAdded on a single merged stream.
     #[tokio::test]
-    async fn subscribe_project_returns_unimplemented_pending_stage_4c5() {
+    async fn subscribe_project_merges_board_streams_and_project_events() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
         let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
 
         let subject = format!("user:test-{}", Id::new());
-        let project_id = Id::new().to_string();
+        let tenant_id = test_tenant_id();
 
-        let mut ctx = authed_ctx(&subject);
-        ctx.extensions_mut()
-            .insert(crate::auth::permission_dispatch::CheckedObjectId(
-                project_id.clone(),
-            ));
+        let project = svc
+            .create_project(
+                authed_ctx(&subject),
+                connect_request(&CreateProjectRequest {
+                    name: "Merge Project".to_string(),
+                    prefix: "MRG".to_string(),
+                    icon: String::new(),
+                    color: String::new(),
+                    description: String::new(),
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_project failed")
+            .body
+            .project
+            .into_option()
+            .expect("project missing");
+        let project_id: Id = project.id.parse().expect("project id");
+        let board_a = crate::test_support::seed_board(&pool, &tenant_id, project_id).await;
+        let board_b = crate::test_support::seed_board(&pool, &tenant_id, project_id).await;
 
-        let result = svc
+        // NATS client for the outbox drain; ensure the JetStream stream exists.
+        let nats = Arc::new(
+            sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
+                url: std::env::var("NATS_URL")
+                    .unwrap_or_else(|_| "nats://localhost:4222".to_string()),
+                jetstream: true,
+                lease_duration: 30,
+                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
+            })
+            .await
+            .expect("NATS connect failed"),
+        );
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("ensure_kanban_stream failed");
+
+        let mut stream = svc
             .subscribe_project(
-                ctx,
+                authed_ctx(&subject),
                 connect_request(&SubscribeProjectRequest {
-                    project_id: project_id.clone(),
+                    project_id: project_id.to_string(),
                     since_seq: 0,
                     ..Default::default()
                 }),
             )
+            .await
+            .expect("subscribe_project failed")
+            .body;
+
+        // Both child board streams cut over with an empty snapshot.
+        let mut cutovers = 0;
+        recv_until(&mut stream, |env| {
+            if matches!(env.payload, Some(Payload::Cutover(_))) {
+                cutovers += 1;
+            }
+            cutovers >= 2
+        })
+        .await;
+
+        // Write + dispatch a card event on each board; both must arrive on
+        // the merged stream.
+        for board in [board_a, board_b] {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::event_log::insert_board_event(
+                &mut tx,
+                &tenant_id,
+                board,
+                "CardCreated",
+                serde_json::json!({ "card_id": Id::new().to_string() }),
+            )
+            .await
+            .expect("insert_board_event failed");
+            tx.commit().await.expect("commit");
+
+            let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
+                pool.clone(),
+                Arc::clone(&nats),
+                crate::realtime::outbox::OutboxConfig::default(),
+            )
+            .with_board_filter(board);
+            assert_eq!(dispatcher.drain_once().await.expect("drain failed"), 1);
+
+            let env = recv_until(&mut stream, |env| {
+                matches!(env.payload, Some(Payload::CardCreated(_)))
+            })
             .await;
+            assert_eq!(env.board_id, board.to_string());
+        }
 
-        assert!(
-            result.is_err(),
-            "SubscribeProject must return an error (unimplemented)"
-        );
-        let err = result.err().expect("result was Ok after is_err check");
-        assert_eq!(
-            err.code,
-            connectrpc::ErrorCode::Unimplemented,
-            "SubscribeProject must return Unimplemented pending Stage 4c.5, got {err:?}"
-        );
+        // add_member emits a project-scoped MemberAdded on the same stream.
+        let member_subject = format!("user:member-{}", Id::new());
+        svc.add_member(
+            authed_ctx_with_object(&subject, &project_id.to_string()),
+            connect_request(&AddMemberRequest {
+                project_id: project_id.to_string(),
+                subject: member_subject.clone(),
+                relation: "viewer".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("add_member failed");
+
+        let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
+            pool.clone(),
+            Arc::clone(&nats),
+            crate::realtime::outbox::OutboxConfig::default(),
+        )
+        .with_board_filter(project_id);
+        assert_eq!(dispatcher.drain_once().await.expect("drain failed"), 1);
+
+        let env = recv_until(&mut stream, |env| {
+            matches!(env.payload, Some(Payload::MemberAdded(_)))
+        })
+        .await;
+        match env.payload {
+            Some(Payload::MemberAdded(ev)) => {
+                assert_eq!(ev.project_id, project_id.to_string());
+                assert_eq!(ev.subject, member_subject);
+                assert_eq!(ev.relation, "viewer");
+            }
+            other => panic!("expected MemberAdded, got {other:?}"),
+        }
+
+        drop(stream);
+        cleanup_project(&pool, &tenant_id, project_id).await;
+        cleanup_permission_for_subject(&permission, &subject).await;
+        cleanup_permission_for_subject(&permission, &member_subject).await;
     }
-
-    // NOTE: per-project multi-board merge test will be added together with
-    // the `subscribe_project` implementation (currently returns
-    // `ConnectError::unimplemented`; covered by
-    // `subscribe_project_returns_unimplemented_pending_stage_4c5`).
 }

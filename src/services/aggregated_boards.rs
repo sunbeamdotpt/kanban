@@ -39,6 +39,7 @@ use crate::cpb::sunbeam::kanban::v1::{
     UpdateAggregatedBoardRequest, UpdateAggregatedBoardResponse,
     aggregated_board_chunk::Payload as ChunkPayload, board_event_envelope::Payload as EventPayload,
 };
+use crate::event_log::insert_aggregated_event;
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::cards::{
@@ -145,31 +146,10 @@ fn aggregated_board_from_row(row: &sqlx::postgres::PgRow) -> AggregatedBoard {
 }
 
 // ── event_log helper ──────────────────────────────────────────────────────────
-
-async fn insert_event_log(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant_id: &str,
-    aggregated_board_id: Id,
-    event_type: &str,
-    payload: serde_json::Value,
-) -> Result<(), ConnectError> {
-    sqlx::query(
-        "INSERT INTO event_log (id, tenant_id, aggregated_board_id, event_type, payload, created_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, now())",
-    )
-    .bind(Id::new())
-    .bind(tenant_id)
-    .bind(aggregated_board_id)
-    .bind(event_type)
-    .bind(payload)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| {
-        warn!(error = %e, "event_log insert failed");
-        internal("failed to insert event_log row", e)
-    })?;
-    Ok(())
-}
+//
+// Aggregated-board events use the shared `crate::event_log::insert_aggregated_event`
+// helper, which bumps `aggregated_boards.revision` and merges it into the
+// payload in the same tx.
 
 // ── Source-board helpers ──────────────────────────────────────────────────────
 
@@ -521,7 +501,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
             );
         }
 
-        insert_event_log(
+        insert_aggregated_event(
             &mut tx,
             &tenant_id,
             aggregated_board_id,
@@ -764,7 +744,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         .map_err(|e| internal("failed to update aggregated board", e))?
         .ok_or_else(|| ConnectError::not_found("aggregated board not found"))?;
 
-        insert_event_log(
+        insert_aggregated_event(
             &mut tx,
             &tenant_id,
             aggregated_board_id,
@@ -937,7 +917,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id, &tenant_id).await?;
         apply_source_order(&mut tx, aggregated_board_id, &tenant_id, &ordered).await?;
 
-        insert_event_log(
+        insert_aggregated_event(
             &mut tx,
             &tenant_id,
             aggregated_board_id,
@@ -1001,7 +981,7 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
         let ordered = fetch_ordered_source_ids(&mut tx, aggregated_board_id, &tenant_id).await?;
         apply_source_order(&mut tx, aggregated_board_id, &tenant_id, &ordered).await?;
 
-        insert_event_log(
+        insert_aggregated_event(
             &mut tx,
             &tenant_id,
             aggregated_board_id,

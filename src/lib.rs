@@ -14,6 +14,7 @@
 pub mod auth;
 pub mod config;
 pub mod cpb;
+pub mod event_log;
 pub mod iam_proto;
 pub mod id;
 pub mod integrations;

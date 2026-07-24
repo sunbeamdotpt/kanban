@@ -85,3 +85,59 @@ URLs pointed at the cluster-internal filer. New `S3_PUBLIC_ENDPOINT` config
 signs and builds presigned URLs for a public host while API calls keep using
 `S3_ENDPOINT`; deployment wiring is sbbb's (they own prod env vars), notified
 by mail.
+
+## 2026-07-24 — Realtime spine completed + rollout findings (v2026.07.5)
+
+Big sweep: every TODO/unimplemented item in the tree, plus the rollout
+findings from sunbeam's task mail (message 73) and a board check via the
+sunbeam CLI. Decisions and their reasoning:
+
+- **Event delivery architecture:** one shared `src/event_log.rs` helper
+  (`insert_board_event` / `insert_aggregated_event` / `insert_project_event`)
+  replaced per-service copies — dedupe was an explicit goal. Board revision
+  counters (migration 0030) are bumped in the same tx as the event write and
+  ride in the payload JSON, so the outbox stays stateless. Project-scoped
+  events needed a home: `event_log.project_id` (migration 0031) + new
+  `kanban.project.{id}.events` subjects rather than shoehorning project
+  events onto a board subject.
+- **BoardCreated/BoardDeleted are written as project events**, because a
+  board-scoped row can never survive `DeleteBoard` (`event_log.board_id` is
+  `ON DELETE CASCADE`). Same reason `AggregatedBoardDeleted` remains
+  undeliverable without schema surgery — documented as a known issue instead
+  of hacking around the FK.
+- **Registry pump stamps `envelope.nats_seq` from JetStream message info.**
+  The outbox publishes with `nats_seq = 0` (the real sequence only exists
+  after the publish ack, which is written back to the DB, not the message);
+  without stamping, the cutover tracker dropped every live event as
+  out-of-order. Latent bug exposed by the snapshot work — before snapshot
+  replay, cutover happened at 0 so nothing was ever dropped.
+- **Snapshot ordering:** subscribe the live channel first, read
+  `MAX(nats_seq)`, then snapshot — an event can be duplicated (client merges
+  by card_id) but never lost.
+- **JetStream bootstrap no longer uses `get_or_create_stream`:** it errors
+  10058 on drift instead of returning the stream, making config upgrades
+  impossible. Now get → drift-compare → update; create when missing. This
+  also closed both `TODO(g2v)` items without touching the g2v repo.
+- **GitHub link service implemented** (was "blocked on product direction";
+  the human overrode by asking for all unimplemented features). Reasonable
+  defaults: unauthenticated `api.github.com` by default, optional
+  `KANBAN_GITHUB_TOKEN` / `KANBAN_GITHUB_API_BASE_URL`; `LinkIssue` creates
+  degraded links when GitHub is unreachable (link creation is never held
+  hostage by GitHub), `ResyncLink` fails hard on fetch errors (its whole
+  point is the fetch). Object id is `card_id` for all five RPCs per the
+  permission matrix — link ids are not permission objects.
+- **KANBAN-007:** org-standard templates ship as seed migration 0029 (with
+  explicit ULID ids — since 0026 id columns are TEXT with no default, which
+  is why the first draft of 0029 blew up the harness). API creation of
+  globals stays rejected; a seed is idempotent, reviewable in git, and needs
+  no new admin permission surface.
+- **KANBAN-012** (found via the board check the human asked for):
+  `req.limit.clamp(1, MAX)` rewrote unset limits to 1 — the dead
+  `if limit == 0` branch below it could never fire. Cursor pagination was
+  also inconsistent (`id > cursor` vs `ORDER BY column_id, position`); now a
+  composite keyset matching the ORDER BY. Same clamp bug fixed in
+  `ListComments`.
+- **Graceful shutdown:** SIGTERM + SIGINT → axum graceful shutdown, watch
+  channel flips the outbox into a final drain, 10 s bounded wait. No new
+  dependency (tokio `watch` instead of tokio-util's CancellationToken).
+- Coverage: held the release to the human's >90% gate (llvm-cov).

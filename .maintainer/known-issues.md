@@ -17,15 +17,25 @@ it in [log.md](log.md). Verify against the repo before trusting an entry.
   fmt/clippy/test/permission-coverage **CI gates** — no such workflows exist
   (only buf lint + release). See [testing.md](testing.md).
 
-## TODO clusters in `src/` (~15)
+## TODO clusters in `src/` — cleared in v2026.07.5
 
-- **Graceful shutdown missing** — `server.rs:600`, `realtime/outbox.rs` (×3).
-- **Outbox gaps** — no `Nats-Msg-Id` dedup header, `board_revision` hardcoded
-  to 0, event hydration incomplete (`realtime/outbox.rs`).
-- **Unimplemented features** — snapshot-replay and multi-board merge
-  (`boards.rs`, `projects.rs`); GitHub issue-linking RPCs stubbed
-  (`services/github.rs`).
-- JetStream stream config limited by g2v API (`realtime/jetstream_bootstrap.rs`).
+All clusters below were implemented in v2026.07.5 (see CHANGELOG):
+
+- ~~Graceful shutdown~~ — SIGTERM/SIGINT → axum graceful shutdown + bounded
+  final outbox drain (`server.rs`, `outbox.rs` `with_shutdown`).
+- ~~Outbox gaps~~ — `Nats-Msg-Id` dedup header, `board_revision` counters
+  (migration 0030), full Card hydration + patch Struct, all event arms,
+  LISTEN/NOTIFY wake, project-scope routing (`kanban.project.{id}.events`,
+  migration 0031).
+- ~~Unimplemented features~~ — snapshot replay + `since_seq` resume
+  (`boards.rs`), multi-board merge `SubscribeProject` (`projects.rs`), GitHub
+  issue-linking RPCs (`services/github.rs`, no longer stubbed).
+- ~~JetStream g2v API limit~~ — bootstrap uses `nats.jetstream()` directly and
+  is drift-correcting; g2v changes not needed.
+
+Remaining gaps (no writer yet, dispatcher arms exist): `ColumnRenamed`,
+`MembershipChanged`, `AggregatedBoardDeleted` (undeliverable — event row
+cascade-deletes with the aggregate).
 
 ## Test harness
 

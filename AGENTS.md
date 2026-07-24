@@ -9,7 +9,7 @@ Sunbeam Kanban is a real-time collaborative board-management backend. It is a Ru
 
 - **Protocol:** Connect-RPC, gRPC, and gRPC-Web over h2.
 - **Auth & permissions:** The sso-gateway is the unified auth stack. It issues opaque OAuth2 tokens; `sunbeam-g2v`'s `IntrospectionLayer` validates every request against the gateway's `/oauth2/introspect`, and per-object permission checks go through the gateway's `PermissionService` (OpenFGA, one store per tenant). The tenant is resolved from the introspected token; trusted service-to-service calls carry `x-tenant-id`. The `x-sunbeam-object-id` header gates every mutating RPC.
-- **Realtime:** Mutations write to Postgres `event_log` → outbox dispatcher publishes to NATS JetStream `kanban.board.{id}.events` → per-pod `BoardSubscriberRegistry` fans out via `tokio::sync::broadcast`.
+- **Realtime:** Mutations write to Postgres `event_log` → outbox dispatcher publishes to NATS JetStream `kanban.board.{id}.events` (board/aggregated events) and `kanban.project.{id}.events` (membership/project events) → per-pod `BoardSubscriberRegistry` fans out via `tokio::sync::broadcast`. `SubscribeBoard` replays a snapshot then cuts over to the live tail; `SubscribeProject` merges one child stream per board plus the project subject.
 
 ---
 
@@ -250,6 +250,8 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `SSO_GATEWAY_URL` | — | Test-only explicit gateway base URL (production derives it from `SSO_GATEWAY_INTROSPECTION_URL`) |
 | `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch endpoint |
 | `KANBAN_OPENSEARCH_INDEX` | `sunbeam-kanban-cards-v1` | OpenSearch card index |
+| `KANBAN_GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub API base URL used by the GitHub link service |
+| `KANBAN_GITHUB_TOKEN` | `''` | Optional GitHub token (PAT or GitHub App installation token); empty means unauthenticated API calls |
 
 ### S3 / attachments
 

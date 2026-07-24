@@ -37,12 +37,26 @@ use crate::cpb::sunbeam::kanban::v1::{
     UnassignCardResponse, UpdateCardRequest, UpdateCardResponse, UpdateChecklistItemRequest,
     UpdateChecklistItemResponse,
 };
+use crate::event_log::insert_board_event;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_PAGE_LIMIT: i32 = 50;
 const MAX_PAGE_LIMIT: i32 = 200;
 const PERMISSION_TYPE_CARD: &str = "KanbanCard";
+
+/// Resolve a request page limit: unset (≤ 0) → `DEFAULT_PAGE_LIMIT`, otherwise
+/// clamped to `1..=MAX_PAGE_LIMIT`.
+///
+/// Note: `req.limit.clamp(1, MAX_PAGE_LIMIT)` alone turns an unset limit into
+/// 1 (KANBAN-012) — the zero check must come first.
+fn page_limit(request_limit: i32) -> i32 {
+    if request_limit <= 0 {
+        DEFAULT_PAGE_LIMIT
+    } else {
+        request_limit.min(MAX_PAGE_LIMIT)
+    }
+}
 
 // ── Service struct ───────────────────────────────────────────────────────────
 
@@ -393,7 +407,7 @@ pub(crate) async fn fetch_dependents(pool: &PgPool, card_id: Id, tenant_id: &str
 }
 
 /// Load a complete card, including its relationships, by id.
-async fn fetch_full_card(
+pub(crate) async fn fetch_full_card(
     pool: &PgPool,
     card_id: Id,
     tenant_id: &str,
@@ -486,33 +500,9 @@ async fn allocate_card_ref(
 }
 
 // ── event_log helper ──────────────────────────────────────────────────────────
-
-async fn insert_event_log(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant_id: &str,
-    board_id: Id,
-    event_type: &str,
-    payload: serde_json::Value,
-    card_revision: i64,
-) -> Result<(), ConnectError> {
-    sqlx::query(
-        "INSERT INTO event_log (id, tenant_id, board_id, event_type, payload, created_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, now())",
-    )
-    .bind(Id::new())
-    .bind(tenant_id)
-    .bind(board_id)
-    .bind(event_type)
-    .bind(payload)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| {
-        warn!(error = %e, "event_log insert failed (non-fatal for caller; Stage 4 will gap-detect)");
-        internal("failed to insert event_log row", e)
-    })?;
-    let _ = card_revision; // carried for future outbox fields
-    Ok(())
-}
+//
+// Card events use the shared `crate::event_log::insert_board_event` helper,
+// which bumps `boards.revision` and merges it into the payload in the same tx.
 
 // ── Idempotency helpers ───────────────────────────────────────────────────────
 
@@ -685,12 +675,7 @@ impl CardService for CardServiceImpl {
 
         let tenant_id = tenant_id_from_request(&ctx)?;
         let req = request.to_owned_message();
-        let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
-        let limit = if limit == 0 {
-            DEFAULT_PAGE_LIMIT
-        } else {
-            limit
-        };
+        let limit = page_limit(req.limit);
 
         let col_filter: Option<Id> = if req.column_id.is_empty() {
             None
@@ -712,7 +697,11 @@ impl CardService for CardServiceImpl {
             )
         };
 
-        // Build query dynamically to avoid runtime SQL errors.
+        // Build query dynamically to avoid runtime SQL errors. Pagination is a
+        // composite keyset on (column_id, position, id) — the cursor is the
+        // last card id of the previous page and is resolved back to its
+        // (column_id, position, id) triple with a subquery, so the WHERE
+        // matches the ORDER BY exactly.
         let rows = if let Some(col_id) = col_filter {
             if let Some(after) = cursor_id {
                 sqlx::query(
@@ -720,8 +709,10 @@ impl CardService for CardServiceImpl {
                             position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
                      FROM cards \
-                     WHERE board_id = $1 AND tenant_id = $2 AND column_id = $3 AND id > $4 \
-                     ORDER BY column_id, position \
+                     WHERE board_id = $1 AND tenant_id = $2 AND column_id = $3 \
+                       AND (column_id, position, id) > \
+                           (SELECT column_id, position, id FROM cards WHERE id = $4 AND tenant_id = $2) \
+                     ORDER BY column_id, position, id \
                      LIMIT $5",
                 )
                 .bind(board_id)
@@ -737,7 +728,7 @@ impl CardService for CardServiceImpl {
                             position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                             milestone_id, revision, created_at, updated_at \
                      FROM cards WHERE board_id = $1 AND tenant_id = $2 AND column_id = $3 \
-                     ORDER BY column_id, position LIMIT $4",
+                     ORDER BY column_id, position, id LIMIT $4",
                 )
                 .bind(board_id)
                 .bind(&tenant_id)
@@ -751,8 +742,10 @@ impl CardService for CardServiceImpl {
                 "SELECT id, project_id, board_id, column_id, ref, title, description, \
                         position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
-                 FROM cards WHERE board_id = $1 AND tenant_id = $2 AND id > $3 \
-                 ORDER BY column_id, position LIMIT $4",
+                 FROM cards WHERE board_id = $1 AND tenant_id = $2 \
+                   AND (column_id, position, id) > \
+                       (SELECT column_id, position, id FROM cards WHERE id = $3 AND tenant_id = $2) \
+                 ORDER BY column_id, position, id LIMIT $4",
             )
             .bind(board_id)
             .bind(&tenant_id)
@@ -766,7 +759,7 @@ impl CardService for CardServiceImpl {
                         position, priority::text, urgency::text, due_date, completed_at, blocked, cover, \
                         milestone_id, revision, created_at, updated_at \
                  FROM cards WHERE board_id = $1 AND tenant_id = $2 \
-                 ORDER BY column_id, position LIMIT $3",
+                 ORDER BY column_id, position, id LIMIT $3",
             )
             .bind(board_id)
             .bind(&tenant_id)
@@ -983,7 +976,7 @@ impl CardService for CardServiceImpl {
             "urgency": urgency_str,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(&mut tx, &tenant_id, board_id, "CardCreated", payload, 0).await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardCreated", payload).await?;
 
         tx.commit()
             .await
@@ -1142,15 +1135,7 @@ impl CardService for CardServiceImpl {
             .begin()
             .await
             .map_err(|e| internal("begin tx failed", e))?;
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
@@ -1344,15 +1329,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardMoved",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardMoved", payload).await?;
 
         tx.commit()
             .await
@@ -1458,15 +1435,7 @@ impl CardService for CardServiceImpl {
             "board_id": board_id.to_string(),
             "prev_revision": prev_revision,
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardDeleted",
-            payload,
-            prev_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardDeleted", payload).await?;
 
         tx.commit()
             .await
@@ -1602,15 +1571,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -1745,15 +1706,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -1889,15 +1842,7 @@ impl CardService for CardServiceImpl {
                 "label_ids": label_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
                 "idempotency_key": req.idempotency_key,
             });
-            insert_event_log(
-                &mut tx,
-                &tenant_id,
-                board_id,
-                "CardUpdated",
-                payload,
-                new_rev,
-            )
-            .await?;
+            insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
             updated_card_ids.push(cid);
         }
@@ -1991,15 +1936,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "assignees": [req.subject] },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2079,15 +2016,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "unassigned": req.subject },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2203,15 +2132,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_added": item_id.to_string() },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2309,15 +2230,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_updated": item_id.to_string() },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2407,15 +2320,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "checklist_item_removed": item_id.to_string() },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2536,15 +2441,7 @@ impl CardService for CardServiceImpl {
             "patch": { "comments_count": "+1" },
             "idempotency_key": req.idempotency_key,
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2653,15 +2550,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "comment_edited": comment_id.to_string() },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2765,15 +2654,7 @@ impl CardService for CardServiceImpl {
             "new_revision": new_revision,
             "patch": { "comment_deleted": comment_id.to_string() },
         });
-        insert_event_log(
-            &mut tx,
-            &tenant_id,
-            board_id,
-            "CardUpdated",
-            payload,
-            new_revision,
-        )
-        .await?;
+        insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
         tx.commit()
             .await
@@ -2799,12 +2680,7 @@ impl CardService for CardServiceImpl {
 
         let tenant_id = tenant_id_from_request(&ctx)?;
         let req = request.to_owned_message();
-        let limit = req.limit.clamp(1, MAX_PAGE_LIMIT);
-        let limit = if limit == 0 {
-            DEFAULT_PAGE_LIMIT
-        } else {
-            limit
-        };
+        let limit = page_limit(req.limit);
 
         let cursor_id: Option<Id> = if req.cursor.is_empty() {
             None
@@ -4127,6 +4003,92 @@ mod tests {
 
         assert_eq!(resp.cards.len(), 2);
         assert!(!resp.next_cursor.is_empty(), "expected next cursor");
+
+        // Follow the cursor: the remaining card arrives on page 2 with no
+        // duplicates and no further cursor (composite keyset on
+        // (column_id, position, id)).
+        let page2 = svc
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 2,
+                    cursor: resp.next_cursor.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(page2.cards.len(), 1, "page 2 should have the last card");
+        assert!(
+            page2.next_cursor.is_empty(),
+            "no cursor after the last page"
+        );
+        let ids: std::collections::HashSet<String> = resp
+            .cards
+            .iter()
+            .chain(page2.cards.iter())
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3, "pages must not overlap");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// KANBAN-012 regression: an unset limit (0) must fall back to
+    /// DEFAULT_PAGE_LIMIT, not clamp to 1 — a default ListCardsByBoard call
+    /// returns every card on the board.
+    #[tokio::test]
+    async fn list_cards_by_board_unset_limit_returns_all_cards() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "LIM0").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        for i in 0..3 {
+            svc.create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: format!("Card {i}"),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let resp = svc
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 0,
+                    cursor: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .body;
+
+        assert_eq!(
+            resp.cards.len(),
+            3,
+            "unset limit must use the default page size, not 1"
+        );
+        assert!(resp.next_cursor.is_empty());
 
         cleanup_project(&pool, pid).await;
     }

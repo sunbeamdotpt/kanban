@@ -20,7 +20,7 @@ use clap::Parser;
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use sunbeam_g2v::client::OAuth2ClientCredentials;
 use sunbeam_g2v::config::NatsConfig;
@@ -380,6 +380,20 @@ pub struct Cli {
     /// Presigned GET URL lifetime in seconds.
     #[arg(long, env = "KANBAN_DOWNLOAD_EXPIRES_SECS", default_value = "300")]
     download_expires_secs: u64,
+
+    // ── GitHub integration ──────────────────────────────────────────────────
+    /// GitHub API base URL used by the GitHub link service.
+    #[arg(
+        long,
+        env = "KANBAN_GITHUB_API_BASE_URL",
+        default_value = "https://api.github.com"
+    )]
+    github_api_base_url: String,
+
+    /// Optional GitHub token (PAT or GitHub App installation token) used for
+    /// GitHub API calls. Empty means unauthenticated access.
+    #[arg(long, env = "KANBAN_GITHUB_TOKEN", default_value = "")]
+    github_token: String,
 }
 
 impl Cli {
@@ -450,6 +464,8 @@ impl Cli {
             cutover_seen_capacity: self.cutover_seen_capacity,
             upload_expires_secs: self.upload_expires_secs,
             download_expires_secs: self.download_expires_secs,
+            github_api_base_url: self.github_api_base_url,
+            github_token: self.github_token,
         })
     }
 }
@@ -495,6 +511,8 @@ pub struct AppConfig {
     pub cutover_seen_capacity: usize,
     pub upload_expires_secs: u64,
     pub download_expires_secs: u64,
+    pub github_api_base_url: String,
+    pub github_token: String,
 }
 
 pub fn load_config() -> Result<AppConfig> {
@@ -588,7 +606,10 @@ pub async fn run_with_config(
 
     let stream_config = crate::realtime::jetstream_bootstrap::StreamConfig {
         name: crate::realtime::jetstream_bootstrap::STREAM_NAME,
-        subjects: &[crate::realtime::jetstream_bootstrap::STREAM_WILDCARD_SUBJECT],
+        subjects: &[
+            crate::realtime::jetstream_bootstrap::STREAM_WILDCARD_SUBJECT,
+            crate::realtime::jetstream_bootstrap::STREAM_WILDCARD_SUBJECT_PROJECT,
+        ],
         retention: config.stream_retention,
         max_age_secs: config.stream_max_age_secs,
         max_msgs_per_subject: config.stream_max_msgs_per_subject,
@@ -617,10 +638,11 @@ pub async fn run_with_config(
     );
 
     // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
-    // Drains undispatched event_log rows to NATS JetStream at 250ms poll
-    // cadence. Hold the handle so the task is not immediately dropped.
-    // TODO: graceful shutdown — plumb a CancellationToken and abort on SIGTERM.
-    let _outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
+    // Drains undispatched event_log rows to NATS JetStream. The shutdown
+    // watch flips when the serve future resolves (SIGTERM/SIGINT), giving the
+    // dispatcher one final drain pass before the process exits.
+    let (outbox_shutdown_tx, outbox_shutdown_rx) = tokio::sync::watch::channel(false);
+    let outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
         pg_pool.clone(),
         Arc::clone(&nats),
         crate::realtime::outbox::OutboxConfig {
@@ -633,6 +655,7 @@ pub async fn run_with_config(
         Arc::clone(&opensearch_client),
         config.opensearch_index_name.clone(),
     )
+    .with_shutdown(outbox_shutdown_rx)
     .spawn();
 
     info!("outbox dispatcher spawned");
@@ -702,7 +725,13 @@ pub async fn run_with_config(
         permission: Arc::clone(&permission),
     })
     .register(connect_router);
-    let connect_router = Arc::new(GitHubServiceImpl).register(connect_router);
+    let connect_router = Arc::new(GitHubServiceImpl {
+        pool: pg_pool.clone(),
+        api_base_url: config.github_api_base_url.clone(),
+        api_token: config.github_token.clone(),
+        http: reqwest::Client::new(),
+    })
+    .register(connect_router);
     let connect_router = Arc::new(AggregatedBoardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
@@ -716,6 +745,9 @@ pub async fn run_with_config(
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
         registry: Arc::clone(&board_registry),
+        heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+        permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
+        cutover_seen_capacity: config.cutover_seen_capacity,
     })
     .register(connect_router);
     let connect_router = Arc::new(SearchServiceImpl {
@@ -811,10 +843,25 @@ pub async fn run_with_config(
 
     info!(addr = %listener.local_addr().unwrap_or(config.addr), "kanban listening");
 
+    // When the shutdown signal fires, flip the outbox watch so the dispatcher
+    // drains in-flight rows while axum finishes its own graceful shutdown.
+    let shutdown = async move {
+        shutdown.await;
+        let _ = outbox_shutdown_tx.send(true);
+    };
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
         .context("axum serve error")?;
+
+    // Bounded wait for the outbox's final drain pass.
+    if tokio::time::timeout(Duration::from_secs(10), outbox_handle)
+        .await
+        .is_err()
+    {
+        warn!("outbox dispatcher did not exit within 10s of shutdown; abandoning in-flight rows");
+    }
 
     info!("kanban shutdown complete");
     Ok(())
@@ -866,7 +913,27 @@ fn init_otel_tracing() -> Result<()> {
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    // SIGINT (ctrl-c) everywhere; SIGTERM on unix (Kubernetes pod teardown).
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            // Handler installation failed (restricted environment) — fall back
+            // to ctrl-c only rather than panic at boot.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("received shutdown signal");
 }
 
@@ -1213,6 +1280,8 @@ mod tests {
             cutover_seen_capacity: 1024,
             upload_expires_secs: 900,
             download_expires_secs: 300,
+            github_api_base_url: "https://api.github.com".into(),
+            github_token: String::new(),
         };
 
         let listener = tokio::net::TcpListener::bind(config.addr)

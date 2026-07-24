@@ -6,37 +6,66 @@
 //! # Design
 //!
 //! Each mutation handler inserts one `event_log` row in the same database
-//! transaction as the entity write. The row starts with `nats_seq IS NULL`.
-//! This dispatcher runs as a background tokio task and:
+//! transaction as the entity write (see `crate::event_log`). The row starts
+//! with `nats_seq IS NULL`. This dispatcher runs as a background tokio task
+//! and:
 //!
 //! - SELECTs undispatched rows in `id` order, bounded by `batch_size`.
-//! - Builds a `BoardEventEnvelope` from each row.
-//! - Publishes the encoded proto bytes to the board's JetStream subject.
+//! - Builds a `BoardEventEnvelope` from each row (hydrating the full `Card`
+//!   proto for `CardCreated` from the cards table).
+//! - Publishes the encoded proto bytes to the object's JetStream subject with
+//!   a `Nats-Msg-Id` header set to the row id, so JetStream's duplicate
+//!   window (2 minutes by default) dedupes the retry-after-UPDATE-failure
+//!   path.
 //! - On success, marks `nats_seq` and `dispatched_at` on the row.
 //! - On failure, leaves the row alone; the next loop pass retries.
 //!
 //! The loop is idempotent on restart: rows with `nats_seq IS NOT NULL` are
 //! never re-published.
 //!
+//! # Routing
+//!
+//! Board rows publish to `kanban.board.<id>.events` with the envelope's
+//! `board_id` set. Aggregated-board rows publish to the same subject scheme
+//! keyed by the aggregated board id. Project rows publish to
+//! `kanban.project.<id>.events` and leave the envelope's `board_id` empty
+//! (per events.proto, project-only events have no board context).
+//!
 //! # Payload mapping (`event_type` → oneof)
 //!
 //! | event_type string | oneof variant        |
 //! |-------------------|----------------------|
-//! | "CardCreated"     | payload::CardCreated |
-//! | "CardUpdated"     | payload::CardUpdated |
+//! | "CardCreated"     | payload::CardCreated (full Card hydrated from the DB) |
+//! | "CardUpdated"     | payload::CardUpdated (patch as google.protobuf.Struct) |
 //! | "CardMoved"       | payload::CardMoved   |
 //! | "CardDeleted"     | payload::CardDeleted |
 //! | "ColumnAdded"     | payload::ColumnAdded |
+//! | "ColumnUpdated"   | payload::ColumnUpdated |
 //! | "ColumnRenamed"   | payload::ColumnRenamed |
 //! | "ColumnRemoved"   | payload::ColumnRemoved |
+//! | "ColumnsReordered" | payload::ColumnsReordered |
+//! | "BoardCreated"    | payload::BoardCreated |
+//! | "BoardDeleted"    | payload::BoardDeleted |
 //! | "BoardRenamed"    | payload::BoardRenamed |
+//! | "BoardUpdated"    | payload::BoardUpdated |
+//! | "MemberAdded"     | payload::MemberAdded |
+//! | "MemberRemoved"   | payload::MemberRemoved |
+//! | "MemberRoleChanged" | payload::MemberRoleChanged |
+//! | "ProjectUpdated"  | payload::ProjectUpdated |
+//! | "AggregatedBoardCreated" | payload::AggregatedBoardCreated |
+//! | "AggregatedBoardUpdated" | payload::AggregatedBoardUpdated |
+//! | "AggregatedBoardDeleted" | payload::AggregatedBoardDeleted |
+//! | "SourceBoardAdded" | payload::SourceBoardAdded |
+//! | "SourceBoardRemoved" | payload::SourceBoardRemoved |
+//! | "GitHubLinkAdded" | payload::GithubLinkAdded |
+//! | "GitHubLinkRefreshed" | payload::GithubLinkRefreshed |
 //! | "MembershipChanged" | payload::MembershipChanged |
 //! | (anything else)   | oneof left empty (envelope fields populated) |
 //!
 //! The JSONB `payload` column contains the raw field values inserted by the
-//! mutation handler. Recognized card event types are mapped to the nested
-//! proto messages here; other event types leave the oneof empty so the
-//! envelope can still be dispatched.
+//! mutation handler. `payload.board_revision` (written by
+//! `crate::event_log::insert_board_event`) is copied to the envelope's
+//! `board_revision`; legacy rows without it default to 0.
 //!
 //! JSONB is easy to inspect in `psql` (`SELECT payload FROM event_log`) while
 //! protobuf BYTEA would deserialize faster. JSONB is the right trade-off for
@@ -44,14 +73,19 @@
 //!
 //! # LISTEN/NOTIFY
 //!
-//! TODO: add `LISTEN 'kanban_event_log'` via `sqlx::PgListener` to wake the
-//! loop immediately when handlers commit. For now polling at 250 ms is adequate:
-//! JetStream publish round-trips are ~1–5 ms, so poll latency dominates.
+//! Handlers issue `pg_notify('kanban_event_log', '')` inside the mutation
+//! transaction (delivered on commit). The dispatcher LISTENs on that channel
+//! via a dedicated `PgListener` connection and drains immediately on each
+//! notification, so the steady-state latency is the publish round-trip, not
+//! the poll interval. The poll tick remains as a fallback: if the listener
+//! connection dies it is dropped and the loop keeps draining on the poll
+//! cadence alone.
 //!
 //! # Shutdown
 //!
-//! TODO: graceful shutdown — plumb a `CancellationToken` or `oneshot::Receiver`
-//! into the spawned loop so the pod drains in-flight rows before SIGTERM exits.
+//! `with_shutdown` attaches a `watch::Receiver<bool>`; when it flips to
+//! `true` (or the sender closes) the loop runs one final drain and exits,
+//! so in-flight rows are not stranded mid-batch on SIGTERM.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,20 +93,27 @@ use std::time::Duration;
 use crate::id::Id;
 use anyhow::{Context, Result};
 use buffa::Message;
-use buffa_types::google::protobuf::Timestamp;
+use buffa_types::google::protobuf::{Struct, Timestamp};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
+use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Row};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use sunbeam_g2v::mq::NatsClient;
 
-use super::jetstream_bootstrap::board_subject;
+use super::jetstream_bootstrap::{board_subject, project_subject};
 use crate::cpb::sunbeam::kanban::v1::{
-    BoardEventEnvelope, CardCreated, CardDeleted, CardMoved, CardUpdated,
-    board_event_envelope::Payload,
+    AggregatedBoardCreated, AggregatedBoardDeleted, AggregatedBoardUpdated, BoardCreated,
+    BoardDeleted, BoardEventEnvelope, BoardRenamed, BoardUpdated, CardCreated, CardDeleted,
+    CardMoved, CardUpdated, ColumnAdded, ColumnRemoved, ColumnRenamed, ColumnUpdated,
+    ColumnsReordered, EventBoard, EventColumn, GitHubLinkAdded, GitHubLinkRefreshed, MemberAdded,
+    MemberRemoved, MemberRoleChanged, MembershipChanged, ProjectUpdated, SourceBoardAdded,
+    SourceBoardRemoved, board_event_envelope::Payload,
 };
+use crate::event_log::EVENT_LOG_NOTIFY_CHANNEL;
 use crate::integrations::opensearch::OpenSearchClient;
 
 // ── OutboxConfig ─────────────────────────────────────────────────────────────
@@ -114,6 +155,8 @@ pub struct OutboxDispatcher {
     /// Search-index write target: the OpenSearch client and the cards index
     /// name. `None` disables indexing (unit tests).
     opensearch: Option<(Arc<OpenSearchClient>, String)>,
+    /// Graceful-shutdown signal for the spawned loop.
+    shutdown: Option<watch::Receiver<bool>>,
     /// Test-only board scope. `None` in production drains every undispatched
     /// row; `Some(board_id)` restricts to one board so concurrent integration
     /// tests don't eat each other's rows.
@@ -131,6 +174,7 @@ impl OutboxDispatcher {
             batch_size: config.batch_size,
             pod_name: config.pod_name,
             opensearch: None,
+            shutdown: None,
             #[cfg(test)]
             board_filter: None,
         }
@@ -171,13 +215,21 @@ impl OutboxDispatcher {
         self
     }
 
-    /// Spawn the long-running poll loop.
+    /// Attach a graceful-shutdown signal. When the watch value flips to
+    /// `true` (or the sender closes), the loop runs one final drain and
+    /// exits instead of abandoning in-flight rows.
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Spawn the long-running drain loop.
     ///
-    /// Returns the `JoinHandle` so the caller can `task.abort()` on shutdown.
-    /// The task runs until the handle is dropped or aborted.
-    ///
-    /// TODO: graceful shutdown — accept a `CancellationToken` so the pod can
-    /// drain in-flight rows before SIGTERM.
+    /// The loop drains on every `kanban_event_log` NOTIFY and on the
+    /// poll-interval tick (fallback when the LISTEN connection is dead).
+    /// With a shutdown receiver attached (see [`Self::with_shutdown`]) it
+    /// runs one final drain and exits on signal; otherwise it runs until the
+    /// returned `JoinHandle` is aborted.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!(
@@ -190,7 +242,16 @@ impl OutboxDispatcher {
             {
                 error!(error = %e, "outbox: failed to ensure search index; indexing will retry per event");
             }
+
+            let mut shutdown = self.shutdown.clone();
+            let mut listener = self.connect_listener().await;
+
             loop {
+                if shutdown_signaled(&shutdown) {
+                    self.final_drain().await;
+                    break;
+                }
+
                 match self.drain_once().await {
                     Ok(n) if n > 0 => {
                         info!(dispatched = n, "outbox: dispatched batch");
@@ -200,9 +261,56 @@ impl OutboxDispatcher {
                         error!(error = %e, "outbox drain_once error — retrying after poll_interval");
                     }
                 }
-                tokio::time::sleep(self.poll_interval).await;
+
+                // Wait for the next wake: shutdown signal, NOTIFY, or the
+                // poll-interval tick (fallback when the listener is dead).
+                tokio::select! {
+                    () = wait_shutdown(&mut shutdown) => {
+                        self.final_drain().await;
+                        break;
+                    }
+                    ok = recv_notification(&mut listener) => {
+                        if !ok {
+                            error!("outbox: LISTEN connection lost — falling back to polling only");
+                            listener = None;
+                        }
+                    }
+                    () = tokio::time::sleep(self.poll_interval) => {}
+                }
             }
+
+            info!("outbox dispatcher stopped");
         })
+    }
+
+    /// Connect a dedicated `PgListener` and LISTEN on the outbox channel.
+    ///
+    /// Returns `None` (pure-polling fallback) when the listener cannot be
+    /// set up — the poll tick alone still guarantees progress.
+    async fn connect_listener(&self) -> Option<PgListener> {
+        match PgListener::connect_with(&self.pool).await {
+            Ok(mut listener) => {
+                if let Err(e) = listener.listen(EVENT_LOG_NOTIFY_CHANNEL).await {
+                    error!(error = %e, "outbox: LISTEN failed — falling back to polling only");
+                    None
+                } else {
+                    Some(listener)
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "outbox: failed to connect PgListener — falling back to polling only");
+                None
+            }
+        }
+    }
+
+    /// Final drain pass on shutdown: flush whatever is pending, then log.
+    async fn final_drain(&self) {
+        match self.drain_once().await {
+            Ok(n) => info!(dispatched = n, "outbox: final drain before shutdown"),
+            Err(e) => error!(error = %e, "outbox: final drain before shutdown failed"),
+        }
+        info!("outbox dispatcher shutting down");
     }
 
     /// One drain pass: SELECT undispatched rows, publish each, mark dispatched.
@@ -222,10 +330,10 @@ impl OutboxDispatcher {
         let board_filter: Option<Id> = None;
 
         let rows = sqlx::query(
-            "SELECT id, tenant_id, board_id, aggregated_board_id, event_type, payload, created_at \
+            "SELECT id, tenant_id, board_id, aggregated_board_id, project_id, event_type, payload, created_at \
              FROM event_log \
              WHERE nats_seq IS NULL \
-               AND ($2::text IS NULL OR board_id = $2 OR aggregated_board_id = $2) \
+               AND ($2::text IS NULL OR board_id = $2 OR aggregated_board_id = $2 OR project_id = $2) \
              ORDER BY id \
              LIMIT $1",
         )
@@ -239,38 +347,75 @@ impl OutboxDispatcher {
 
         for row in &rows {
             let row_id: Id = row.get("id");
-            let object_id: Id = match row
-                .get::<Option<Id>, _>("aggregated_board_id")
-                .or_else(|| row.get::<Option<Id>, _>("board_id"))
-            {
-                Some(id) => id,
-                None => panic!("event_log row has neither board_id nor aggregated_board_id"),
-            };
+            let tenant_id: String = row.get("tenant_id");
             let event_type: String = row.get("event_type");
             let payload_json: JsonValue = row.get("payload");
             let created_at: DateTime<Utc> = row.get("created_at");
 
-            // Step 2: build BoardEventEnvelope.
+            // Routing: board and aggregated-board rows publish to
+            // kanban.board.<id>.events with the envelope board_id set;
+            // project rows publish to kanban.project.<id>.events with an
+            // empty envelope board_id (project-only events have no board
+            // context, per events.proto).
+            let (subject, envelope_board_id) = match row
+                .get::<Option<Id>, _>("aggregated_board_id")
+                .or_else(|| row.get::<Option<Id>, _>("board_id"))
+            {
+                Some(id) => (board_subject(&id.to_string()), id.to_string()),
+                None => match row.get::<Option<Id>, _>("project_id") {
+                    Some(id) => (project_subject(&id.to_string()), String::new()),
+                    None => {
+                        warn!(
+                            row_id = %row_id,
+                            event_type = %event_type,
+                            "outbox: row has no board/aggregated/project id — skipping"
+                        );
+                        continue;
+                    }
+                },
+            };
+
+            // Step 2: build BoardEventEnvelope (hydrates CardCreated payloads
+            // from the cards table; falls back to the minimal variant when the
+            // card no longer exists).
+            let payload = self
+                .build_payload(&event_type, &payload_json, &tenant_id)
+                .await;
             let envelope = build_envelope(
                 row_id,
-                object_id,
-                &event_type,
+                &envelope_board_id,
                 &payload_json,
                 created_at,
                 &self.pod_name,
+                payload,
             );
 
             // Step 3: encode to bytes.
             let encoded = Bytes::from(envelope.encode_to_vec());
 
-            // Step 4: publish via JetStream.
-            let subject = board_subject(&object_id.to_string());
-            let ack_future = match self.nats.publish_jetstream(&subject, encoded).await {
+            // Step 4: publish via JetStream with Nats-Msg-Id = row id so the
+            // server-side duplicate window dedupes retries (e.g. the
+            // UPDATE-failure path below).
+            let ack_result = match self.nats.jetstream() {
+                Some(js) => {
+                    let mut headers = async_nats::header::HeaderMap::new();
+                    headers.insert(async_nats::header::NATS_MESSAGE_ID, row_id.to_string());
+                    js.publish_with_headers(subject.clone(), headers, encoded)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => self
+                    .nats
+                    .publish_jetstream(&subject, encoded)
+                    .await
+                    .map_err(|e| e.to_string()),
+            };
+            let ack_future = match ack_result {
                 Ok(f) => f,
                 Err(e) => {
                     warn!(
                         row_id = %row_id,
-                        object_id = %object_id,
+                        subject = %subject,
                         event_type = %event_type,
                         error = %e,
                         "outbox: publish failed — row left undispatched for retry"
@@ -310,7 +455,6 @@ impl OutboxDispatcher {
                     // The card id rides in the payload; indexing failures are
                     // logged inside the helpers and never block dispatch.
                     if let Some((os, index)) = &self.opensearch {
-                        let tenant_id: String = row.get("tenant_id");
                         let card_id = payload_json
                             .get("card_id")
                             .and_then(|v| v.as_str())
@@ -341,11 +485,9 @@ impl OutboxDispatcher {
                          stays undispatched; duplicate publish possible on retry"
                     );
                     // Do not increment `dispatched` — the row is in a dirty state.
-                    // The next SELECT will pick it up again; JetStream deduplication
-                    // (if configured with a Nats-Msg-Id header) would prevent double
-                    // delivery, but we don't set that header today.
-                    // TODO: add Nats-Msg-Id = row_id.to_string() to publish headers for
-                    // server-side dedup.
+                    // The next SELECT will pick it up again; the Nats-Msg-Id
+                    // header set at publish time lets JetStream dedupe the
+                    // re-publish inside its duplicate window.
                 }
             }
         }
@@ -356,18 +498,53 @@ impl OutboxDispatcher {
 
 // ── Envelope builder ──────────────────────────────────────────────────────────
 
+impl OutboxDispatcher {
+    /// Build the oneof payload for an `event_log` row.
+    ///
+    /// `CardCreated` hydrates the full `Card` proto from the cards table at
+    /// dispatch time; when the card no longer exists (deleted between the
+    /// mutation and the drain) it falls back to the minimal variant so the
+    /// event still reaches subscribers. Every other event type maps purely
+    /// from the JSONB payload.
+    async fn build_payload(
+        &self,
+        event_type: &str,
+        json: &JsonValue,
+        tenant_id: &str,
+    ) -> Option<Payload> {
+        if event_type == "CardCreated"
+            && let Some(card_id) = json
+                .get("card_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Id>().ok())
+            && let Ok(card) =
+                crate::services::cards::fetch_full_card(&self.pool, card_id, tenant_id).await
+        {
+            return Some(Payload::CardCreated(Box::new(CardCreated {
+                card: Some(card).into(),
+                column_id: json_str(json, "column_id"),
+                position: json_i32(json, "position"),
+                idempotency_key: json_str(json, "idempotency_key"),
+                ..Default::default()
+            })));
+        }
+        build_payload(event_type, json)
+    }
+}
+
 /// Build a `BoardEventEnvelope` from a raw `event_log` row.
 ///
-/// The envelope fields are always populated. The oneof payload is built for
-/// the card event types emitted by `cards.rs`; unknown event types leave the
-/// oneof empty until their proto shapes are wired in.
+/// The envelope fields are always populated. `board_id` is empty for
+/// project-scoped rows (project-only events have no board context, per
+/// events.proto). `board_revision` rides in the JSONB payload (written by
+/// `crate::event_log::insert_board_event`); legacy rows without it get 0.
 fn build_envelope(
     row_id: Id,
-    board_id: Id,
-    event_type: &str,
+    board_id: &str,
     payload_json: &JsonValue,
     created_at: DateTime<Utc>,
     emitter_pod_id: &str,
+    payload: Option<Payload>,
 ) -> BoardEventEnvelope {
     let emitted_at = Some(Timestamp {
         seconds: created_at.timestamp(),
@@ -376,23 +553,13 @@ fn build_envelope(
     })
     .into();
 
-    // Build the oneof payload from the JSONB fields.
-    //
-    // cards.rs stores at minimum: { "card_id": "...", "board_id": "...", ... }
-    // We carry card_id / prev_revision / new_revision where present.
-    // Full field hydration (Card proto, patch Struct, Column proto, etc.) is
-    // deferred to Stage 4d.5 — see module-level doc comment.
-    let payload = build_payload(event_type, payload_json);
-
     BoardEventEnvelope {
         board_id: board_id.to_string(),
-        // event_id uses the row UUID as a stable ULID substitute until the
-        // event_log table gains a dedicated ULID column.
         event_id: row_id.to_string(),
         // nats_seq is set to 0 before publish; the real sequence is written
         // back to the DB after the JetStream ack.
         nats_seq: 0,
-        board_revision: 0, // TODO: carry board_revision in event_log payload
+        board_revision: json_u64(payload_json, "board_revision"),
         emitted_at,
         emitter_pod_id: emitter_pod_id.to_string(),
         actor_subject: payload_json
@@ -405,81 +572,127 @@ fn build_envelope(
     }
 }
 
+// ── JSON field helpers ────────────────────────────────────────────────────────
+
+/// Read a string field from the payload JSON; missing/wrong-typed → "".
+fn json_str(json: &JsonValue, key: &str) -> String {
+    json.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Read a u64 field from the payload JSON; missing/wrong-typed → 0.
+fn json_u64(json: &JsonValue, key: &str) -> u64 {
+    json.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// Read an i32 field from the payload JSON; missing/wrong-typed → 0.
+fn json_i32(json: &JsonValue, key: &str) -> i32 {
+    json.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
+}
+
+/// Read the (prev_revision, new_revision) pair carried by card mutations.
+fn revision_pair(json: &JsonValue) -> (u64, u64) {
+    (
+        json_u64(json, "prev_revision"),
+        json_u64(json, "new_revision"),
+    )
+}
+
+/// Parse an `EventColumn` from a nested payload object.
+fn parse_event_column(json: &JsonValue) -> EventColumn {
+    EventColumn {
+        id: json_str(json, "id"),
+        board_id: json_str(json, "board_id"),
+        title: json_str(json, "title"),
+        accent: json_str(json, "accent"),
+        wip_limit: json_i32(json, "wip_limit"),
+        position: json_i32(json, "position"),
+        ..Default::default()
+    }
+}
+
+/// Parse an `EventBoard` from a nested payload object.
+fn parse_event_board(json: &JsonValue) -> EventBoard {
+    EventBoard {
+        id: json_str(json, "id"),
+        project_id: json_str(json, "project_id"),
+        name: json_str(json, "name"),
+        description: json_str(json, "description"),
+        icon: json_str(json, "icon"),
+        ..Default::default()
+    }
+}
+
+// ── CardUpdated patch Struct ──────────────────────────────────────────────────
+
+/// True for payload values that encode "field not changed" and must be
+/// filtered out of the `CardUpdated` patch: empty strings (the sparse-patch
+/// sentinel used by `cards.rs` for text fields) and unspecified enum values
+/// (buffa serializes `EnumValue` as the proto name, e.g.
+/// `CARD_PRIORITY_UNSPECIFIED`).
+fn is_unchanged_sentinel(v: &JsonValue) -> bool {
+    match v {
+        JsonValue::String(s) => s.is_empty() || s.ends_with("_UNSPECIFIED"),
+        _ => false,
+    }
+}
+
+/// Convert the `payload.patch` JSON object into a `google.protobuf.Struct`,
+/// dropping unchanged sentinels and always setting `revision` to
+/// `new_revision` (per the events.proto contract).
+fn build_patch_struct(patch: Option<&JsonValue>, new_revision: u64) -> Struct {
+    let mut filtered = serde_json::Map::new();
+    if let Some(obj) = patch.and_then(JsonValue::as_object) {
+        for (k, v) in obj {
+            if !is_unchanged_sentinel(v) {
+                filtered.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    filtered.insert("revision".to_string(), JsonValue::from(new_revision));
+    serde_json::from_value(JsonValue::Object(filtered)).unwrap_or_default()
+}
+
+// ── Payload mapping ───────────────────────────────────────────────────────────
+
 /// Map an `event_type` string to the matching `board_event_envelope::Payload`
 /// oneof variant. Returns `None` (empty oneof) for unknown event types.
+///
+/// Pure/sync: the CardCreated arm emits the minimal variant; the dispatcher's
+/// async `build_payload` upgrades it to the hydrated Card when possible.
 fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
-    let card_id = json
-        .get("card_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let idempotency_key = json
-        .get("idempotency_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let card_id = json_str(json, "card_id");
+    let idempotency_key = json_str(json, "idempotency_key");
 
     match event_type {
-        "CardCreated" => {
-            // TODO(4d.5): hydrate the full Card proto from the payload JSON.
-            // For now we emit the minimal variant with just the card_id
-            // embedded in an empty Card so consumers can dedupe by event_id.
-            Some(Payload::CardCreated(Box::new(CardCreated {
-                card: None.into(),
-                column_id: json
-                    .get("column_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                position: json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                idempotency_key,
-                ..Default::default()
-            })))
-        }
+        "CardCreated" => Some(Payload::CardCreated(Box::new(CardCreated {
+            // Minimal variant: the full Card is hydrated by the dispatcher.
+            card: None.into(),
+            column_id: json_str(json, "column_id"),
+            position: json_i32(json, "position"),
+            idempotency_key,
+            ..Default::default()
+        }))),
         "CardUpdated" => {
-            let prev_revision = json
-                .get("prev_revision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let new_revision = json
-                .get("new_revision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let (prev_revision, new_revision) = revision_pair(json);
             Some(Payload::CardUpdated(Box::new(CardUpdated {
                 card_id,
                 prev_revision,
                 new_revision,
-                patch: None.into(), // TODO(4d.5): map JSONB diff to google.protobuf.Struct
+                patch: Some(build_patch_struct(json.get("patch"), new_revision)).into(),
                 idempotency_key,
                 ..Default::default()
             })))
         }
         "CardMoved" => {
-            let prev_revision = json
-                .get("prev_revision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let new_revision = json
-                .get("new_revision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let from_column = json
-                .get("from_column_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let to_column = json
-                .get("column_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let to_position = json.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let (prev_revision, new_revision) = revision_pair(json);
             Some(Payload::CardMoved(Box::new(CardMoved {
                 card_id,
-                from_column,
-                to_column,
-                to_position,
+                from_column: json_str(json, "from_column_id"),
+                to_column: json_str(json, "column_id"),
+                to_position: json_i32(json, "position"),
                 prev_revision,
                 new_revision,
                 idempotency_key,
@@ -487,10 +700,7 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
             })))
         }
         "CardDeleted" => {
-            let prev_revision = json
-                .get("prev_revision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let (prev_revision, _) = revision_pair(json);
             Some(Payload::CardDeleted(Box::new(CardDeleted {
                 card_id,
                 prev_revision,
@@ -498,13 +708,173 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 ..Default::default()
             })))
         }
-        // ColumnAdded, ColumnRenamed, ColumnRemoved, BoardRenamed, MembershipChanged:
-        // TODO(4d.5): map these event types. They require Column/BoardRenamed
-        // protos which need their own JSONB fields to be structured first.
+        "ColumnAdded" => Some(Payload::ColumnAdded(Box::new(ColumnAdded {
+            column: Some(parse_event_column(
+                json.get("column").unwrap_or(&JsonValue::Null),
+            ))
+            .into(),
+            position: json_i32(json, "position"),
+            ..Default::default()
+        }))),
+        "ColumnUpdated" => Some(Payload::ColumnUpdated(Box::new(ColumnUpdated {
+            column: Some(parse_event_column(
+                json.get("column").unwrap_or(&JsonValue::Null),
+            ))
+            .into(),
+            ..Default::default()
+        }))),
+        "ColumnRenamed" => Some(Payload::ColumnRenamed(Box::new(ColumnRenamed {
+            column_id: json_str(json, "column_id"),
+            new_title: json_str(json, "new_title"),
+            ..Default::default()
+        }))),
+        "ColumnRemoved" => Some(Payload::ColumnRemoved(Box::new(ColumnRemoved {
+            column_id: json_str(json, "column_id"),
+            move_cards_to_column: json_str(json, "move_cards_to_column"),
+            ..Default::default()
+        }))),
+        "ColumnsReordered" => {
+            let columns = json
+                .get("columns")
+                .and_then(JsonValue::as_array)
+                .map(|cols| cols.iter().map(parse_event_column).collect())
+                .unwrap_or_default();
+            Some(Payload::ColumnsReordered(Box::new(ColumnsReordered {
+                columns,
+                ..Default::default()
+            })))
+        }
+        "BoardCreated" => Some(Payload::BoardCreated(Box::new(BoardCreated {
+            project_id: json_str(json, "project_id"),
+            board_id: json_str(json, "board_id"),
+            name: json_str(json, "name"),
+            ..Default::default()
+        }))),
+        "BoardDeleted" => Some(Payload::BoardDeleted(Box::new(BoardDeleted {
+            project_id: json_str(json, "project_id"),
+            board_id: json_str(json, "board_id"),
+            ..Default::default()
+        }))),
+        "BoardRenamed" => Some(Payload::BoardRenamed(Box::new(BoardRenamed {
+            new_name: json_str(json, "new_name"),
+            ..Default::default()
+        }))),
+        "BoardUpdated" => Some(Payload::BoardUpdated(Box::new(BoardUpdated {
+            board: Some(parse_event_board(
+                json.get("board").unwrap_or(&JsonValue::Null),
+            ))
+            .into(),
+            ..Default::default()
+        }))),
+        "MemberAdded" => Some(Payload::MemberAdded(Box::new(MemberAdded {
+            project_id: json_str(json, "project_id"),
+            subject: json_str(json, "subject"),
+            relation: json_str(json, "relation"),
+            display_name: json_str(json, "display_name"),
+            email: json_str(json, "email"),
+            ..Default::default()
+        }))),
+        "MemberRemoved" => Some(Payload::MemberRemoved(Box::new(MemberRemoved {
+            project_id: json_str(json, "project_id"),
+            subject: json_str(json, "subject"),
+            ..Default::default()
+        }))),
+        "MemberRoleChanged" => Some(Payload::MemberRoleChanged(Box::new(MemberRoleChanged {
+            project_id: json_str(json, "project_id"),
+            subject: json_str(json, "subject"),
+            old_relation: json_str(json, "old_relation"),
+            new_relation: json_str(json, "new_relation"),
+            ..Default::default()
+        }))),
+        "ProjectUpdated" => Some(Payload::ProjectUpdated(Box::new(ProjectUpdated {
+            project_id: json_str(json, "project_id"),
+            name: json_str(json, "name"),
+            prefix: json_str(json, "prefix"),
+            description: json_str(json, "description"),
+            ..Default::default()
+        }))),
+        "AggregatedBoardCreated" => Some(Payload::AggregatedBoardCreated(Box::new(
+            AggregatedBoardCreated {
+                aggregated_board_id: json_str(json, "aggregated_board_id"),
+                ..Default::default()
+            },
+        ))),
+        "AggregatedBoardUpdated" => Some(Payload::AggregatedBoardUpdated(Box::new(
+            AggregatedBoardUpdated {
+                aggregated_board_id: json_str(json, "aggregated_board_id"),
+                ..Default::default()
+            },
+        ))),
+        "AggregatedBoardDeleted" => Some(Payload::AggregatedBoardDeleted(Box::new(
+            AggregatedBoardDeleted {
+                aggregated_board_id: json_str(json, "aggregated_board_id"),
+                ..Default::default()
+            },
+        ))),
+        "SourceBoardAdded" => Some(Payload::SourceBoardAdded(Box::new(SourceBoardAdded {
+            aggregated_board_id: json_str(json, "aggregated_board_id"),
+            board_id: json_str(json, "board_id"),
+            ..Default::default()
+        }))),
+        "SourceBoardRemoved" => Some(Payload::SourceBoardRemoved(Box::new(SourceBoardRemoved {
+            aggregated_board_id: json_str(json, "aggregated_board_id"),
+            board_id: json_str(json, "board_id"),
+            ..Default::default()
+        }))),
+        "GitHubLinkAdded" => Some(Payload::GithubLinkAdded(Box::new(GitHubLinkAdded {
+            card_id,
+            link_id: json_str(json, "link_id"),
+            ..Default::default()
+        }))),
+        "GitHubLinkRefreshed" => Some(Payload::GithubLinkRefreshed(Box::new(
+            GitHubLinkRefreshed {
+                card_id,
+                link_id: json_str(json, "link_id"),
+                new_state: json_str(json, "new_state"),
+                ..Default::default()
+            },
+        ))),
+        "MembershipChanged" => Some(Payload::MembershipChanged(Box::new(MembershipChanged {
+            subject: json_str(json, "subject"),
+            relation: json_str(json, "relation"),
+            granted: json
+                .get("granted")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            ..Default::default()
+        }))),
         _ => {
             warn!(event_type = %event_type, "outbox: unknown event_type — oneof left empty");
             None
         }
+    }
+}
+
+// ── Spawn-loop helpers ────────────────────────────────────────────────────────
+
+/// True once the shutdown watch has been signaled.
+fn shutdown_signaled(rx: &Option<watch::Receiver<bool>>) -> bool {
+    rx.as_ref().is_some_and(|r| *r.borrow())
+}
+
+/// Resolve when the shutdown watch fires (or its sender closes). Pends
+/// forever when no shutdown receiver is attached.
+async fn wait_shutdown(rx: &mut Option<watch::Receiver<bool>>) {
+    match rx.as_mut() {
+        Some(r) => {
+            let _ = r.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Receive the next NOTIFY; resolves `false` when the listener connection
+/// failed (caller drops the listener and falls back to polling). Pends
+/// forever when no listener is attached.
+async fn recv_notification(listener: &mut Option<PgListener>) -> bool {
+    match listener.as_mut() {
+        Some(l) => l.recv().await.is_ok(),
+        None => std::future::pending::<bool>().await,
     }
 }
 
@@ -833,10 +1203,6 @@ mod tests {
     // affecting other tests. This test documents the expected behaviour:
     // rows remain with nats_seq IS NULL when publish fails, and the dispatcher
     // returns 0 (not an error at the `drain_once` level).
-    //
-    // TODO: implement via a bad NATS URL dispatcher + live Postgres. The
-    // publish_jetstream call will fail immediately; drain_once should return
-    // Ok(0) and all rows stay NULL.
 
     #[tokio::test]
     async fn drain_once_leaves_rows_undispatched_when_publish_fails() {
@@ -891,22 +1257,60 @@ mod tests {
         let created_at = Utc::now();
         let payload = serde_json::json!({
             "card_id": "card-1",
-            "actor_subject": "user:alice"
+            "actor_subject": "user:alice",
+            "board_revision": 7
         });
 
         let env = build_envelope(
             row_id,
-            board_id,
-            "CardCreated",
+            &board_id.to_string(),
             &payload,
             created_at,
             "pod-test",
+            build_payload("CardCreated", &payload),
         );
 
         assert_eq!(env.board_id, board_id.to_string());
         assert_eq!(env.event_id, row_id.to_string());
         assert_eq!(env.actor_subject, "user:alice");
+        assert_eq!(env.board_revision, 7);
         assert!(env.emitted_at.is_set());
+        assert!(env.payload.is_some());
+    }
+
+    /// Legacy rows without `board_revision` in the payload default to 0.
+    #[test]
+    fn build_envelope_defaults_board_revision_to_zero() {
+        let payload = serde_json::json!({ "card_id": "card-1" });
+        let env = build_envelope(Id::new(), "b-1", &payload, Utc::now(), "pod-test", None);
+        assert_eq!(env.board_revision, 0);
+    }
+
+    /// Project-scoped rows keep the envelope board_id empty.
+    #[test]
+    fn build_envelope_project_scope_leaves_board_id_empty() {
+        let payload = serde_json::json!({
+            "project_id": "p-1",
+            "subject": "user:a",
+            "relation": "viewer"
+        });
+        let env = build_envelope(
+            Id::new(),
+            "",
+            &payload,
+            Utc::now(),
+            "pod-test",
+            build_payload("MemberAdded", &payload),
+        );
+        assert_eq!(env.board_id, "");
+        match env.payload {
+            Some(Payload::MemberAdded(ev)) => {
+                assert_eq!(ev.project_id, "p-1");
+                assert_eq!(ev.subject, "user:a");
+                assert_eq!(ev.relation, "viewer");
+            }
+            other => panic!("expected MemberAdded, got {other:?}"),
+        }
     }
 
     #[test]
@@ -992,7 +1396,7 @@ mod tests {
     #[test]
     fn build_payload_unknown_type_returns_none() {
         let json = serde_json::json!({ "card_id": "card-1" });
-        assert!(build_payload("BoardRenamed", &json).is_none());
+        assert!(build_payload("NoSuchEvent", &json).is_none());
         assert!(build_payload("", &json).is_none());
     }
 
@@ -1021,12 +1425,504 @@ mod tests {
         let payload = serde_json::json!({ "card_id": "card-1" });
         let env = build_envelope(
             row_id,
-            board_id,
-            "CardCreated",
+            &board_id.to_string(),
             &payload,
             Utc::now(),
             "pod-7",
+            None,
         );
         assert_eq!(env.emitter_pod_id, "pod-7");
+    }
+
+    // ── New payload arms ──────────────────────────────────────────────────────
+
+    #[test]
+    fn build_payload_column_added() {
+        let json = serde_json::json!({
+            "column": { "id": "c-1", "board_id": "b-1", "title": "Todo", "accent": "red", "wip_limit": 3, "position": 2 },
+            "position": 2
+        });
+        match build_payload("ColumnAdded", &json).unwrap() {
+            Payload::ColumnAdded(ev) => {
+                let col = ev.column.into_option().expect("column missing");
+                assert_eq!(col.id, "c-1");
+                assert_eq!(col.title, "Todo");
+                assert_eq!(col.accent, "red");
+                assert_eq!(col.wip_limit, 3);
+                assert_eq!(col.position, 2);
+                assert_eq!(ev.position, 2);
+            }
+            other => panic!("expected ColumnAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_column_updated() {
+        let json = serde_json::json!({
+            "column": { "id": "c-1", "board_id": "b-1", "title": "Doing", "position": 0 }
+        });
+        match build_payload("ColumnUpdated", &json).unwrap() {
+            Payload::ColumnUpdated(ev) => {
+                assert_eq!(
+                    ev.column.into_option().expect("column missing").title,
+                    "Doing"
+                );
+            }
+            other => panic!("expected ColumnUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_column_renamed_and_removed() {
+        let renamed = serde_json::json!({ "column_id": "c-1", "new_title": "Done" });
+        match build_payload("ColumnRenamed", &renamed).unwrap() {
+            Payload::ColumnRenamed(ev) => {
+                assert_eq!(ev.column_id, "c-1");
+                assert_eq!(ev.new_title, "Done");
+            }
+            other => panic!("expected ColumnRenamed, got {other:?}"),
+        }
+
+        let removed = serde_json::json!({ "column_id": "c-1", "move_cards_to_column": "" });
+        match build_payload("ColumnRemoved", &removed).unwrap() {
+            Payload::ColumnRemoved(ev) => {
+                assert_eq!(ev.column_id, "c-1");
+                assert_eq!(ev.move_cards_to_column, "");
+            }
+            other => panic!("expected ColumnRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_columns_reordered() {
+        let json = serde_json::json!({
+            "columns": [
+                { "id": "c-2", "board_id": "b-1", "title": "Doing", "position": 0 },
+                { "id": "c-1", "board_id": "b-1", "title": "Todo", "position": 1 }
+            ]
+        });
+        match build_payload("ColumnsReordered", &json).unwrap() {
+            Payload::ColumnsReordered(ev) => {
+                assert_eq!(ev.columns.len(), 2);
+                assert_eq!(ev.columns[0].id, "c-2");
+                assert_eq!(ev.columns[1].id, "c-1");
+            }
+            other => panic!("expected ColumnsReordered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_board_events() {
+        let created =
+            serde_json::json!({ "project_id": "p-1", "board_id": "b-1", "name": "Roadmap" });
+        match build_payload("BoardCreated", &created).unwrap() {
+            Payload::BoardCreated(ev) => {
+                assert_eq!(ev.project_id, "p-1");
+                assert_eq!(ev.board_id, "b-1");
+                assert_eq!(ev.name, "Roadmap");
+            }
+            other => panic!("expected BoardCreated, got {other:?}"),
+        }
+
+        let deleted = serde_json::json!({ "project_id": "p-1", "board_id": "b-1" });
+        match build_payload("BoardDeleted", &deleted).unwrap() {
+            Payload::BoardDeleted(ev) => {
+                assert_eq!(ev.project_id, "p-1");
+                assert_eq!(ev.board_id, "b-1");
+            }
+            other => panic!("expected BoardDeleted, got {other:?}"),
+        }
+
+        let renamed = serde_json::json!({ "new_name": "New Name" });
+        match build_payload("BoardRenamed", &renamed).unwrap() {
+            Payload::BoardRenamed(ev) => assert_eq!(ev.new_name, "New Name"),
+            other => panic!("expected BoardRenamed, got {other:?}"),
+        }
+
+        let updated = serde_json::json!({
+            "board": { "id": "b-1", "project_id": "p-1", "name": "N", "description": "d", "icon": "i" }
+        });
+        match build_payload("BoardUpdated", &updated).unwrap() {
+            Payload::BoardUpdated(ev) => {
+                let b = ev.board.into_option().expect("board missing");
+                assert_eq!(b.id, "b-1");
+                assert_eq!(b.icon, "i");
+            }
+            other => panic!("expected BoardUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_member_events() {
+        let added = serde_json::json!({
+            "project_id": "p-1", "subject": "user:a", "relation": "editor",
+            "display_name": "", "email": ""
+        });
+        match build_payload("MemberAdded", &added).unwrap() {
+            Payload::MemberAdded(ev) => {
+                assert_eq!(ev.subject, "user:a");
+                assert_eq!(ev.relation, "editor");
+            }
+            other => panic!("expected MemberAdded, got {other:?}"),
+        }
+
+        let removed = serde_json::json!({ "project_id": "p-1", "subject": "user:a" });
+        match build_payload("MemberRemoved", &removed).unwrap() {
+            Payload::MemberRemoved(ev) => assert_eq!(ev.subject, "user:a"),
+            other => panic!("expected MemberRemoved, got {other:?}"),
+        }
+
+        let changed = serde_json::json!({
+            "project_id": "p-1", "subject": "user:a",
+            "old_relation": "viewer", "new_relation": "admin"
+        });
+        match build_payload("MemberRoleChanged", &changed).unwrap() {
+            Payload::MemberRoleChanged(ev) => {
+                assert_eq!(ev.old_relation, "viewer");
+                assert_eq!(ev.new_relation, "admin");
+            }
+            other => panic!("expected MemberRoleChanged, got {other:?}"),
+        }
+
+        let membership =
+            serde_json::json!({ "subject": "user:a", "relation": "viewers", "granted": true });
+        match build_payload("MembershipChanged", &membership).unwrap() {
+            Payload::MembershipChanged(ev) => {
+                assert_eq!(ev.subject, "user:a");
+                assert!(ev.granted);
+            }
+            other => panic!("expected MembershipChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_project_updated() {
+        let json = serde_json::json!({
+            "project_id": "p-1", "name": "N", "prefix": "ABC", "description": "d"
+        });
+        match build_payload("ProjectUpdated", &json).unwrap() {
+            Payload::ProjectUpdated(ev) => {
+                assert_eq!(ev.project_id, "p-1");
+                assert_eq!(ev.prefix, "ABC");
+            }
+            other => panic!("expected ProjectUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_aggregated_board_events() {
+        let created = serde_json::json!({ "aggregated_board_id": "a-1" });
+        match build_payload("AggregatedBoardCreated", &created).unwrap() {
+            Payload::AggregatedBoardCreated(ev) => assert_eq!(ev.aggregated_board_id, "a-1"),
+            other => panic!("expected AggregatedBoardCreated, got {other:?}"),
+        }
+        match build_payload("AggregatedBoardUpdated", &created).unwrap() {
+            Payload::AggregatedBoardUpdated(ev) => assert_eq!(ev.aggregated_board_id, "a-1"),
+            other => panic!("expected AggregatedBoardUpdated, got {other:?}"),
+        }
+        match build_payload("AggregatedBoardDeleted", &created).unwrap() {
+            Payload::AggregatedBoardDeleted(ev) => assert_eq!(ev.aggregated_board_id, "a-1"),
+            other => panic!("expected AggregatedBoardDeleted, got {other:?}"),
+        }
+
+        let source = serde_json::json!({ "aggregated_board_id": "a-1", "board_id": "b-1" });
+        match build_payload("SourceBoardAdded", &source).unwrap() {
+            Payload::SourceBoardAdded(ev) => {
+                assert_eq!(ev.aggregated_board_id, "a-1");
+                assert_eq!(ev.board_id, "b-1");
+            }
+            other => panic!("expected SourceBoardAdded, got {other:?}"),
+        }
+        match build_payload("SourceBoardRemoved", &source).unwrap() {
+            Payload::SourceBoardRemoved(ev) => assert_eq!(ev.board_id, "b-1"),
+            other => panic!("expected SourceBoardRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_payload_github_link_events() {
+        let added = serde_json::json!({ "card_id": "c-1", "link_id": "l-1" });
+        match build_payload("GitHubLinkAdded", &added).unwrap() {
+            Payload::GithubLinkAdded(ev) => {
+                assert_eq!(ev.card_id, "c-1");
+                assert_eq!(ev.link_id, "l-1");
+            }
+            other => panic!("expected GithubLinkAdded, got {other:?}"),
+        }
+
+        let refreshed =
+            serde_json::json!({ "card_id": "c-1", "link_id": "l-1", "new_state": "closed" });
+        match build_payload("GitHubLinkRefreshed", &refreshed).unwrap() {
+            Payload::GithubLinkRefreshed(ev) => {
+                assert_eq!(ev.link_id, "l-1");
+                assert_eq!(ev.new_state, "closed");
+            }
+            other => panic!("expected GithubLinkRefreshed, got {other:?}"),
+        }
+    }
+
+    // ── CardUpdated patch Struct ──────────────────────────────────────────────
+
+    #[test]
+    fn card_updated_patch_filters_sentinels_and_sets_revision() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "prev_revision": 3,
+            "new_revision": 4,
+            "patch": {
+                "title": "New title",
+                "description": "",
+                "priority": "CARD_PRIORITY_UNSPECIFIED",
+                "urgency": "CARD_URGENCY_HIGH",
+                "blocked": false
+            }
+        });
+        match build_payload("CardUpdated", &json).unwrap() {
+            Payload::CardUpdated(ev) => {
+                let patch = ev.patch.into_option().expect("patch missing");
+                assert_eq!(
+                    patch.get("title").and_then(|v| v.as_str()),
+                    Some("New title")
+                );
+                assert_eq!(
+                    patch.get("urgency").and_then(|v| v.as_str()),
+                    Some("CARD_URGENCY_HIGH")
+                );
+                assert_eq!(patch.get("blocked").and_then(|v| v.as_bool()), Some(false));
+                assert!(
+                    patch.get("description").is_none(),
+                    "empty-string sentinel must be filtered"
+                );
+                assert!(
+                    patch.get("priority").is_none(),
+                    "unspecified enum sentinel must be filtered"
+                );
+                assert_eq!(
+                    patch.get("revision").and_then(|v| v.as_number()),
+                    Some(4.0),
+                    "revision key must always be present as a JSON number"
+                );
+            }
+            other => panic!("expected CardUpdated, got {other:?}"),
+        }
+    }
+
+    /// A CardUpdated without a patch object still carries the revision key.
+    #[test]
+    fn card_updated_without_patch_still_sets_revision() {
+        let json = serde_json::json!({
+            "card_id": "card-1",
+            "prev_revision": 0,
+            "new_revision": 9
+        });
+        match build_payload("CardUpdated", &json).unwrap() {
+            Payload::CardUpdated(ev) => {
+                let patch = ev.patch.into_option().expect("patch missing");
+                assert_eq!(patch.get("revision").and_then(|v| v.as_number()), Some(9.0));
+            }
+            other => panic!("expected CardUpdated, got {other:?}"),
+        }
+    }
+
+    // ── CardCreated hydration ─────────────────────────────────────────────────
+
+    /// CardCreated rows are hydrated with the full Card from the DB at
+    /// dispatch time; a deleted card falls back to the minimal variant.
+    #[tokio::test]
+    async fn build_payload_hydrates_card_created_from_db() {
+        let pool = setup_pool().await;
+        let nats = setup_nats().await;
+        let tenant_id = crate::test_support::test_tenant_id();
+        let (project_id, board_id, col_id, card_id) = seed_card_chain(&pool).await;
+
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+
+        let json = serde_json::json!({
+            "card_id": card_id.to_string(),
+            "column_id": col_id.to_string(),
+            "position": 0
+        });
+        let payload = dispatcher
+            .build_payload("CardCreated", &json, &tenant_id)
+            .await
+            .expect("payload expected");
+        match payload {
+            Payload::CardCreated(ev) => {
+                let card = ev.card.into_option().expect("hydrated card missing");
+                assert_eq!(card.id, card_id.to_string());
+                assert_eq!(card.title, "test-card");
+                assert_eq!(ev.column_id, col_id.to_string());
+            }
+            other => panic!("expected CardCreated, got {other:?}"),
+        }
+
+        // Unknown card id → minimal fallback (no hydrated card).
+        let missing = serde_json::json!({
+            "card_id": Id::new().to_string(),
+            "column_id": col_id.to_string()
+        });
+        let payload = dispatcher
+            .build_payload("CardCreated", &missing, &tenant_id)
+            .await
+            .expect("payload expected");
+        match payload {
+            Payload::CardCreated(ev) => assert!(!ev.card.is_set()),
+            other => panic!("expected CardCreated, got {other:?}"),
+        }
+
+        cleanup(&pool, board_id, project_id).await;
+    }
+
+    // ── Project-scope routing ─────────────────────────────────────────────────
+
+    /// Project rows are dispatched (marked with a JetStream sequence) and
+    /// carry an empty envelope board_id.
+    #[tokio::test]
+    async fn drain_once_dispatches_project_scoped_rows() {
+        let pool = setup_pool().await;
+        let nats = setup_nats().await;
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("stream bootstrap failed");
+
+        let project_id = crate::test_support::seed_project(&pool).await;
+        sqlx::query(
+            "INSERT INTO event_log (id, tenant_id, project_id, event_type, payload, created_at) \
+             VALUES ($1, $2, $3, $4, $5::jsonb, now())",
+        )
+        .bind(Id::new())
+        .bind(&tenant_id)
+        .bind(project_id)
+        .bind("MemberAdded")
+        .bind(serde_json::json!({
+            "project_id": project_id.to_string(),
+            "subject": "user:a",
+            "relation": "viewer"
+        }))
+        .execute(&pool)
+        .await
+        .expect("insert project event failed");
+
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), project_id);
+        let n = dispatcher.drain_once().await.expect("drain_once failed");
+        assert_eq!(n, 1, "project row must be dispatched");
+
+        let seq: Option<i64> =
+            sqlx::query_scalar("SELECT nats_seq FROM event_log WHERE project_id = $1")
+                .bind(project_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch nats_seq");
+        assert!(seq.unwrap_or(0) > 0, "nats_seq must be set after dispatch");
+
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+
+    /// Signaling the shutdown watch drains pending rows and exits the task.
+    #[tokio::test]
+    async fn spawn_drains_pending_rows_and_exits_on_shutdown() {
+        let pool = setup_pool().await;
+        let nats = setup_nats().await;
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("stream bootstrap failed");
+
+        let (project_id, board_id, _col_id, _card_id) = seed_card_chain(&pool).await;
+        seed_event_log(&pool, board_id, "CardCreated").await;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .with_shutdown(shutdown_rx)
+            .spawn();
+
+        // Let the loop start, then signal shutdown: the final drain must
+        // flush the pending row before the task exits.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(true).expect("shutdown send failed");
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("dispatcher task did not exit after shutdown")
+            .expect("dispatcher task panicked");
+
+        assert_eq!(
+            count_dispatched(&pool, board_id).await,
+            1,
+            "final drain must have flushed the pending row"
+        );
+
+        cleanup(&pool, board_id, project_id).await;
+    }
+
+    /// A committed event insert wakes the loop via LISTEN/NOTIFY well before
+    /// the (deliberately long) poll interval would fire.
+    #[tokio::test]
+    async fn spawn_wakes_on_pg_notify() {
+        let pool = setup_pool().await;
+        let nats = setup_nats().await;
+
+        crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
+            &nats,
+            &crate::realtime::jetstream_bootstrap::default_config(),
+        )
+        .await
+        .expect("stream bootstrap failed");
+
+        let (project_id, board_id, _col_id, _card_id) = seed_card_chain(&pool).await;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .with_poll_interval(Duration::from_secs(60))
+            .with_shutdown(shutdown_rx)
+            .spawn();
+
+        // Insert via the shared helper so pg_notify fires on commit.
+        let tenant_id = crate::test_support::test_tenant_id();
+        let mut tx = pool.begin().await.expect("begin tx");
+        crate::event_log::insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardCreated",
+            serde_json::json!({ "card_id": Id::new().to_string() }),
+        )
+        .await
+        .expect("insert_board_event failed");
+        tx.commit().await.expect("commit");
+
+        // NOTIFY must wake the loop within a couple of seconds even though the
+        // poll interval is 60s.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if count_dispatched(&pool, board_id).await == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("row was not dispatched via NOTIFY wake");
+
+        shutdown_tx.send(true).expect("shutdown send failed");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("dispatcher task did not exit")
+            .expect("dispatcher task panicked");
+
+        cleanup(&pool, board_id, project_id).await;
     }
 }

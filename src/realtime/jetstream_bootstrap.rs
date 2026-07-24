@@ -6,14 +6,20 @@
 //!
 //! # Stream layout
 //!
-//! One stream, `KANBAN_BOARD_EVENTS`, covers all boards via the wildcard
-//! subject `kanban.board.>`. Each board publishes to
-//! `kanban.board.<board_id>.events`.
+//! One stream, `KANBAN_BOARD_EVENTS`, covers all boards and projects via the
+//! wildcard subjects `kanban.board.>` and `kanban.project.>`. Each board
+//! publishes to `kanban.board.<board_id>.events`; each project publishes to
+//! `kanban.project.<project_id>.events`.
+//!
+//! `ensure_kanban_stream` is drift-correcting: after the get-or-create it
+//! compares the live stream config against the desired one and issues an
+//! `update_stream` when subjects, retention, or limits differ.
 //!
 //! # Consumer naming (MF-6)
 //!
 //! Live-tail consumers are ephemeral; NATS GCs them on disconnect.
-//! Format: `kanban-board-{board_id}-{pod_id}-{stream_id}`.
+//! Format: `kanban-board-{board_id}-{pod_id}-{stream_id}` for boards and
+//! `kanban-project-{project_id}-{pod_id}-{stream_id}` for projects.
 //!
 //! Replay consumers (replay-from-resume-token) are also ephemeral per RPC.
 //! Format: `kanban-replay-{board_id}-{replay_id}`.
@@ -22,6 +28,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use sunbeam_g2v::mq::NatsClient;
+use tracing::info;
 
 // ── Stable names ─────────────────────────────────────────────────────────────
 
@@ -34,11 +41,22 @@ pub const STREAM_SUBJECT_PREFIX: &str = "kanban.board.";
 /// Wildcard subject that covers every board; used in stream config.
 pub const STREAM_WILDCARD_SUBJECT: &str = "kanban.board.>";
 
+/// Subject prefix for per-project event subjects. Append `{project_id}.events`.
+pub const STREAM_SUBJECT_PREFIX_PROJECT: &str = "kanban.project.";
+
+/// Wildcard subject that covers every project; used in stream config.
+pub const STREAM_WILDCARD_SUBJECT_PROJECT: &str = "kanban.project.>";
+
 // ── Subject helpers ───────────────────────────────────────────────────────────
 
 /// Subject for events on a single board: `kanban.board.<board_id>.events`.
 pub fn board_subject(board_id: &str) -> String {
     format!("{STREAM_SUBJECT_PREFIX}{board_id}.events")
+}
+
+/// Subject for events on a single project: `kanban.project.<project_id>.events`.
+pub fn project_subject(project_id: &str) -> String {
+    format!("{STREAM_SUBJECT_PREFIX_PROJECT}{project_id}.events")
 }
 
 /// Ephemeral consumer name for live-tail per MF-6.
@@ -47,6 +65,13 @@ pub fn board_subject(board_id: &str) -> String {
 /// NATS GCs the consumer when the subscribing connection closes.
 pub fn live_tail_consumer_name(board_id: &str, pod_id: &str, stream_id: &str) -> String {
     format!("kanban-board-{board_id}-{pod_id}-{stream_id}")
+}
+
+/// Ephemeral consumer name for project live-tail.
+///
+/// Format: `kanban-project-{project_id}-{pod_id}-{stream_id}`.
+pub fn project_live_tail_consumer_name(project_id: &str, pod_id: &str, stream_id: &str) -> String {
+    format!("kanban-project-{project_id}-{pod_id}-{stream_id}")
 }
 
 // ── StreamConfig ──────────────────────────────────────────────────────────────
@@ -130,7 +155,7 @@ impl std::str::FromStr for Storage {
 pub fn default_config() -> StreamConfig {
     StreamConfig {
         name: STREAM_NAME,
-        subjects: &[STREAM_WILDCARD_SUBJECT],
+        subjects: &[STREAM_WILDCARD_SUBJECT, STREAM_WILDCARD_SUBJECT_PROJECT],
         retention: Retention::Limits,
         max_age_secs: 86_400,
         max_msgs_per_subject: 10_000,
@@ -158,9 +183,6 @@ impl From<&StreamConfig> for async_nats::jetstream::stream::Config {
                 Storage::File => async_nats::jetstream::stream::StorageType::File,
                 Storage::Memory => async_nats::jetstream::stream::StorageType::Memory,
             },
-            // TODO(g2v): expose retention + max_msgs_per_subject on NatsClient::ensure_stream
-            // so callers don't need to reach into async_nats types directly.
-            // For now, From<&StreamConfig> produces the native config which is passed through.
             ..Default::default()
         }
     }
@@ -168,11 +190,15 @@ impl From<&StreamConfig> for async_nats::jetstream::stream::Config {
 
 // ── Bootstrap entry point ─────────────────────────────────────────────────────
 
-/// Idempotently ensure the `KANBAN_BOARD_EVENTS` JetStream stream exists.
+/// Idempotently ensure the `KANBAN_BOARD_EVENTS` JetStream stream exists and
+/// matches `cfg`.
 ///
-/// Uses `NatsClient::ensure_stream` (g2v wrapper around
-/// `async_nats::jetstream::Context::get_or_create_stream`).
-/// A second call with the same config is a no-op.
+/// Looks the stream up by name and corrects drift (subjects, retention,
+/// limits) via `update_stream`; creates it when missing. `get_or_create_stream`
+/// is deliberately *not* used: it errors with "stream name already in use
+/// with a different configuration" (10058) instead of returning the drifted
+/// stream, which would make config upgrades impossible without manual stream
+/// surgery.
 ///
 /// # Errors
 ///
@@ -180,13 +206,74 @@ impl From<&StreamConfig> for async_nats::jetstream::stream::Config {
 /// propagates this with `?` — the process panics, which is correct (the stream
 /// is a hard dependency at startup).
 pub async fn ensure_kanban_stream(nats: &NatsClient, cfg: &StreamConfig) -> Result<()> {
-    let nats_cfg = async_nats::jetstream::stream::Config::from(cfg);
-    nats.ensure_stream(nats_cfg).await.map_err(|e| {
-        anyhow::anyhow!(
-            "fatal: failed to bootstrap {stream}: {e}",
-            stream = cfg.name
-        )
-    })?;
+    let js = nats
+        .jetstream()
+        .ok_or_else(|| anyhow::anyhow!("JetStream not enabled on NatsClient"))?;
+
+    match js.get_stream(cfg.name).await {
+        Ok(mut stream) => {
+            let current = stream
+                .info()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("fatal: failed to fetch {} stream info: {e}", cfg.name)
+                })?
+                .config
+                .clone();
+            correct_drift(js, cfg, &current).await
+        }
+        Err(_) => {
+            // Not found (or a lookup error treated as such) — create. On a
+            // create collision with another pod, fall back to the drift path.
+            let desired = async_nats::jetstream::stream::Config::from(cfg);
+            match js.create_stream(desired).await {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    let mut stream = js.get_stream(cfg.name).await.map_err(|e| {
+                        anyhow::anyhow!("fatal: failed to bootstrap {}: {e}", cfg.name)
+                    })?;
+                    let current = stream
+                        .info()
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("fatal: failed to fetch {} stream info: {e}", cfg.name)
+                        })?
+                        .config
+                        .clone();
+                    correct_drift(js, cfg, &current).await
+                }
+            }
+        }
+    }
+}
+
+/// Update the stream when the live config has drifted from the desired one.
+async fn correct_drift(
+    js: &async_nats::jetstream::Context,
+    cfg: &StreamConfig,
+    current: &async_nats::jetstream::stream::Config,
+) -> Result<()> {
+    let desired = async_nats::jetstream::stream::Config::from(cfg);
+    let drifted = current.subjects != desired.subjects
+        || current.retention != desired.retention
+        || current.max_age != desired.max_age
+        || current.max_messages_per_subject != desired.max_messages_per_subject
+        || current.num_replicas != desired.num_replicas
+        || current.storage != desired.storage;
+
+    if drifted {
+        js.update_stream(&desired).await.map_err(|e| {
+            anyhow::anyhow!(
+                "fatal: failed to correct drifted {} stream config: {e}",
+                cfg.name
+            )
+        })?;
+        info!(
+            stream = cfg.name,
+            "JetStream stream config drifted; updated to desired config"
+        );
+    }
+
     Ok(())
 }
 
@@ -220,8 +307,92 @@ mod tests {
             .await
             .expect("second ensure_kanban_stream failed (not idempotent)");
 
-        // TODO(g2v): when NatsClient exposes stream_info(), assert returned
-        // config matches default_config() fields (retention, max_age, etc.).
+        // The live stream config must match the desired one.
+        let js = nats.jetstream().expect("jetstream enabled");
+        let mut stream = js.get_stream(STREAM_NAME).await.expect("get_stream failed");
+        let info = stream.info().await.expect("stream info failed");
+        assert_eq!(info.config.subjects, cfg.subjects);
+        assert_eq!(
+            info.config.retention,
+            async_nats::jetstream::stream::RetentionPolicy::Limits
+        );
+        assert_eq!(
+            info.config.max_age,
+            std::time::Duration::from_secs(cfg.max_age_secs)
+        );
+        assert_eq!(
+            info.config.max_messages_per_subject,
+            cfg.max_msgs_per_subject
+        );
+    }
+
+    /// A drifted stream (missing the project wildcard subject, different
+    /// limits) must be corrected back to the desired config.
+    ///
+    /// Uses a dedicated stream name: mutating the shared `KANBAN_BOARD_EVENTS`
+    /// stream would race with parallel tests that ensure/subscribe to it.
+    #[tokio::test]
+    async fn ensure_kanban_stream_corrects_drift() {
+        const DRIFT_STREAM: &str = "KANBAN_BOARD_EVENTS_DRIFT_TEST";
+        // Dedicated subject namespace: reusing the production wildcards would
+        // overlap with the real KANBAN_BOARD_EVENTS stream (NATS error 10065)
+        // when tests run in parallel against the shared container.
+        const DRIFT_SUBJECT: &str = "kanban.drift-test.board.>";
+        const DRIFT_SUBJECT_PROJECT: &str = "kanban.drift-test.project.>";
+
+        let nats = Arc::clone(&crate::test_support::containers::setup().await.nats);
+
+        // Bootstrap a drifted config: board-only subjects, smaller limits.
+        let drifted = StreamConfig {
+            name: DRIFT_STREAM,
+            subjects: &[DRIFT_SUBJECT],
+            retention: Retention::Limits,
+            max_age_secs: 3_600,
+            max_msgs_per_subject: 100,
+            replicas: 1,
+            storage: Storage::File,
+        };
+        ensure_kanban_stream(&nats, &drifted)
+            .await
+            .expect("drifted bootstrap failed");
+
+        let cfg = StreamConfig {
+            name: DRIFT_STREAM,
+            subjects: &[DRIFT_SUBJECT, DRIFT_SUBJECT_PROJECT],
+            ..default_config()
+        };
+        ensure_kanban_stream(&nats, &cfg)
+            .await
+            .expect("drift-correcting ensure_kanban_stream failed");
+
+        let js = nats.jetstream().expect("jetstream enabled");
+        let mut stream = js
+            .get_stream(DRIFT_STREAM)
+            .await
+            .expect("get_stream failed");
+        let info = stream.info().await.expect("stream info failed");
+        assert_eq!(
+            info.config.subjects, cfg.subjects,
+            "project wildcard subject must have been added"
+        );
+        assert_eq!(
+            info.config.max_messages_per_subject,
+            cfg.max_msgs_per_subject
+        );
+        assert_eq!(
+            info.config.max_age,
+            std::time::Duration::from_secs(cfg.max_age_secs)
+        );
+
+        // Do not leak the scratch stream into other tests.
+        js.delete_stream(DRIFT_STREAM)
+            .await
+            .expect("delete_stream failed");
+    }
+
+    #[test]
+    fn project_subject_formats_events_subject() {
+        assert_eq!(project_subject("p-1"), "kanban.project.p-1.events");
     }
 
     #[test]

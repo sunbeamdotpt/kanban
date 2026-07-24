@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use connectrpc::{
     ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
+use serde_json::json;
 use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::broadcast;
@@ -35,14 +36,17 @@ use crate::auth::permission_dispatch::CheckedObjectId;
 use crate::auth::permission_retry::PermissionRetryExt;
 use crate::cpb::sunbeam::kanban::v1::{
     AddColumnRequest, AddColumnResponse, Board, BoardDetail, BoardEventEnvelope, BoardService,
-    Column, CreateBoardRequest, CreateBoardResponse, Cutover, DeleteBoardRequest,
-    DeleteBoardResponse, GetBoardRequest, GetBoardResponse, Heartbeat, ListBoardsRequest,
-    ListBoardsResponse, MoveColumnRequest, MoveColumnResponse, RemoveColumnRequest,
-    RemoveColumnResponse, SubscribeBoardRequest, SubscribeBoardResponse, UpdateBoardRequest,
-    UpdateBoardResponse, UpdateColumnRequest, UpdateColumnResponse, board_event_envelope::Payload,
+    CardCreated, Column, ColumnAdded, CreateBoardRequest, CreateBoardResponse, Cutover,
+    DeleteBoardRequest, DeleteBoardResponse, EventColumn, GetBoardRequest, GetBoardResponse,
+    Heartbeat, ListBoardsRequest, ListBoardsResponse, MoveColumnRequest, MoveColumnResponse,
+    RemoveColumnRequest, RemoveColumnResponse, SubscribeBoardRequest, SubscribeBoardResponse,
+    UpdateBoardRequest, UpdateBoardResponse, UpdateColumnRequest, UpdateColumnResponse,
+    board_event_envelope::Payload,
 };
+use crate::event_log::{insert_board_event, insert_project_event};
 use crate::realtime::cutover::{CutoverTracker, Outcome};
 use crate::realtime::registry::BoardSubscriberRegistry;
+use crate::services::cards::fetch_full_card;
 use crate::services::visibility::{db_to_proto, is_public_or_internal, proto_to_db};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -171,6 +175,52 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
     }
 }
 
+// ── Event payload helpers ─────────────────────────────────────────────────────
+
+/// Convert a `Column` proto into the minimal `EventColumn` snapshot carried
+/// inside event envelopes.
+fn event_column_from_proto(col: &Column) -> EventColumn {
+    EventColumn {
+        id: col.id.clone(),
+        board_id: col.board_id.clone(),
+        title: col.title.clone(),
+        accent: col.accent.clone(),
+        wip_limit: col.wip_limit,
+        position: col.position,
+        ..Default::default()
+    }
+}
+
+/// Serialize an `EventColumn` into the snake_case JSON shape the outbox
+/// dispatcher parses back into the proto.
+fn event_column_json(col: &EventColumn) -> serde_json::Value {
+    json!({
+        "id": col.id,
+        "board_id": col.board_id,
+        "title": col.title,
+        "accent": col.accent,
+        "wip_limit": col.wip_limit,
+        "position": col.position,
+    })
+}
+
+/// Serialize the board row into the `EventBoard` JSON shape the outbox
+/// dispatcher parses back into the proto.
+fn event_board_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
+    let id: Id = row.get("id");
+    let project_id: Id = row.get("project_id");
+    let name: String = row.get("name");
+    let description: Option<String> = row.get("description");
+    let icon: Option<String> = row.get("icon");
+    json!({
+        "id": id.to_string(),
+        "project_id": project_id.to_string(),
+        "name": name,
+        "description": description.unwrap_or_default(),
+        "icon": icon.unwrap_or_default(),
+    })
+}
+
 // ── Count helpers ─────────────────────────────────────────────────────────────
 
 pub(crate) async fn fetch_columns_count(
@@ -268,7 +318,7 @@ fn cutover_envelope(last_replay_nats_seq: u64) -> BoardEventEnvelope {
 }
 
 /// Build a `Heartbeat` envelope carrying the current server time.
-fn heartbeat_envelope() -> BoardEventEnvelope {
+pub(crate) fn heartbeat_envelope() -> BoardEventEnvelope {
     use std::time::{SystemTime, UNIX_EPOCH};
     let server_time_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -297,25 +347,26 @@ fn heartbeat_envelope() -> BoardEventEnvelope {
 /// Token revocation is handled by the sso-gateway during the introspection
 /// call that creates the `AuthContext`, so no additional revocation check is
 /// needed here.
-fn revalidate_token(_auth: &AuthContext) -> Result<bool, ConnectError> {
+pub(crate) fn revalidate_token(_auth: &AuthContext) -> Result<bool, ConnectError> {
     Ok(true)
 }
 
-/// Recheck authorization with the permission backend for a live board stream.
+/// Recheck authorization with the permission backend for a live stream.
 ///
 /// Returns `Ok(true)` if the caller still has access, `Ok(false)` if the
 /// permission was revoked, and `Err` if the permission check itself failed.
-async fn revalidate_permission(
+pub(crate) async fn revalidate_permission(
     permission: &PermissionClient,
     auth: &AuthContext,
-    board_id: &str,
+    object_type: &str,
+    object_id: &str,
 ) -> Result<bool, ConnectError> {
     let subject = auth.subject.as_deref().unwrap_or("");
     permission
-        .check_permission_with_retry("KanbanBoard", board_id, "view", subject)
+        .check_permission_with_retry(object_type, object_id, "view", subject)
         .await
         .map_err(|e| {
-            warn!(board_id, subject, error = %e, "stream: permission recheck failed");
+            warn!(object_type, object_id, subject, error = %e, "stream: permission recheck failed");
             ConnectError::internal("authorization check failed")
         })
 }
@@ -332,6 +383,85 @@ pub struct SubscribeBoardArgs {
     pub is_private: bool,
     pub heartbeat_interval: Duration,
     pub permission_recheck_interval: Duration,
+    pub pool: PgPool,
+    pub tenant_id: String,
+    /// Resume token: `0` requests a full snapshot replay; `> 0` skips the
+    /// snapshot and cuts over at that JetStream sequence.
+    pub since_seq: u64,
+    pub cutover_seen_capacity: usize,
+}
+
+/// Build a synthetic snapshot-replay envelope (`nats_seq = 0`).
+fn snapshot_envelope(board_id: &str, payload: Payload) -> BoardEventEnvelope {
+    BoardEventEnvelope {
+        board_id: board_id.to_string(),
+        event_id: Id::new().to_string(),
+        nats_seq: 0,
+        board_revision: 0,
+        emitted_at: None.into(),
+        emitter_pod_id: String::new(),
+        actor_subject: "system".to_string(),
+        payload: Some(payload),
+        ..Default::default()
+    }
+}
+
+/// Read the board snapshot for replay: columns ordered by position, cards per
+/// column ordered by position (as full `Card` protos), and the last replayed
+/// JetStream sequence for the board.
+///
+/// `MAX(nats_seq)` is read FIRST so that a mutation committed after this
+/// point is either inside the snapshot (its live event has `nats_seq` above
+/// the cutover and also arrives on the live tail — the client dedupes by
+/// card id / revision) or reaches the live tail; an event can be duplicated
+/// in that window but never lost.
+async fn read_board_snapshot(
+    pool: &PgPool,
+    tenant_id: &str,
+    board_id: &str,
+) -> Result<(Vec<Column>, Vec<crate::cpb::sunbeam::kanban::v1::Card>, u64), ConnectError> {
+    let last_replay: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(nats_seq), 0) FROM event_log WHERE board_id = $1 AND tenant_id = $2",
+    )
+    .bind(board_id)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| internal("failed to read last replayed nats_seq", e))?;
+
+    let col_rows = sqlx::query(
+        "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+         FROM columns WHERE board_id = $1 AND tenant_id = $2 ORDER BY position ASC",
+    )
+    .bind(board_id)
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| internal("failed to fetch columns for snapshot", e))?;
+    let columns: Vec<Column> = col_rows.iter().map(column_from_row).collect();
+
+    let mut cards = Vec::new();
+    for col in &columns {
+        let card_id: Id = col
+            .id
+            .parse()
+            .map_err(|_| ConnectError::internal("invalid column id in snapshot"))?;
+        let card_rows = sqlx::query(
+            "SELECT id FROM cards WHERE column_id = $1 AND tenant_id = $2 ORDER BY position ASC",
+        )
+        .bind(card_id)
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| internal("failed to fetch cards for snapshot", e))?;
+        for row in &card_rows {
+            let id: Id = row.get("id");
+            let card = fetch_full_card(pool, id, tenant_id).await?;
+            cards.push(card);
+        }
+    }
+
+    Ok((columns, cards, last_replay as u64))
 }
 
 /// Build the `SubscribeBoard` server-streaming response.
@@ -339,9 +469,18 @@ pub struct SubscribeBoardArgs {
 /// `heartbeat_interval` and `permission_recheck_interval` are configurable so
 /// tests can use short durations instead of the production defaults.
 ///
-/// Snapshot replay is not implemented yet. When it lands, this should
-/// emit the current columns and cards as synthetic `ColumnAdded` and
-/// `CardCreated` events with `nats_seq=0` before the `Cutover` envelope.
+/// Order of operations:
+///
+/// 1. Subscribe the registry handle FIRST so no live event is missed while
+///    the snapshot is being read.
+/// 2. With `since_seq == 0` (fresh subscription), emit the current board
+///    state as synthetic `ColumnAdded` / `CardCreated` replay envelopes
+///    (`nats_seq = 0`, `actor_subject = "system"`), each deduped through the
+///    cutover tracker.
+/// 3. Emit the `Cutover` envelope and transition the tracker to live at
+///    `MAX(nats_seq)` (or at `since_seq` for a resume, where the registry
+///    consumer replays retained history and the tracker drops older seqs).
+/// 4. Tail live events, heartbeats, and per-yield revalidation as before.
 pub async fn build_subscribe_board_stream(
     args: SubscribeBoardArgs,
 ) -> Result<SubscribeBoardStream, ConnectError> {
@@ -353,18 +492,16 @@ pub async fn build_subscribe_board_stream(
         is_private,
         heartbeat_interval,
         permission_recheck_interval,
+        pool,
+        tenant_id,
+        since_seq,
+        cutover_seen_capacity,
     } = args;
 
     let s = stream! {
-        // ── Step 1: emit Cutover immediately (empty replay, seq=0) ────────────
-        // TODO(4c.5): snapshot replay — emit synthetic CardCreated/ColumnAdded
-        // events before this Cutover, each with nats_seq=0.
-        yield Ok(SubscribeBoardResponse {
-            envelope: Some(cutover_envelope(0)).into(),
-            ..Default::default()
-        });
-
-        // ── Step 2: subscribe to live events ─────────────────────────────────
+        // ── Step 1: subscribe to live events FIRST ───────────────────────────
+        // Subscribing before reading the snapshot guarantees no live event is
+        // missed while the snapshot is being assembled.
         let mut handle = match Arc::clone(&registry).subscribe(&board_id).await {
             Ok(h) => h,
             Err(e) => {
@@ -374,8 +511,62 @@ pub async fn build_subscribe_board_stream(
             }
         };
 
-        let mut tracker = CutoverTracker::new();
-        tracker.cutover_to_live(0);
+        let mut tracker = CutoverTracker::with_capacity(cutover_seen_capacity);
+
+        // ── Step 2: snapshot replay (fresh) or direct cutover (resume) ───────
+        let cutover_seq = if since_seq == 0 {
+            match read_board_snapshot(&pool, &tenant_id, &board_id).await {
+                Ok((columns, cards, last_replay)) => {
+                    for col in &columns {
+                        let envelope = snapshot_envelope(
+                            &board_id,
+                            Payload::ColumnAdded(Box::new(ColumnAdded {
+                                column: Some(event_column_from_proto(col)).into(),
+                                position: col.position,
+                                ..Default::default()
+                            })),
+                        );
+                        if tracker.observe_replay(&envelope.event_id) == Outcome::Emit {
+                            yield Ok(SubscribeBoardResponse {
+                                envelope: Some(envelope).into(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    for card in cards {
+                        let envelope = snapshot_envelope(
+                            &board_id,
+                            Payload::CardCreated(Box::new(CardCreated {
+                                column_id: card.column_id.clone(),
+                                position: card.position,
+                                card: Some(card).into(),
+                                ..Default::default()
+                            })),
+                        );
+                        if tracker.observe_replay(&envelope.event_id) == Outcome::Emit {
+                            yield Ok(SubscribeBoardResponse {
+                                envelope: Some(envelope).into(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    last_replay
+                }
+                Err(status) => {
+                    yield Err(status);
+                    return;
+                }
+            }
+        } else {
+            since_seq
+        };
+
+        // ── Step 3: cut over to the live tail ────────────────────────────────
+        yield Ok(SubscribeBoardResponse {
+            envelope: Some(cutover_envelope(cutover_seq)).into(),
+            ..Default::default()
+        });
+        tracker.cutover_to_live(cutover_seq);
 
         let mut heartbeat = tokio::time::interval(heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -403,7 +594,7 @@ pub async fn build_subscribe_board_stream(
             // there is no permission to recheck. Private boards still recheck
             // the explicit view relation.
             if is_private && last_permission_recheck.elapsed() >= permission_recheck_interval {
-                match revalidate_permission(&permission, &auth, &board_id).await {
+                match revalidate_permission(&permission, &auth, PERMISSION_TYPE_BOARD, &board_id).await {
                     Ok(true) => {}
                     Ok(false) => {
                         yield Err(ConnectError::permission_denied("permission revoked mid-stream"));
@@ -648,7 +839,15 @@ impl BoardService for BoardServiceImpl {
         let slug = slug_from_name(&req.name);
         let visibility = proto_to_db(req.visibility.to_i32());
 
-        // INSERT board.
+        // INSERT board + BoardCreated outbox event in one transaction. The
+        // event is project-scoped: it signals a board-list change and is
+        // routed to kanban.project.<id>.events.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         let row = sqlx::query(
             r#"
             INSERT INTO boards (id, tenant_id, project_id, name, slug, description, icon, visibility)
@@ -668,7 +867,7 @@ impl BoardService for BoardServiceImpl {
             Some(req.icon.clone())
         })
         .bind(visibility)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db) = e
@@ -678,6 +877,23 @@ impl BoardService for BoardServiceImpl {
             }
             internal("failed to insert board", e)
         })?;
+
+        insert_project_event(
+            &mut tx,
+            &tenant_id,
+            project_id,
+            "BoardCreated",
+            json!({
+                "project_id": project_id.to_string(),
+                "board_id": board_id.to_string(),
+                "name": req.name,
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         // Permission backend FIRST: write parent tuple so board inherits project access.
         // KanbanBoard:{board_id}#parent@KanbanProject:{project_id}
@@ -766,6 +982,14 @@ impl BoardService for BoardServiceImpl {
 
         let new_visibility = proto_to_db(patch.visibility.to_i32());
 
+        // UPDATE board + BoardRenamed / BoardUpdated outbox events in one
+        // transaction.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         let row = sqlx::query(
             r#"
             UPDATE boards SET
@@ -785,10 +1009,37 @@ impl BoardService for BoardServiceImpl {
         .bind(&patch.icon)
         .bind(visibility_change)
         .bind(new_visibility)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update board", e))?
         .ok_or_else(|| ConnectError::not_found("board not found"))?;
+
+        // BoardRenamed when the name changed; BoardUpdated (EventBoard) when
+        // icon or description changed. Both may fire for one mutation.
+        if !patch.name.is_empty() {
+            insert_board_event(
+                &mut tx,
+                &tenant_id,
+                board_id,
+                "BoardRenamed",
+                json!({ "new_name": patch.name }),
+            )
+            .await?;
+        }
+        if !patch.description.is_empty() || !patch.icon.is_empty() {
+            insert_board_event(
+                &mut tx,
+                &tenant_id,
+                board_id,
+                "BoardUpdated",
+                json!({ "board": event_board_json(&row) }),
+            )
+            .await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         let columns_count = fetch_columns_count(&self.pool, board_id, Some(&tenant_id)).await;
         let cards_count = fetch_cards_count(&self.pool, board_id, Some(&tenant_id)).await;
@@ -815,16 +1066,50 @@ impl BoardService for BoardServiceImpl {
             .parse::<Id>()
             .map_err(|_| ConnectError::invalid_argument("invalid board_id"))?;
 
+        // BoardDeleted is project-scoped (a board-list change) and must be
+        // written BEFORE the DELETE: event_log.board_id cascade-deletes with
+        // the board, so only a project-scoped row survives.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
+        let project_id: Id =
+            sqlx::query_scalar("SELECT project_id FROM boards WHERE tenant_id = $1 AND id = $2")
+                .bind(&tenant_id)
+                .bind(board_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| internal("failed to fetch board", e))?
+                .ok_or_else(|| ConnectError::not_found("board not found"))?;
+
+        insert_project_event(
+            &mut tx,
+            &tenant_id,
+            project_id,
+            "BoardDeleted",
+            json!({
+                "project_id": project_id.to_string(),
+                "board_id": board_id.to_string(),
+            }),
+        )
+        .await?;
+
         let result = sqlx::query("DELETE FROM boards WHERE tenant_id = $1 AND id = $2")
             .bind(&tenant_id)
             .bind(board_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| internal("failed to delete board", e))?;
 
         if result.rows_affected() == 0 {
             return Err(ConnectError::not_found("board not found"));
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         // Best-effort permission parent tuple cleanup.
         warn!(
@@ -892,6 +1177,13 @@ impl BoardService for BoardServiceImpl {
 
         let column_id = Id::new();
 
+        // INSERT column + ColumnAdded outbox event in one transaction.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         let row = if req.position == 0 {
             // Append at the end: position = MAX(position) + 1.
             sqlx::query(
@@ -916,7 +1208,7 @@ impl BoardService for BoardServiceImpl {
             } else {
                 Some(req.wip_limit)
             })
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to insert column", e))?
         } else {
@@ -948,12 +1240,27 @@ impl BoardService for BoardServiceImpl {
                 Some(req.wip_limit)
             })
             .bind(req.position)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to insert column at position", e))?
         };
 
-        // Stage 4: emit BoardEventEnvelope::ColumnAdded over NATS subject kanban.board.<board_id>.events
+        let column = column_from_row(&row);
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "ColumnAdded",
+            json!({
+                "column": event_column_json(&event_column_from_proto(&column)),
+                "position": column.position,
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         // Store idempotency response.
         if !req.idempotency_key.is_empty()
@@ -970,7 +1277,7 @@ impl BoardService for BoardServiceImpl {
             }
 
         Ok(Response::new(AddColumnResponse {
-            column: Some(column_from_row(&row)).into(),
+            column: Some(column).into(),
             ..Default::default()
         }))
     }
@@ -998,6 +1305,13 @@ impl BoardService for BoardServiceImpl {
             .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
         let patch = req.column.into_option().unwrap_or_default();
 
+        // UPDATE column + ColumnUpdated outbox event in one transaction.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         let row = sqlx::query(
             r#"
             UPDATE columns SET
@@ -1015,15 +1329,27 @@ impl BoardService for BoardServiceImpl {
         .bind(&patch.title)
         .bind(&patch.accent)
         .bind(patch.wip_limit)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update column", e))?
         .ok_or_else(|| ConnectError::not_found("column not found on this board"))?;
 
-        // Stage 4: emit BoardEventEnvelope::ColumnUpdated over NATS subject kanban.board.<board_id>.events
+        let column = column_from_row(&row);
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "ColumnUpdated",
+            json!({ "column": event_column_json(&event_column_from_proto(&column)) }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(UpdateColumnResponse {
-            column: Some(column_from_row(&row)).into(),
+            column: Some(column).into(),
             ..Default::default()
         }))
     }
@@ -1058,6 +1384,14 @@ impl BoardService for BoardServiceImpl {
             .parse::<Id>()
             .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
 
+        // Delete + gap-fill + ColumnRemoved outbox event in one transaction.
+        // Removal semantics are unchanged: cards cascade-delete via FK.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         // Verify the column belongs to this board.
         let exists: bool = sqlx::query(
             "SELECT EXISTS(SELECT 1 FROM columns WHERE tenant_id = $1 AND id = $2 AND board_id = $3)",
@@ -1065,7 +1399,7 @@ impl BoardService for BoardServiceImpl {
         .bind(&tenant_id)
         .bind(col_id)
         .bind(board_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to verify column ownership", e))
         .map(|r| r.get::<bool, _>(0))?;
@@ -1080,7 +1414,7 @@ impl BoardService for BoardServiceImpl {
                 .bind(&tenant_id)
                 .bind(col_id)
                 .bind(board_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to delete column", e))?;
 
@@ -1105,13 +1439,27 @@ impl BoardService for BoardServiceImpl {
         )
         .bind(&tenant_id)
         .bind(board_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         {
             warn!(error = %e, board_id = %board_id, "failed to gap-fill column positions after remove");
         }
 
-        // Stage 4: emit BoardEventEnvelope::ColumnDeleted over NATS subject kanban.board.<board_id>.events
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "ColumnRemoved",
+            json!({
+                "column_id": col_id.to_string(),
+                "move_cards_to_column": "",
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
 
         Ok(Response::new(RemoveColumnResponse::default()))
     }
@@ -1147,6 +1495,13 @@ impl BoardService for BoardServiceImpl {
         // Convert to 0-based target.
         let target_pos = req.to_position - 1;
 
+        // Move + ColumnsReordered outbox event in one transaction.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
         // Fetch current position.
         let current_pos: i32 = sqlx::query(
             "SELECT position FROM columns WHERE tenant_id = $1 AND id = $2 AND board_id = $3",
@@ -1154,7 +1509,7 @@ impl BoardService for BoardServiceImpl {
         .bind(&tenant_id)
         .bind(col_id)
         .bind(board_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to fetch column position", e))?
         .ok_or_else(|| ConnectError::not_found("column not found on this board"))
@@ -1171,7 +1526,7 @@ impl BoardService for BoardServiceImpl {
                 .bind(board_id)
                 .bind(current_pos)
                 .bind(target_pos)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to shift columns (forward move)", e))?;
             } else {
@@ -1184,7 +1539,7 @@ impl BoardService for BoardServiceImpl {
                 .bind(board_id)
                 .bind(target_pos)
                 .bind(current_pos)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to shift columns (backward move)", e))?;
             }
@@ -1196,14 +1551,42 @@ impl BoardService for BoardServiceImpl {
             .bind(&tenant_id)
             .bind(col_id)
             .bind(target_pos)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| internal("failed to place moved column", e))?;
         }
 
-        // Stage 4: emit BoardEventEnvelope::ColumnsReordered over NATS subject kanban.board.<board_id>.events
+        // The full ordered column list is emitted so clients can replace
+        // their column order without tracking diffs.
+        let col_rows = sqlx::query(
+            "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+             FROM columns WHERE tenant_id = $1 AND board_id = $2 ORDER BY position ASC",
+        )
+        .bind(&tenant_id)
+        .bind(board_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to fetch columns", e))?;
+        let columns: Vec<Column> = col_rows.iter().map(column_from_row).collect();
 
-        let columns = fetch_board_columns(&self.pool, board_id).await?;
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "ColumnsReordered",
+            json!({
+                "columns": columns
+                    .iter()
+                    .map(|c| event_column_json(&event_column_from_proto(c)))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
         Ok(Response::new(MoveColumnResponse {
             columns,
             ..Default::default()
@@ -1224,8 +1607,7 @@ impl BoardService for BoardServiceImpl {
             .ok_or_else(|| ConnectError::unauthenticated("missing auth context"))?;
         let req = request.to_owned_message();
         let board_id = req.board_id;
-        // since_seq is reserved for Stage 4c.5 resume protocol; ignored here.
-        let _since_seq = req.since_seq;
+        let since_seq = req.since_seq;
 
         let tenant = auth
             .tenant_id
@@ -1260,6 +1642,10 @@ impl BoardService for BoardServiceImpl {
             is_private,
             heartbeat_interval: self.heartbeat_interval,
             permission_recheck_interval: self.permission_recheck_interval,
+            pool: self.pool.clone(),
+            tenant_id: tenant,
+            since_seq,
+            cutover_seen_capacity: self.cutover_seen_capacity,
         })
         .await?;
 
@@ -1349,6 +1735,10 @@ mod tests {
             is_private: true,
             heartbeat_interval: Duration::from_secs(15),
             permission_recheck_interval: Duration::from_secs(30),
+            pool: setup_pool().await,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq: 0,
+            cutover_seen_capacity: 1024,
         })
         .await
         .expect("build_subscribe_board_stream failed");
@@ -1414,6 +1804,10 @@ mod tests {
             is_private: true,
             heartbeat_interval: Duration::from_secs(15),
             permission_recheck_interval: Duration::from_secs(30),
+            pool: setup_pool().await,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq: 0,
+            cutover_seen_capacity: 1024,
         })
         .await
         .expect("build failed");
@@ -1508,6 +1902,10 @@ mod tests {
             is_private: true,
             heartbeat_interval: Duration::from_secs(1), // short interval for test
             permission_recheck_interval: Duration::from_secs(60), // long permission recheck to avoid interference
+            pool: setup_pool().await,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq: 0,
+            cutover_seen_capacity: 1024,
         })
         .await
         .expect("build failed");
@@ -1584,6 +1982,10 @@ mod tests {
             is_private: true,
             heartbeat_interval: Duration::from_millis(100), // fast heartbeat to keep loop ticking
             permission_recheck_interval: Duration::from_secs(1), // 1s permission recheck for test
+            pool: setup_pool().await,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq: 0,
+            cutover_seen_capacity: 1024,
         })
         .await
         .expect("build failed");
@@ -3033,6 +3435,10 @@ mod tests {
             is_private: false,
             heartbeat_interval: Duration::from_secs(15),
             permission_recheck_interval: Duration::from_secs(30),
+            pool: setup_pool().await,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq: 0,
+            cutover_seen_capacity: 1024,
         })
         .await
         .expect("build_subscribe_board_stream failed");
@@ -3058,5 +3464,675 @@ mod tests {
             }
             other => panic!("expected Cutover, got {other:?}"),
         }
+    }
+
+    // ── Snapshot replay tests ────────────────────────────────────────────────
+
+    /// Build a subscribe stream against a real seeded board.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_test_stream(
+        pool: PgPool,
+        registry: Arc<BoardSubscriberRegistry>,
+        permission: Arc<PermissionClient>,
+        subject: &str,
+        board_id: &str,
+        since_seq: u64,
+    ) -> SubscribeBoardStream {
+        build_subscribe_board_stream(SubscribeBoardArgs {
+            registry,
+            permission,
+            auth: make_auth(subject),
+            board_id: board_id.to_string(),
+            is_private: false,
+            heartbeat_interval: Duration::from_secs(15),
+            permission_recheck_interval: Duration::from_secs(30),
+            pool,
+            tenant_id: crate::test_support::test_tenant_id(),
+            since_seq,
+            cutover_seen_capacity: 1024,
+        })
+        .await
+        .expect("build_subscribe_board_stream failed")
+    }
+
+    async fn next_envelope(
+        stream: &mut SubscribeBoardStream,
+    ) -> crate::cpb::sunbeam::kanban::v1::BoardEventEnvelope {
+        use tokio_stream::StreamExt;
+        tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timeout waiting for envelope")
+            .expect("stream ended")
+            .expect("stream error")
+            .envelope
+            .into_option()
+            .expect("envelope missing")
+    }
+
+    /// Create a project + board + 2 columns + 3 cards (2 in col 1, 1 in col 2)
+    /// via the service, returning (project_id, board_id, col1, col2).
+    async fn seed_board_with_cards(
+        pool: &PgPool,
+        svc: &BoardServiceImpl,
+        subject: &str,
+    ) -> (Id, String, String, String) {
+        let project_id = create_test_project(pool, subject).await;
+        let board = svc
+            .create_board(
+                authed_ctx_with_object(subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Snapshot Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Public.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_board failed")
+            .body
+            .board
+            .into_option()
+            .expect("board missing");
+        let bid = board.id.clone();
+
+        let mut col_ids = Vec::new();
+        for title in ["S1", "S2"] {
+            let col = svc
+                .add_column(
+                    authed_ctx_with_object(subject, &bid),
+                    connect_request(&AddColumnRequest {
+                        board_id: bid.clone(),
+                        title: title.to_string(),
+                        accent: String::new(),
+                        wip_limit: 0,
+                        position: 0,
+                        idempotency_key: String::new(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("add_column failed")
+                .body
+                .column
+                .into_option()
+                .expect("column missing");
+            col_ids.push(col.id);
+        }
+
+        let col1: Id = col_ids[0].parse().expect("col id");
+        let col2: Id = col_ids[1].parse().expect("col id");
+        let board_id: Id = bid.parse().expect("board id");
+        create_test_card(pool, project_id, board_id, col1, subject, "SC-001").await;
+        create_test_card(pool, project_id, board_id, col1, subject, "SC-002").await;
+        create_test_card(pool, project_id, board_id, col2, subject, "SC-003").await;
+
+        (project_id, bid, col_ids[0].clone(), col_ids[1].clone())
+    }
+
+    /// A fresh subscription replays the board snapshot (ColumnAdded per
+    /// column, CardCreated per card), cuts over, then forwards live events.
+    #[tokio::test]
+    async fn subscribe_replays_snapshot_then_cutover_then_live() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = permission_client().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let (project_id, bid, col1, col2) = seed_board_with_cards(&pool, &svc, &subject).await;
+
+        let mut stream = build_test_stream(
+            pool.clone(),
+            registry,
+            Arc::clone(&permission),
+            &subject,
+            &bid,
+            0,
+        )
+        .await;
+
+        // Snapshot: ColumnAdded ×2 in column order.
+        for expected_col in [&col1, &col2] {
+            match next_envelope(&mut stream).await.payload {
+                Some(Payload::ColumnAdded(ev)) => {
+                    assert_eq!(
+                        ev.column.into_option().expect("column missing").id,
+                        *expected_col
+                    );
+                }
+                other => panic!("expected ColumnAdded, got {other:?}"),
+            }
+        }
+        // Snapshot: CardCreated ×3 with hydrated cards.
+        for _ in 0..3 {
+            match next_envelope(&mut stream).await.payload {
+                Some(Payload::CardCreated(ev)) => {
+                    let card = ev.card.into_option().expect("hydrated card missing");
+                    assert!(!card.id.is_empty());
+                    assert!(!card.title.is_empty());
+                }
+                other => panic!("expected CardCreated, got {other:?}"),
+            }
+        }
+        // Cutover at 0: no dispatched rows for this board yet.
+        match next_envelope(&mut stream).await.payload {
+            Some(Payload::Cutover(c)) => assert_eq!(c.last_replay_nats_seq, 0),
+            other => panic!("expected Cutover, got {other:?}"),
+        }
+
+        // Live: a new column mutation is drained by the outbox and forwarded.
+        let _ = svc
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "S3-live".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_column failed");
+        let board_id: Id = bid.parse().expect("board id");
+        let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
+            pool.clone(),
+            Arc::clone(&nats),
+            crate::realtime::outbox::OutboxConfig::default(),
+        )
+        .with_board_filter(board_id);
+        let n = dispatcher.drain_once().await.expect("drain_once failed");
+        assert_eq!(
+            n, 3,
+            "S1/S2 (from seeding) and S3-live must all be dispatched"
+        );
+
+        // The live tail forwards all three in order; the tracker accepts them
+        // because their stamped nats_seq is above the cutover point.
+        for expected_title in ["S1", "S2", "S3-live"] {
+            let live = next_envelope(&mut stream).await;
+            assert!(live.nats_seq > 0, "live events carry the real nats_seq");
+            match live.payload {
+                Some(Payload::ColumnAdded(ev)) => {
+                    assert_eq!(
+                        ev.column.into_option().expect("column missing").title,
+                        expected_title
+                    );
+                }
+                other => panic!("expected live ColumnAdded, got {other:?}"),
+            }
+        }
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    /// A resume (`since_seq > 0`) skips the snapshot and cuts over directly.
+    #[tokio::test]
+    async fn subscribe_with_since_seq_skips_snapshot() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = permission_client().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let (project_id, bid, _col1, _col2) = seed_board_with_cards(&pool, &svc, &subject).await;
+
+        let mut stream = build_test_stream(
+            pool.clone(),
+            registry,
+            Arc::clone(&permission),
+            &subject,
+            &bid,
+            7,
+        )
+        .await;
+
+        // The first envelope must be the Cutover at the requested sequence —
+        // no snapshot events precede it.
+        match next_envelope(&mut stream).await.payload {
+            Some(Payload::Cutover(c)) => assert_eq!(c.last_replay_nats_seq, 7),
+            other => panic!("expected Cutover, got {other:?}"),
+        }
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    // ── Event-writer tests ───────────────────────────────────────────────────
+
+    /// Subscribe the registry channel for one object (board or project
+    /// scope) and drain its pending outbox rows; the returned handle receives
+    /// the dispatched envelopes in order.
+    async fn subscribe_and_drain(
+        pool: &PgPool,
+        nats: Arc<NatsClient>,
+        registry: &Arc<BoardSubscriberRegistry>,
+        object_id: Id,
+        project_scoped: bool,
+    ) -> crate::realtime::registry::StreamHandle {
+        let handle = if project_scoped {
+            Arc::clone(registry)
+                .subscribe_project(&object_id.to_string())
+                .await
+                .expect("subscribe_project failed")
+        } else {
+            Arc::clone(registry)
+                .subscribe(&object_id.to_string())
+                .await
+                .expect("subscribe failed")
+        };
+        let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
+            pool.clone(),
+            nats,
+            crate::realtime::outbox::OutboxConfig::default(),
+        )
+        .with_board_filter(object_id);
+        let n = dispatcher.drain_once().await.expect("drain_once failed");
+        assert!(n >= 1, "expected at least one dispatched row");
+        handle
+    }
+
+    /// Receive the next envelope from a registry handle.
+    async fn recv_envelope(
+        handle: &mut crate::realtime::registry::StreamHandle,
+    ) -> crate::cpb::sunbeam::kanban::v1::BoardEventEnvelope {
+        tokio::time::timeout(Duration::from_secs(2), handle.receiver.recv())
+            .await
+            .expect("timeout waiting for envelope")
+            .expect("recv failed")
+    }
+
+    /// Fetch (event_type, payload) rows for a board, newest last.
+    async fn board_event_rows(pool: &PgPool, board_id: Id) -> Vec<(String, serde_json::Value)> {
+        sqlx::query(
+            "SELECT event_type, payload FROM event_log WHERE board_id = $1 ORDER BY created_at, id",
+        )
+        .bind(board_id)
+        .fetch_all(pool)
+        .await
+        .expect("fetch event rows")
+        .iter()
+        .map(|r| (r.get("event_type"), r.get("payload")))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn add_column_writes_and_dispatches_column_added_event() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&pool, &subject).await;
+        let board = svc
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Event Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_board failed")
+            .body
+            .board
+            .into_option()
+            .expect("board missing");
+        let bid = board.id.clone();
+        let board_id: Id = bid.parse().expect("board id");
+
+        let col = svc
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "Events C1".to_string(),
+                    accent: String::new(),
+                    wip_limit: 0,
+                    position: 0,
+                    idempotency_key: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_column failed")
+            .body
+            .column
+            .into_option()
+            .expect("column missing");
+
+        // event_log row: ColumnAdded with the column snapshot and revision 1.
+        let rows = board_event_rows(&pool, board_id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ColumnAdded");
+        assert_eq!(
+            rows[0].1.pointer("/column/title").and_then(|v| v.as_str()),
+            Some("Events C1")
+        );
+        assert_eq!(
+            rows[0].1.get("board_revision").and_then(|v| v.as_i64()),
+            Some(1)
+        );
+
+        // Dispatched oneof matches.
+        let mut handle = subscribe_and_drain(&pool, nats, &registry, board_id, false).await;
+        let env = recv_envelope(&mut handle).await;
+        assert_eq!(env.board_revision, 1);
+        assert!(env.nats_seq > 0);
+        match env.payload {
+            Some(Payload::ColumnAdded(ev)) => {
+                let c = ev.column.into_option().expect("column missing");
+                assert_eq!(c.id, col.id);
+                assert_eq!(c.title, "Events C1");
+            }
+            other => panic!("expected ColumnAdded, got {other:?}"),
+        }
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn update_column_writes_and_dispatches_column_updated_event() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let (project_id, bid, col1, _col2) = seed_board_with_cards(&pool, &svc, &subject).await;
+        let board_id: Id = bid.parse().expect("board id");
+
+        svc.update_column(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&UpdateColumnRequest {
+                board_id: bid.clone(),
+                column_id: col1.clone(),
+                column: Some(Column {
+                    title: "Renamed C1".to_string(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("update_column failed");
+
+        // Two ColumnAdded rows from seeding + one ColumnUpdated row.
+        let rows = board_event_rows(&pool, board_id).await;
+        let updated = rows
+            .iter()
+            .find(|(t, _)| t == "ColumnUpdated")
+            .expect("ColumnUpdated row missing");
+        assert_eq!(
+            updated.1.pointer("/column/title").and_then(|v| v.as_str()),
+            Some("Renamed C1")
+        );
+        assert_eq!(
+            updated.1.get("board_revision").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+
+        let mut handle = subscribe_and_drain(&pool, nats, &registry, board_id, false).await;
+        let mut seen_updated = false;
+        for _ in 0..3 {
+            let env = recv_envelope(&mut handle).await;
+            if let Some(Payload::ColumnUpdated(ev)) = env.payload {
+                assert_eq!(
+                    ev.column.into_option().expect("column missing").title,
+                    "Renamed C1"
+                );
+                seen_updated = true;
+            }
+        }
+        assert!(seen_updated, "ColumnUpdated envelope not dispatched");
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn move_column_writes_and_dispatches_columns_reordered_event() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let (project_id, bid, col1, col2) = seed_board_with_cards(&pool, &svc, &subject).await;
+        let board_id: Id = bid.parse().expect("board id");
+
+        svc.move_column(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&MoveColumnRequest {
+                board_id: bid.clone(),
+                column_id: col1.clone(),
+                to_position: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("move_column failed");
+
+        let rows = board_event_rows(&pool, board_id).await;
+        let reordered = rows
+            .iter()
+            .find(|(t, _)| t == "ColumnsReordered")
+            .expect("ColumnsReordered row missing");
+        let first_col = reordered
+            .1
+            .pointer("/columns/0/id")
+            .and_then(|v| v.as_str())
+            .expect("columns[0].id missing");
+        assert_eq!(first_col, col2, "col2 must lead after the move");
+
+        let mut handle = subscribe_and_drain(&pool, nats, &registry, board_id, false).await;
+        let mut seen_reordered = false;
+        for _ in 0..3 {
+            let env = recv_envelope(&mut handle).await;
+            if let Some(Payload::ColumnsReordered(ev)) = env.payload {
+                assert_eq!(ev.columns.len(), 2);
+                assert_eq!(ev.columns[0].id, col2);
+                assert_eq!(ev.columns[1].id, col1);
+                seen_reordered = true;
+            }
+        }
+        assert!(seen_reordered, "ColumnsReordered envelope not dispatched");
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn update_board_writes_board_renamed_and_board_updated_events() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&pool, &subject).await;
+        let board = svc
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Rename Me".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_board failed")
+            .body
+            .board
+            .into_option()
+            .expect("board missing");
+        let bid = board.id.clone();
+        let board_id: Id = bid.parse().expect("board id");
+
+        svc.update_board(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&UpdateBoardRequest {
+                board_id: bid.clone(),
+                board: Some(Board {
+                    name: "Renamed Board".to_string(),
+                    ..Default::default()
+                })
+                .into(),
+                update_mask: None.into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("update_board failed");
+
+        svc.update_board(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&UpdateBoardRequest {
+                board_id: bid.clone(),
+                board: Some(Board {
+                    description: "new description".to_string(),
+                    ..Default::default()
+                })
+                .into(),
+                update_mask: None.into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("update_board failed");
+
+        let rows = board_event_rows(&pool, board_id).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "BoardRenamed");
+        assert_eq!(
+            rows[0].1.get("new_name").and_then(|v| v.as_str()),
+            Some("Renamed Board")
+        );
+        assert_eq!(rows[1].0, "BoardUpdated");
+        assert_eq!(
+            rows[1].1.pointer("/board/name").and_then(|v| v.as_str()),
+            Some("Renamed Board")
+        );
+
+        let mut handle =
+            subscribe_and_drain(&pool, Arc::clone(&nats), &registry, board_id, false).await;
+        let env = recv_envelope(&mut handle).await;
+        match env.payload {
+            Some(Payload::BoardRenamed(ev)) => assert_eq!(ev.new_name, "Renamed Board"),
+            other => panic!("expected BoardRenamed, got {other:?}"),
+        }
+        let env = recv_envelope(&mut handle).await;
+        match env.payload {
+            Some(Payload::BoardUpdated(ev)) => {
+                let b = ev.board.into_option().expect("board missing");
+                assert_eq!(b.description, "new description");
+                assert_eq!(b.name, "Renamed Board");
+            }
+            other => panic!("expected BoardUpdated, got {other:?}"),
+        }
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn create_and_delete_board_write_project_scoped_events() {
+        let pool = setup_pool().await;
+        let nats = connect_nats().await;
+        ensure_stream(&nats).await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let registry = make_registry(Arc::clone(&nats)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&pool, &subject).await;
+        let board = svc
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Lifecycle Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_board failed")
+            .body
+            .board
+            .into_option()
+            .expect("board missing");
+        let bid = board.id.clone();
+
+        svc.delete_board(
+            authed_ctx_with_object(&subject, &bid),
+            connect_request(&DeleteBoardRequest {
+                board_id: bid.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("delete_board failed");
+
+        // Both events are project-scoped rows.
+        let rows = sqlx::query(
+            "SELECT event_type FROM event_log WHERE project_id = $1 ORDER BY created_at, id",
+        )
+        .bind(project_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch project event rows");
+        let types: Vec<String> = rows.iter().map(|r| r.get("event_type")).collect();
+        assert_eq!(types, vec!["BoardCreated", "BoardDeleted"]);
+
+        let mut handle =
+            subscribe_and_drain(&pool, Arc::clone(&nats), &registry, project_id, true).await;
+        let env = recv_envelope(&mut handle).await;
+        assert_eq!(
+            env.board_id, "",
+            "project-scoped envelopes carry no board_id"
+        );
+        match env.payload {
+            Some(Payload::BoardCreated(ev)) => {
+                assert_eq!(ev.board_id, bid);
+                assert_eq!(ev.project_id, project_id.to_string());
+                assert_eq!(ev.name, "Lifecycle Board");
+            }
+            other => panic!("expected BoardCreated, got {other:?}"),
+        }
+        let env = recv_envelope(&mut handle).await;
+        match env.payload {
+            Some(Payload::BoardDeleted(ev)) => assert_eq!(ev.board_id, bid),
+            other => panic!("expected BoardDeleted, got {other:?}"),
+        }
+
+        cleanup_project(&pool, project_id).await;
     }
 }

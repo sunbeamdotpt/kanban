@@ -6,6 +6,33 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.5] - 2026-07-24
+
+### Added
+
+- **Realtime spine completed.**
+  - `SubscribeBoard` now replays a board snapshot before the `Cutover` envelope: synthetic `ColumnAdded` per column and `CardCreated` per card (full `Card` hydration) with `nats_seq = 0`, followed by the live tail. `since_seq` is honored as the resume token — a non-zero value skips the snapshot and cuts over at that JetStream sequence.
+  - `SubscribeProject` is implemented: a multi-board merge of one child stream per project board plus project-scoped events (member add/remove/role-change, `ProjectUpdated`) carried on the new `kanban.project.{id}.events` subjects. Child heartbeats are deduplicated into a single stream heartbeat.
+  - Outbox dispatcher covers every event variant defined in `events.proto`: column, board, membership, project, aggregated-board, source-board, and GitHub-link payload arms. `CardUpdated` now carries its sparse patch as a `google.protobuf.Struct` (unchanged sentinels filtered, `revision` always set) and `CardCreated` hydrates the full `Card` proto at dispatch time.
+  - Every publish sets the `Nats-Msg-Id` header (event_log row id) so JetStream deduplicates the retry-after-ack-failure path server-side.
+  - `board_revision` is real: `boards`/`aggregated_boards` gain revision counters (migration `0030`) bumped in the same transaction as every event write, and the envelope carries the value.
+  - The outbox wakes on Postgres `LISTEN/NOTIFY` (`pg_notify` issued in the event transaction) with the 250 ms poll as fallback.
+  - JetStream bootstrap is drift-correcting: boot compares the live stream config against the desired one and updates it; the stream now also covers `kanban.project.>`.
+- **Graceful shutdown:** SIGTERM (and SIGINT) triggers axum's graceful shutdown and flips the outbox dispatcher into a final drain pass, bounded by a 10 s wait before exit.
+- **GithubLinkService is fully implemented:** `LinkIssue` (initial title/state sync from GitHub, degraded create when GitHub is unreachable), `UnlinkIssue`, `ListLinksByCard`, `SearchGithubIssues` (live proxy, no persistence), and `ResyncLink`, backed by the `github_links` table (new `kind` column, migration `0028`) and emitting `GitHubLinkAdded`/`GitHubLinkRefreshed` board events. New optional config: `KANBAN_GITHUB_TOKEN` and `KANBAN_GITHUB_API_BASE_URL` (default `https://api.github.com`).
+- Org-standard global templates seeded (migration `0029`): board template `standard` (To Do / In Progress / Review / Done — deliberately no Backlog, no Archived) and card templates `feature` (Given/When/Then), `bug` (Expected/Actual/Repro/Impact), and `chore`.
+
+### Fixed
+
+- **KANBAN-006:** `UpdateProject` bound the patch's `prefix` to the `slug` column and never updated `prefix`; the response then echoed a derived fallback. `prefix` now updates (uppercased, sparse), `slug` is immutable, and the response echoes the real column.
+- **KANBAN-012:** `ListCardsByBoard` with an unset limit returned exactly one card — `clamp(1, MAX)` rewrote `0` to `1`, making the default-page-size branch dead. Unset now means the default page size, and cursor pagination uses a composite `(column_id, position, id)` keyset that matches the `ORDER BY` (previously `id > cursor` against a different ordering skipped/duplicated rows). The same clamp bug in `ListComments` is fixed.
+- The registry pump stamps the JetStream stream sequence onto each envelope: the outbox publishes with `nats_seq = 0` (the real sequence only exists post-ack), so without stamping the cutover tracker dropped every live event as out-of-order.
+
+### Known issues
+
+- `RemoveColumn`/`DeleteBoard` still cascade-delete cards without `CardDeleted` event_log rows (unchanged from 2026.07.3; reconciler territory).
+- `AggregatedBoardDeleted` cannot be delivered through the outbox: the event_log row references the aggregate via `ON DELETE CASCADE`, so the row never survives the delete it would describe.
+
 ## [2026.07.4] - 2026-07-21
 
 ### Added

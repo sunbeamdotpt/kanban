@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `BoardSubscriberRegistry` — per-pod ephemeral NATS push consumer + broadcast fanout.
 //!
+//! Despite the name, the registry fans out both board subjects
+//! (`kanban.board.<id>.events`, via [`BoardSubscriberRegistry::subscribe`]) and
+//! project subjects (`kanban.project.<id>.events`, via
+//! [`BoardSubscriberRegistry::subscribe_project`]); both share the same map,
+//! pump-task, and refcount machinery through a common `subscribe_object` path.
+//!
 //! # Concurrency invariants
 //!
 //! - **`boards` is the single source of truth.** No channel state lives outside
@@ -34,7 +40,10 @@ use tracing::{debug, error, warn};
 
 use sunbeam_g2v::mq::NatsClient;
 
-use super::jetstream_bootstrap::{STREAM_NAME, board_subject, live_tail_consumer_name};
+use super::jetstream_bootstrap::{
+    STREAM_NAME, board_subject, live_tail_consumer_name, project_live_tail_consumer_name,
+    project_subject,
+};
 use crate::cpb::sunbeam::kanban::v1::BoardEventEnvelope;
 
 /// Per-board ring-buffer capacity. 256 covers typical burst windows;
@@ -124,24 +133,52 @@ impl BoardSubscriberRegistry {
     /// Returns `Err` if JetStream is not enabled on the client or if the NATS
     /// `create_consumer` call fails.
     pub async fn subscribe(self: Arc<Self>, board_id: &str) -> Result<StreamHandle> {
-        // Fast path: board already has a channel — take read lock, check, drop.
+        let stream_id = Id::new().to_string();
+        let subject = board_subject(board_id);
+        let consumer_name = live_tail_consumer_name(board_id, &self.pod_id, &stream_id);
+        self.subscribe_object(format!("board:{board_id}"), subject, consumer_name)
+            .await
+    }
+
+    /// Subscribe to live events for `project_id`
+    /// (`kanban.project.<id>.events`). Same channel-sharing semantics as
+    /// [`Self::subscribe`].
+    pub async fn subscribe_project(self: Arc<Self>, project_id: &str) -> Result<StreamHandle> {
+        let stream_id = Id::new().to_string();
+        let subject = project_subject(project_id);
+        let consumer_name = project_live_tail_consumer_name(project_id, &self.pod_id, &stream_id);
+        self.subscribe_object(format!("project:{project_id}"), subject, consumer_name)
+            .await
+    }
+
+    /// Shared subscribe path for board and project subjects.
+    ///
+    /// `map_key` namespaces the channel map so a board id and a project id
+    /// can never alias the same channel.
+    async fn subscribe_object(
+        self: Arc<Self>,
+        map_key: String,
+        subject: String,
+        consumer_name: String,
+    ) -> Result<StreamHandle> {
+        // Fast path: object already has a channel — take read lock, check, drop.
         {
             let guard = self.boards.read();
-            if guard.contains_key(board_id) {
+            if guard.contains_key(&map_key) {
                 // Drop read lock before upgrading to write lock.
                 drop(guard);
                 // Upgrade to write lock to increment refcount.
                 let mut guard = self.boards.write();
-                if let Some(ch) = guard.get_mut(board_id) {
+                if let Some(ch) = guard.get_mut(&map_key) {
                     ch.refcount += 1;
                     let receiver = ch.sender.subscribe();
                     debug!(
-                        board_id,
+                        map_key,
                         refcount = ch.refcount,
                         "subscriber joined existing channel"
                     );
                     return Ok(StreamHandle {
-                        board_id: board_id.to_string(),
+                        board_id: map_key,
                         receiver,
                         registry: Arc::clone(&self),
                     });
@@ -154,9 +191,6 @@ impl BoardSubscriberRegistry {
         }
 
         // Slow path: open a new push consumer and insert a new channel.
-        let stream_id = Id::new().to_string();
-        let consumer_name = live_tail_consumer_name(board_id, &self.pod_id, &stream_id);
-        let subject = board_subject(board_id);
         let deliver_inbox = self.nats.client().new_inbox();
 
         // Access the JetStream context. NatsClient::jetstream() returns Option<&Context>.
@@ -219,7 +253,14 @@ impl BoardSubscriberRegistry {
 
                 // Decode the protobuf envelope.
                 match BoardEventEnvelope::decode_from_slice(&payload) {
-                    Ok(envelope) => {
+                    Ok(mut envelope) => {
+                        // The outbox publishes with nats_seq = 0 (the sequence
+                        // is only known after the JetStream ack). Stamp the
+                        // authoritative stream sequence so cutover tracking
+                        // and client resume tokens see the real value.
+                        if let Ok(info) = msg.info() {
+                            envelope.nats_seq = info.stream_sequence;
+                        }
                         // Fire-and-forget: if there are no receivers (all dropped),
                         // send returns Err — we ignore it; the task will be aborted
                         // shortly via Drop.
@@ -246,7 +287,7 @@ impl BoardSubscriberRegistry {
         {
             let mut guard = self.boards.write();
             guard.insert(
-                board_id.to_string(),
+                map_key.clone(),
                 BoardChannel {
                     sender,
                     consumer_task: pump_task,
@@ -255,51 +296,52 @@ impl BoardSubscriberRegistry {
             );
         }
 
-        debug!(board_id, consumer = %consumer_name, "opened new NATS push consumer");
+        debug!(map_key, consumer = %consumer_name, "opened new NATS push consumer");
 
         Ok(StreamHandle {
-            board_id: board_id.to_string(),
+            board_id: map_key,
             receiver,
             registry: Arc::clone(&self),
         })
     }
 
-    /// Decrement the refcount for `board_id`. If it reaches 0, abort the pump
+    /// Decrement the refcount for `map_key`. If it reaches 0, abort the pump
     /// task and remove the entry from the map.
     ///
     /// Called from `StreamHandle::drop`; must not panic.
-    fn decrement_refcount(&self, board_id: &str) {
+    fn decrement_refcount(&self, map_key: &str) {
         let mut guard = self.boards.write();
-        let remove = match guard.get_mut(board_id) {
+        let remove = match guard.get_mut(map_key) {
             Some(ch) => {
                 ch.refcount = ch.refcount.saturating_sub(1);
-                debug!(board_id, refcount = ch.refcount, "subscriber dropped");
+                debug!(map_key, refcount = ch.refcount, "subscriber dropped");
                 ch.refcount == 0
             }
             None => {
-                warn!(board_id, "decrement_refcount called for unknown board");
+                warn!(map_key, "decrement_refcount called for unknown object");
                 false
             }
         };
 
-        if remove && let Some(ch) = guard.remove(board_id) {
+        if remove && let Some(ch) = guard.remove(map_key) {
             // Abort the pump task. The ephemeral consumer will be GC'd by
             // NATS after `inactive_threshold` (30s). No async work needed.
             ch.consumer_task.abort();
-            debug!(board_id, "removed board channel (last subscriber dropped)");
+            debug!(map_key, "removed channel (last subscriber dropped)");
         }
     }
 }
 
 // ── StreamHandle ──────────────────────────────────────────────────────────────
 
-/// A handle to an active board subscription.
+/// A handle to an active board or project subscription.
 ///
 /// Holds a `broadcast::Receiver<BoardEventEnvelope>`. When dropped, decrements
-/// the registry's refcount for this board; if the refcount reaches 0, the
+/// the registry's refcount for this object; if the refcount reaches 0, the
 /// ephemeral NATS push consumer's pump task is aborted and NATS auto-GCs
 /// the consumer after `inactive_threshold`.
 pub struct StreamHandle {
+    /// Registry map key (`board:<id>` or `project:<id>`), used for refcounting.
     pub board_id: String,
     pub receiver: broadcast::Receiver<BoardEventEnvelope>,
     registry: Arc<BoardSubscriberRegistry>,
@@ -419,7 +461,9 @@ mod tests {
         );
         {
             let guard = registry.boards.read();
-            let ch = guard.get(&board_id).expect("board channel missing");
+            let ch = guard
+                .get(&format!("board:{board_id}"))
+                .expect("board channel missing");
             assert_eq!(ch.refcount, 2, "refcount should be 2");
         }
 
@@ -478,7 +522,7 @@ mod tests {
         assert_eq!(registry.boards.read().len(), 1);
         {
             let guard = registry.boards.read();
-            let ch = guard.get(&board_id).unwrap();
+            let ch = guard.get(&format!("board:{board_id}")).unwrap();
             assert_eq!(ch.refcount, 1, "fresh channel must have refcount 1");
         }
     }
@@ -536,6 +580,60 @@ mod tests {
         // Board B subscriber must NOT receive it (timeout expected).
         let rb = tokio::time::timeout(Duration::from_millis(300), handle_b.receiver.recv()).await;
         assert!(rb.is_err(), "board B should not receive board A's event");
+    }
+
+    /// Project subscribers receive envelopes published to the project subject,
+    /// isolated from board subjects, and share one consumer per project.
+    #[tokio::test]
+    async fn subscribe_project_receives_project_events() {
+        let nats = setup_nats().await;
+        ensure_stream(&nats).await;
+
+        let project_id = format!("test-project-{}", Id::new());
+        let registry = Arc::new(BoardSubscriberRegistry::new(
+            Arc::clone(&nats),
+            "pod-test-project",
+        ));
+
+        let mut handle1 = Arc::clone(&registry)
+            .subscribe_project(&project_id)
+            .await
+            .expect("subscribe_project 1");
+        let mut handle2 = Arc::clone(&registry)
+            .subscribe_project(&project_id)
+            .await
+            .expect("subscribe_project 2");
+
+        // One channel for the project, refcount 2.
+        {
+            let guard = registry.boards.read();
+            assert_eq!(guard.len(), 1);
+            let ch = guard
+                .get(&format!("project:{project_id}"))
+                .expect("project channel missing");
+            assert_eq!(ch.refcount, 2);
+        }
+
+        let envelope = make_envelope("", "evt-project-1");
+        let subject = project_subject(&project_id);
+        let buf = bytes::Bytes::from(envelope.encode_to_vec());
+        nats.publish_jetstream(&subject, buf)
+            .await
+            .expect("publish failed")
+            .await
+            .expect("ack failed");
+
+        let r1 = tokio::time::timeout(Duration::from_secs(2), handle1.receiver.recv())
+            .await
+            .expect("timeout h1")
+            .expect("recv error h1");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), handle2.receiver.recv())
+            .await
+            .expect("timeout h2")
+            .expect("recv error h2");
+
+        assert_eq!(r1.event_id, "evt-project-1");
+        assert_eq!(r2.event_id, "evt-project-1");
     }
 
     /// A lagged receiver does not block or starve a fast receiver.
