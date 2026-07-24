@@ -10,17 +10,22 @@ timestamp: 2026-07-24T00:00:00Z
 
 ## In flight
 
-- **v2026.07.5 released** (tag pushed, release workflow building): realtime
-  spine completed (snapshot replay, `since_seq` resume, multi-board
-  `SubscribeProject`, full outbox event coverage, `Nats-Msg-Id` dedup,
-  `board_revision` counters, LISTEN/NOTIFY wake, drift-correcting JetStream
-  bootstrap, graceful shutdown), GithubLinkService fully implemented,
-  KANBAN-006 + KANBAN-012 fixed. Migrations 0028–0031. Suite green,
-  llvm-cov 90.5% lines / 92.8% functions.
-- **Deploy tasks sent to sbbb**: optional `KANBAN_GITHUB_TOKEN` /
-  `KANBAN_GITHUB_API_BASE_URL`; post-deploy verification of KANBAN-006/012.
-- **Task sent to nats-callout**: new `kanban.project.>` subject family needs
-  NATS subject grants before `SubscribeProject` works in prod.
+- **v2026.07.6 released** (tag pushed, workflow building): cross-board and
+  cross-project card dependencies (KANBAN-014) — target card may live on any
+  board/project in the tenant; both cards bump revision and both boards get
+  `CardUpdated`. No migrations, no new env vars. Deploy task #104 sent to
+  sbbb; once deployed, wire `KANBAN-009 depends_on CLI-004` (the motivating
+  case) and verify.
+- **v2026.07.5 deployed and verified** by sbbb (#101): realtime spine,
+  GithubLinkService, KANBAN-006/012 fixes confirmed in prod.
+- **Cross-tenant dependencies** filed as low-priority KANBAN-015 (design
+  question, no use case yet).
+- **CLI gotcha cards** CLI-001/002 filed on cli/dev + mail #103; KANBAN-009's
+  CLI half is CLI-004 on cli/dev (the human is doing the CLI work).
+- Note: `.maintainer/charter.md` was modified outside this session (sbbb
+  routing: board card instead of agent-mail; human escalation: in-session)
+  and rode along in the v2026.07.6 commit unreviewed — confirm with the
+  human it was their edit.
 
 ## Board state (kanban/dev)
 
