@@ -6,6 +6,39 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.7] - 2026-07-24
+
+### Added
+
+- **MilestoneService (KANBAN-017).** Project-scoped milestone CRUD —
+  `CreateMilestone` / `ListMilestones` / `GetMilestone` / `UpdateMilestone` /
+  `DeleteMilestone` — finally exposing the `milestones` table referenced by
+  `Card.milestone_id` since the beginning. `Milestone` carries computed
+  completion stats (`total_cards`, `completed_cards`) per the `MilestoneRef`
+  contract. Reads require `view` on the project, writes `manage`
+  (handler-enforced, templates pattern). `DeleteMilestone` clears
+  `cards.milestone_id` in the same transaction (no FK exists). No realtime
+  events are emitted (catalog-style, like templates).
+- **Label catalog CRUD (KANBAN-018).** New `LabelService` —
+  `CreateLabel` / `ListLabels` / `UpdateLabel` / `DeleteLabel` — over the
+  previously write-only label catalog, unblocking CLI label commands.
+  Labels are project-scoped or **global** (tenant-wide, migration `0032`:
+  nullable `labels.project_id` + partial unique indexes per scope);
+  `ListLabels` returns global labels plus the requested project's. Global
+  writes require `manage` on at least one project of the tenant (there is no
+  tenant-level permission object). Deleting a label cascades `card_labels`.
+
+### Fixed
+
+- **`milestone_id` honored in card writes (KANBAN-017).** `CreateCard` and
+  `UpdateCard` now validate that a referenced milestone exists and belongs to
+  the card's project (`invalid_argument` otherwise; unparseable IDs were
+  previously dropped silently). `UpdateCard` can **clear** a milestone:
+  naming `milestone_id` in `update_mask` with an empty patch value sets it to
+  NULL — legacy sentinel behavior (non-empty sets, empty = no change) is
+  unchanged when the mask does not name it. The `CardUpdated` event patch now
+  includes `milestone_id`.
+
 ## [2026.07.6] - 2026-07-24
 
 ### Added

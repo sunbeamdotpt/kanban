@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// proto/sunbeam/kanban/v1/milestones.proto
+//
+// Project-scoped milestones. Cards reference a milestone via
+// Card.milestone_id; this service manages the catalog and exposes the
+// computed completion stats promised on MilestoneRef in cards.proto.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+// A project-scoped milestone with computed card-completion stats.
+message Milestone {
+  string id = 1; // ULID.
+  string project_id = 2; // ULID.
+  string title = 3;
+  // Optional; absent when unset.
+  google.protobuf.Timestamp due = 4;
+  // Cards in the project with this milestone_id.
+  int32 total_cards = 5;
+  // Of those, cards with completed_at set.
+  int32 completed_cards = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message CreateMilestoneRequest {
+  // ULID — required. Caller needs manage on the project.
+  string project_id = 1;
+  string title = 2;
+  // Optional.
+  google.protobuf.Timestamp due = 3;
+}
+message CreateMilestoneResponse {
+  Milestone milestone = 1;
+}
+
+message ListMilestonesRequest {
+  // ULID — required. Caller needs view on the project.
+  string project_id = 1;
+}
+message ListMilestonesResponse {
+  repeated Milestone milestones = 1;
+}
+
+message GetMilestoneRequest {
+  // ULID — required.
+  string milestone_id = 1;
+}
+message GetMilestoneResponse {
+  Milestone milestone = 1;
+}
+
+message UpdateMilestoneRequest {
+  // ULID — required.
+  string milestone_id = 1;
+  // Updatable paths: "title", "due". Naming "due" with the field absent
+  // clears the due date.
+  google.protobuf.FieldMask update_mask = 2;
+  string title = 3;
+  google.protobuf.Timestamp due = 4;
+}
+message UpdateMilestoneResponse {
+  Milestone milestone = 1;
+}
+
+message DeleteMilestoneRequest {
+  // ULID — required. Cards referencing the milestone have their
+  // milestone_id cleared in the same transaction.
+  string milestone_id = 1;
+}
+message DeleteMilestoneResponse {}
+
+// Milestone CRUD. Reads require view on the parent project, writes require
+// manage. No realtime events are emitted (catalog-style, like templates).
+service MilestoneService {
+  rpc CreateMilestone(CreateMilestoneRequest) returns (CreateMilestoneResponse);
+  rpc ListMilestones(ListMilestonesRequest) returns (ListMilestonesResponse);
+  rpc GetMilestone(GetMilestoneRequest) returns (GetMilestoneResponse);
+  rpc UpdateMilestone(UpdateMilestoneRequest) returns (UpdateMilestoneResponse);
+  rpc DeleteMilestone(DeleteMilestoneRequest) returns (DeleteMilestoneResponse);
+}

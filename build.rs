@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/sunbeam/kanban/v1/events.proto",
         "proto/sunbeam/kanban/v1/aggregated_boards.proto",
         "proto/sunbeam/kanban/v1/github.proto",
+        "proto/sunbeam/kanban/v1/labels.proto",
+        "proto/sunbeam/kanban/v1/milestones.proto",
         "proto/sunbeam/kanban/v1/projects.proto",
         "proto/sunbeam/kanban/v1/public_boards.proto",
         "proto/sunbeam/kanban/v1/search.proto",

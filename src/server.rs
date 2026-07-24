@@ -33,8 +33,9 @@ use crate::auth::session_client::SsoGatewaySessionClient;
 use crate::auth::permission_dispatch::{DispatchState, dispatch};
 use crate::cpb::sunbeam::kanban::v1::{
     AggregatedBoardServiceExt as _, AttachmentServiceExt as _, BoardServiceExt as _,
-    CardServiceExt as _, GithubLinkServiceExt as _, ProjectServiceExt as _,
-    PublicBoardServiceExt as _, SearchServiceExt as _, TemplatesServiceExt as _,
+    CardServiceExt as _, GithubLinkServiceExt as _, LabelServiceExt as _, MilestoneServiceExt as _,
+    ProjectServiceExt as _, PublicBoardServiceExt as _, SearchServiceExt as _,
+    TemplatesServiceExt as _,
 };
 use crate::id::Id;
 use crate::integrations::opensearch::{OpenSearchClient, OpenSearchConfig};
@@ -43,7 +44,8 @@ use crate::realtime::registry::BoardSubscriberRegistry;
 use crate::services::{
     aggregated_boards::AggregatedBoardServiceImpl, attachments::AttachmentServiceImpl,
     boards::BoardServiceImpl, cards::CardServiceImpl, github::GitHubServiceImpl,
-    projects::ProjectServiceImpl, public_boards::PublicBoardServiceImpl, search::SearchServiceImpl,
+    labels::LabelServiceImpl, milestones::MilestoneServiceImpl, projects::ProjectServiceImpl,
+    public_boards::PublicBoardServiceImpl, search::SearchServiceImpl,
     templates::TemplatesServiceImpl,
 };
 use sunbeam_g2v::router::ServiceRouter;
@@ -758,6 +760,16 @@ pub async fn run_with_config(
     })
     .register(connect_router);
     let connect_router = Arc::new(TemplatesServiceImpl {
+        pool: pg_pool.clone(),
+        permission: Arc::clone(&permission),
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(MilestoneServiceImpl {
+        pool: pg_pool.clone(),
+        permission: Arc::clone(&permission),
+    })
+    .register(connect_router);
+    let connect_router = Arc::new(LabelServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
     })

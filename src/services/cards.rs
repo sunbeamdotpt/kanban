@@ -934,7 +934,27 @@ impl CardService for CardServiceImpl {
         let milestone_id: Option<Id> = if req.milestone_id.is_empty() {
             None
         } else {
-            req.milestone_id.parse::<Id>().ok()
+            let mid: Id = req
+                .milestone_id
+                .parse()
+                .map_err(|_| ConnectError::invalid_argument("invalid milestone_id"))?;
+            // The milestone must exist and belong to this card's project.
+            let exists = sqlx::query(
+                "SELECT 1 FROM milestones WHERE id = $1 AND tenant_id = $2 AND project_id = $3",
+            )
+            .bind(mid)
+            .bind(&tenant_id)
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to check milestone", e))?
+            .is_some();
+            if !exists {
+                return Err(ConnectError::invalid_argument(
+                    "milestone not found in this project",
+                ));
+            }
+            Some(mid)
         };
 
         sqlx::query(
@@ -1017,6 +1037,8 @@ impl CardService for CardServiceImpl {
     //
     // CheckedObjectId = card_id (KanbanCard + edit, per matrix).
     // Sparse patch via CASE WHEN. Bumps revision. event_log: CardUpdated.
+    // milestone_id is validated against the card's project and can be cleared
+    // by naming "milestone_id" in update_mask with an empty patch value.
 
     async fn update_card(
         &self,
@@ -1047,16 +1069,18 @@ impl CardService for CardServiceImpl {
         }
 
         // Fetch current card for board_id + revision.
-        let cur =
-            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
-                .bind(card_id)
-                .bind(&tenant_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| internal("failed to fetch card", e))?
-                .ok_or_else(|| ConnectError::not_found("card not found"))?;
+        let cur = sqlx::query(
+            "SELECT board_id, project_id, revision FROM cards WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(card_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch card", e))?
+        .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
         let board_id: Id = cur.get("board_id");
+        let project_id: Id = cur.get("project_id");
         let prev_revision: i64 = cur.get("revision");
 
         let priority_str: Option<&str> = if patch.priority != CardPriority::Unspecified {
@@ -1076,11 +1100,44 @@ impl CardService for CardServiceImpl {
             .into_option()
             .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32));
 
-        let milestone_id: Option<Id> = if patch.milestone_id.is_empty() {
-            None
-        } else {
-            patch.milestone_id.parse::<Id>().ok()
-        };
+        // milestone_id: legacy sentinel behavior (non-empty sets; empty = no
+        // change), plus explicit FieldMask semantics — when the mask names
+        // "milestone_id" the patch value applies exactly, and empty clears.
+        let mask_has_milestone = req
+            .update_mask
+            .as_option()
+            .map(|m| m.paths.iter().any(|p| p == "milestone_id"))
+            .unwrap_or(false);
+        let (milestone_apply, milestone_value): (bool, Option<Id>) =
+            if patch.milestone_id.is_empty() {
+                if mask_has_milestone {
+                    (true, None) // explicit clear
+                } else {
+                    (false, None) // no change
+                }
+            } else {
+                let mid: Id = patch
+                    .milestone_id
+                    .parse()
+                    .map_err(|_| ConnectError::invalid_argument("invalid milestone_id"))?;
+                // The milestone must exist and belong to this card's project.
+                let exists = sqlx::query(
+                    "SELECT 1 FROM milestones WHERE id = $1 AND tenant_id = $2 AND project_id = $3",
+                )
+                .bind(mid)
+                .bind(&tenant_id)
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to check milestone", e))?
+                .is_some();
+                if !exists {
+                    return Err(ConnectError::invalid_argument(
+                        "milestone not found in this project",
+                    ));
+                }
+                (true, Some(mid))
+            };
 
         let row = sqlx::query(
             "UPDATE cards SET
@@ -1091,10 +1148,10 @@ impl CardService for CardServiceImpl {
                 due_date    = CASE WHEN $6 IS NOT NULL THEN $6 ELSE due_date END,
                 blocked     = CASE WHEN $7 THEN $7 ELSE blocked END,
                 cover       = CASE WHEN $8 != '' THEN $8 ELSE cover END,
-                milestone_id = CASE WHEN $9 IS NOT NULL THEN $9 ELSE milestone_id END,
+                milestone_id = CASE WHEN $9 THEN $10 ELSE milestone_id END,
                 revision    = revision + 1,
                 updated_at  = now()
-             WHERE id = $1 AND tenant_id = $10
+             WHERE id = $1 AND tenant_id = $11
              RETURNING board_id, revision",
         )
         .bind(card_id)
@@ -1105,7 +1162,8 @@ impl CardService for CardServiceImpl {
         .bind(due_date)
         .bind(patch.blocked)
         .bind(&patch.cover)
-        .bind(milestone_id)
+        .bind(milestone_apply)
+        .bind(milestone_value)
         .bind(&tenant_id)
         .fetch_optional(&self.pool)
         .await
@@ -1127,6 +1185,8 @@ impl CardService for CardServiceImpl {
                 "urgency": patch.urgency,
                 "blocked": patch.blocked,
                 "cover": patch.cover,
+                "milestone_id": patch.milestone_id,
+                "milestone_cleared": milestone_apply && milestone_value.is_none(),
             }
         });
 
@@ -2952,7 +3012,7 @@ mod tests {
         let lid = Id::new();
         sqlx::query(
             "INSERT INTO labels (id, tenant_id, project_id, name, style) VALUES ($1, $2, $3, $4, 'amber') \
-             ON CONFLICT (tenant_id, project_id, name) DO NOTHING",
+             ON CONFLICT (tenant_id, project_id, name) WHERE project_id IS NOT NULL DO NOTHING",
         )
         .bind(lid)
         .bind(tenant_id)
@@ -2972,6 +3032,21 @@ mod tests {
         .await
         .expect("fetch label id failed");
         row.get("id")
+    }
+
+    async fn seed_milestone(pool: &PgPool, project_id: Id, tenant_id: &str, title: &str) -> Id {
+        let mid = Id::new();
+        sqlx::query(
+            "INSERT INTO milestones (id, tenant_id, project_id, title) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(mid)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(title)
+        .execute(pool)
+        .await
+        .expect("seed milestone failed");
+        mid
     }
 
     async fn cleanup_project(pool: &PgPool, project_id: Id) {
@@ -4627,6 +4702,178 @@ mod tests {
             "updated urgency should be high"
         );
         assert!(updated.revision > card.revision, "revision should bump");
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn update_card_sets_and_clears_milestone() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "MLS").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+        let mid = seed_milestone(&pool, pid, &tenant_id, "v1.0").await;
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Milestone set/clear".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(card.milestone_id.is_empty());
+
+        // Legacy sentinel behavior: non-empty sets, no mask required.
+        let updated = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card {
+                        milestone_id: mid.to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("set milestone failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert_eq!(updated.milestone_id, mid.to_string());
+
+        // Mask semantics: naming "milestone_id" with an empty value clears.
+        let cleared = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card::default()).into(),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["milestone_id".to_string()],
+                        ..Default::default()
+                    })
+                    .into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("clear milestone failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            cleared.milestone_id.is_empty(),
+            "milestone_id should be cleared"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn create_card_rejects_milestone_from_other_project() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "MLA").await;
+        let other_pid = seed_project(&pool, &subject, "MLB").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+        let foreign_mid = seed_milestone(&pool, other_pid, &tenant_id, "other").await;
+
+        let err = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Foreign milestone".to_string(),
+                    milestone_id: foreign_mid.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("foreign milestone must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+
+        cleanup_project(&pool, pid).await;
+        cleanup_project(&pool, other_pid).await;
+    }
+
+    #[tokio::test]
+    async fn update_card_rejects_unknown_milestone() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "MLU").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Unknown milestone".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let err = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card {
+                        milestone_id: Id::new().to_string(), // does not exist
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("unknown milestone must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
 
         cleanup_project(&pool, pid).await;
     }

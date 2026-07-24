@@ -10,6 +10,8 @@ pub mod attachments;
 pub mod boards;
 pub mod cards;
 pub mod github;
+pub mod labels;
+pub mod milestones;
 pub mod projects;
 pub mod public_boards;
 pub mod search;

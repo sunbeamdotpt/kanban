@@ -165,3 +165,61 @@ ritual, charter, and state.md now describe the kanban flow; mail references
 in older entries are historical. *Why:* the human standardized cross-repo
 tracking on kanban (this repo's product) so tickets are visible to
 everyone, not just the two mail endpoints.
+
+## 2026-07-24 — MilestoneService + label catalog CRUD (KANBAN-017/018)
+
+Both filed same-day with CLI consumers blocked (cli wants release grouping
+under a "3.2" milestone; CLI-007/CLI-009 blocked on label CRUD). Shipped as
+additive proto (`milestones.proto`, `labels.proto`), pushed to
+buf.build/sunbeamdotpt/kanban after `buf breaking` confirmed additive.
+
+Decisions and the why:
+- **None-source dispatch + handler-side KanbanProject checks** (view reads /
+  manage writes), copied from templates.rs: milestones/labels have no OpenFGA
+  object of their own and their ids are not permission objects. Matrix 68→77.
+- **Global labels via nullable `labels.project_id`** (migration 0032; NULL =
+  tenant-wide) instead of templates' `is_global` flag: the old
+  UNIQUE(tenant_id, project_id, name) can't express NULL-scope uniqueness, so
+  it was swapped for two partial unique indexes. *Gotcha:* any
+  `ON CONFLICT (tenant_id, project_id, name)` now needs the
+  `WHERE project_id IS NOT NULL` predicate — only cards.rs's test seed_label
+  used one (fixed); seeds use bare `ON CONFLICT DO NOTHING` and are fine.
+- **Global label writes = manage on at least one tenant project.** There is
+  no tenant-level OpenFGA object; this is the least-wrong check. Worth
+  revisiting if a tenant/admin object ever lands.
+- **No realtime events** for milestone/label CRUD — templates set the
+  catalog-CRUD-without-events precedent. Card-level milestone changes still
+  flow through `CardUpdated`.
+- **UpdateCard milestone clear:** the handler is sentinel-based and ignores
+  update_mask for every other field, so gating milestone *only* on the mask
+  would silently break existing clients that set it without a mask. Hybrid:
+  mask naming "milestone_id" applies the patch value exactly (empty clears);
+  otherwise legacy behavior (non-empty sets, empty = no change). Create/Update
+  now validate the milestone exists in the card's project (was parse-only,
+  silently dropping garbage ids).
+- **DeleteMilestone clears cards.milestone_id in the same tx** — no FK on
+  that column, so it had to be manual.
+- Milestone stats (total/completed cards) are computed per request with one
+  grouped query; no denormalized counters.
+- Release cut (2026.07.7 bump + tag) left to the human per charter;
+  CHANGELOG staged under [Unreleased].
+
+## 2026-07-24 — Scoped GitHub issue/PR auto-sync, filed KANBAN-019/020/021
+
+The human asked for scoping + ticketing only (no implementation). Current
+state: link sync is manual-only (`ResyncLink`); `github.proto` itself defers
+automatic sync and auto-status to "v2". Filed on kanban/dev:
+- KANBAN-019 (high) webhook receiver: unauthenticated axum route
+  `/webhooks/github` + HMAC-SHA256 (X-Hub-Signature-256), issues/pull_request
+  events applied payload-direct (no API call), cross-tenant link lookup via
+  idx_github_links_repo_issue, GitHubLinkRefreshed per affected board,
+  delivery-id dedupe, fast-2xx + async processing (GitHub's 10 s limit).
+- KANBAN-020 (medium) reconciliation worker: periodic stale-link sweep as the
+  missed-webhook fallback; rate-limit aware, changed-only events.
+- KANBAN-021 (medium) auto-status propagation onto cards — depends_on 019 AND
+  020 (needs the state-change feed); carries open product questions (what
+  maps where, per-board opt-in, user-override wins) that must be escalated
+  in-session before implementation.
+Deployment wiring (KANBAN_GITHUB_WEBHOOK_SECRET, ingress must pass the
+X-Hub-Signature-256/X-GitHub-* headers intact) filed on sbbb/dev per charter
+rule 4.

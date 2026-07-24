@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// proto/sunbeam/kanban/v1/labels.proto
+//
+// Label catalog CRUD. The Label message itself lives in cards.proto (cards
+// embed it). Labels are project-scoped, or global (tenant-wide) when
+// project_id is empty; ListLabels returns the global labels plus the
+// requested project's labels.
+
+syntax = "proto3";
+
+package sunbeam.kanban.v1;
+
+import "google/protobuf/field_mask.proto";
+import "sunbeam/kanban/v1/cards.proto";
+
+option java_package = "pt.sunbeam.kanban.v1";
+option java_multiple_files = true;
+option go_package = "pt.sunbeam/kanban/v1;kanbanv1";
+
+message CreateLabelRequest {
+  // ULID of the parent project. Empty creates a global (tenant-wide) label.
+  string project_id = 1;
+  string name = 2;
+  // Style token name, resolved client-side; free-form, never a hex code.
+  string style = 3;
+}
+message CreateLabelResponse {
+  Label label = 1;
+}
+
+message ListLabelsRequest {
+  // ULID — required. Returns the global labels plus this project's labels.
+  string project_id = 1;
+}
+message ListLabelsResponse {
+  repeated Label labels = 1;
+}
+
+message UpdateLabelRequest {
+  // ULID — required.
+  string label_id = 1;
+  // Updatable paths: "name", "style".
+  google.protobuf.FieldMask update_mask = 2;
+  string name = 3;
+  string style = 4;
+}
+message UpdateLabelResponse {
+  Label label = 1;
+}
+
+message DeleteLabelRequest {
+  // ULID — required. Card assignments are removed via the card_labels
+  // cascade.
+  string label_id = 1;
+}
+message DeleteLabelResponse {}
+
+// Label catalog CRUD. Reads require view on the requested project;
+// project-scoped writes require manage on that project; global writes
+// require manage on at least one project of the tenant (there is no
+// tenant-level permission object). No realtime events are emitted
+// (catalog-style, like templates).
+service LabelService {
+  rpc CreateLabel(CreateLabelRequest) returns (CreateLabelResponse);
+  rpc ListLabels(ListLabelsRequest) returns (ListLabelsResponse);
+  rpc UpdateLabel(UpdateLabelRequest) returns (UpdateLabelResponse);
+  rpc DeleteLabel(DeleteLabelRequest) returns (DeleteLabelResponse);
+}

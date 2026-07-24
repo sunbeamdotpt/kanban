@@ -120,7 +120,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 68] = [
+static MATRIX: [DispatchEntry; 77] = [
     // ── ProjectService (9) ──────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.ProjectService/ListProjects",
@@ -547,6 +547,68 @@ static MATRIX: [DispatchEntry; 68] = [
         relation: "",
         object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
     },
+    // ── MilestoneService (5) ────────────────────────────────────────────────
+    // Milestones are project-owned resources with no OpenFGA object of their
+    // own; the handler checks KanbanProject view/manage (templates pattern).
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.MilestoneService/CreateMilestone",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.MilestoneService/ListMilestones",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/view
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.MilestoneService/GetMilestone",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/view
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.MilestoneService/UpdateMilestone",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.MilestoneService/DeleteMilestone",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    // ── LabelService (4) ────────────────────────────────────────────────────
+    // Labels are project-owned or global (tenant-wide) catalog entries with no
+    // OpenFGA object of their own; the handler checks KanbanProject
+    // view/manage (templates pattern). Global writes require manage on at
+    // least one project of the tenant.
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.LabelService/CreateLabel",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.LabelService/ListLabels",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/view
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.LabelService/UpdateLabel",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
+    DispatchEntry {
+        method: "/sunbeam.kanban.v1.LabelService/DeleteLabel",
+        namespace: "",
+        relation: "",
+        object_id_source: ObjectIdSource::None, // handler checks KanbanProject/manage
+    },
 ];
 
 /// RPC methods that bypass the `permission_dispatch` middleware entirely.
@@ -930,6 +992,15 @@ mod tests {
                     "/sunbeam.kanban.v1.TemplatesService/CreateCardTemplate",
                     "/sunbeam.kanban.v1.TemplatesService/UpdateCardTemplate",
                     "/sunbeam.kanban.v1.TemplatesService/DeleteCardTemplate",
+                    "/sunbeam.kanban.v1.MilestoneService/CreateMilestone",
+                    "/sunbeam.kanban.v1.MilestoneService/ListMilestones",
+                    "/sunbeam.kanban.v1.MilestoneService/GetMilestone",
+                    "/sunbeam.kanban.v1.MilestoneService/UpdateMilestone",
+                    "/sunbeam.kanban.v1.MilestoneService/DeleteMilestone",
+                    "/sunbeam.kanban.v1.LabelService/CreateLabel",
+                    "/sunbeam.kanban.v1.LabelService/ListLabels",
+                    "/sunbeam.kanban.v1.LabelService/UpdateLabel",
+                    "/sunbeam.kanban.v1.LabelService/DeleteLabel",
                 ];
                 assert!(
                     none_methods.contains(&entry.method),
@@ -941,8 +1012,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_68() {
-        assert_eq!(MATRIX.len(), 68, "matrix must contain exactly 68 entries");
+    fn matrix_size_is_77() {
+        assert_eq!(MATRIX.len(), 77, "matrix must contain exactly 77 entries");
     }
 
     #[test]
