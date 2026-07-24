@@ -6,6 +6,20 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.6] - 2026-07-24
+
+### Added
+
+- **Cross-board and cross-project card dependencies (KANBAN-014).**
+  `AddCardDependency`/`RemoveCardDependency` previously required both cards on
+  the authorized board ("both cards must belong to the authorized board").
+  The source card must still belong to the authorized board (the middleware
+  gates `edit` on it), but the dependency target may now live on any board or
+  project in the same tenant; cross-tenant targets remain rejected. Both
+  cards' revisions bump and both boards receive a `CardUpdated` event, so
+  `depends_on_card_ids`/`dependent_card_ids` stay consistent on every
+  affected board's stream.
+
 ## [2026.07.5] - 2026-07-24
 
 ### Added

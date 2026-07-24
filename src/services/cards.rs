@@ -1462,8 +1462,9 @@ impl CardService for CardServiceImpl {
     //
     // CheckedObjectId = board_id (KanbanBoard + edit, per matrix).
     // Creates a directed edge: card_id depends on depends_on_card_id.
-    // Both cards must belong to the authorized board. Bumps card_id revision.
-    // event_log: CardUpdated.
+    // card_id must belong to the authorized board; depends_on_card_id may live
+    // on any board/project in the same tenant (KANBAN-014). Bumps both cards'
+    // revisions. event_log: CardUpdated on both boards.
 
     async fn add_card_dependency(
         &self,
@@ -1518,29 +1519,42 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("begin tx failed", e))?;
 
-        // Verify both cards belong to the authorized board.
-        let rows =
-            sqlx::query("SELECT id, revision FROM cards WHERE id = ANY($1) AND board_id = $2 AND tenant_id = $3")
-                .bind(&[card_id, depends_on_id][..])
-                .bind(board_id)
-                .bind(&tenant_id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| internal("failed to verify cards", e))?;
-
-        if rows.len() != 2 {
-            return Err(ConnectError::invalid_argument(
-                "both cards must belong to the authorized board",
-            ));
-        }
+        // Verify the source card belongs to the authorized board (the object
+        // the middleware gated `edit` on). The target card only needs to exist
+        // in the same tenant — cross-board and cross-project dependencies are
+        // allowed (KANBAN-014).
+        let rows = sqlx::query(
+            "SELECT id, board_id, revision FROM cards WHERE id = ANY($1) AND tenant_id = $2",
+        )
+        .bind(&[card_id, depends_on_id][..])
+        .bind(&tenant_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to verify cards", e))?;
 
         let mut prev_revision = 0i64;
+        let mut source_on_board = false;
+        let mut target: Option<(Id, i64)> = None; // (board_id, revision)
         for row in &rows {
             let id: Id = row.get("id");
             if id == card_id {
                 prev_revision = row.get("revision");
+                source_on_board = row.get::<Id, _>("board_id") == board_id;
+            } else {
+                target = Some((row.get("board_id"), row.get("revision")));
             }
         }
+
+        if !source_on_board {
+            return Err(ConnectError::invalid_argument(
+                "card does not belong to the authorized board",
+            ));
+        }
+        let Some((target_board_id, target_prev_revision)) = target else {
+            return Err(ConnectError::invalid_argument(
+                "dependency card not found in tenant",
+            ));
+        };
 
         sqlx::query(
             "INSERT INTO card_dependencies (card_id, depends_on_card_id) VALUES ($1, $2) \
@@ -1573,6 +1587,36 @@ impl CardService for CardServiceImpl {
         });
         insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
+        // The target card gains a dependent: bump its revision and emit on its
+        // own board so that board's stream sees the change too.
+        let target_updated = sqlx::query(
+            "UPDATE cards SET revision = revision + 1, updated_at = now() \
+             WHERE id = $1 AND tenant_id = $2 RETURNING revision",
+        )
+        .bind(depends_on_id)
+        .bind(&tenant_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to bump dependency card revision", e))?;
+        let target_new_revision: i64 = target_updated.get("revision");
+
+        let target_payload = json!({
+            "card_id": depends_on_id.to_string(),
+            "board_id": target_board_id.to_string(),
+            "dependent_card_id": card_id.to_string(),
+            "prev_revision": target_prev_revision,
+            "new_revision": target_new_revision,
+            "idempotency_key": req.idempotency_key,
+        });
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            target_board_id,
+            "CardUpdated",
+            target_payload,
+        )
+        .await?;
+
         tx.commit()
             .await
             .map_err(|e| internal("commit failed", e))?;
@@ -1589,8 +1633,10 @@ impl CardService for CardServiceImpl {
     // ── RemoveCardDependency ──────────────────────────────────────────────────
     //
     // CheckedObjectId = board_id (KanbanBoard + edit, per matrix).
-    // Removes a directed dependency edge. Both cards must belong to the board.
-    // Bumps card_id revision. event_log: CardUpdated.
+    // Removes a directed dependency edge. card_id must belong to the
+    // authorized board; depends_on_card_id may live on any board/project in
+    // the same tenant (KANBAN-014). Bumps both cards' revisions when an edge
+    // was removed. event_log: CardUpdated on both boards.
 
     async fn remove_card_dependency(
         &self,
@@ -1660,19 +1706,23 @@ impl CardService for CardServiceImpl {
         };
 
         let depends_row =
-            sqlx::query("SELECT 1 FROM cards WHERE id = $1 AND board_id = $2 AND tenant_id = $3")
+            sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
                 .bind(depends_on_id)
-                .bind(board_id)
                 .bind(&tenant_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| internal("failed to verify dependency card", e))?;
 
-        if depends_row.is_none() {
-            return Err(ConnectError::invalid_argument(
-                "dependency card does not belong to the authorized board",
-            ));
-        }
+        // The target card may live on any board/project in the same tenant
+        // (KANBAN-014); it only needs to exist.
+        let (target_board_id, target_prev_revision) = match depends_row {
+            Some(row) => (row.get::<Id, _>("board_id"), row.get::<i64, _>("revision")),
+            None => {
+                return Err(ConnectError::invalid_argument(
+                    "dependency card not found in tenant",
+                ));
+            }
+        };
 
         let result = sqlx::query(
             "DELETE FROM card_dependencies WHERE card_id = $1 AND depends_on_card_id = $2",
@@ -1707,6 +1757,38 @@ impl CardService for CardServiceImpl {
             "idempotency_key": req.idempotency_key,
         });
         insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
+
+        // Edge actually removed: the target card loses a dependent — bump its
+        // revision and emit on its own board too.
+        if result.rows_affected() > 0 {
+            let target_updated = sqlx::query(
+                "UPDATE cards SET revision = revision + 1, updated_at = now() \
+                 WHERE id = $1 AND tenant_id = $2 RETURNING revision",
+            )
+            .bind(depends_on_id)
+            .bind(&tenant_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| internal("failed to bump dependency card revision", e))?;
+            let target_new_revision: i64 = target_updated.get("revision");
+
+            let target_payload = json!({
+                "card_id": depends_on_id.to_string(),
+                "board_id": target_board_id.to_string(),
+                "dependent_card_id": card_id.to_string(),
+                "prev_revision": target_prev_revision,
+                "new_revision": target_new_revision,
+                "idempotency_key": req.idempotency_key,
+            });
+            insert_board_event(
+                &mut tx,
+                &tenant_id,
+                target_board_id,
+                "CardUpdated",
+                target_payload,
+            )
+            .await?;
+        }
 
         tx.commit()
             .await
@@ -4821,8 +4903,10 @@ mod tests {
         cleanup_project(&pool, pid).await;
     }
 
+    /// KANBAN-014: cross-board dependencies are allowed (same tenant). Both
+    /// cards' revisions bump and both boards get a CardUpdated event.
     #[tokio::test]
-    async fn add_card_dependency_rejects_cross_board() {
+    async fn add_card_dependency_allows_cross_board() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
         let svc = make_service(pool.clone(), Arc::clone(&permission));
@@ -4871,7 +4955,7 @@ mod tests {
             .into_option()
             .expect("card missing");
 
-        let err = svc
+        let dep = svc
             .add_card_dependency(
                 authed_ctx_with_object(&subject, &bid_a.to_string()),
                 connect_request(&AddCardDependencyRequest {
@@ -4882,9 +4966,322 @@ mod tests {
                 }),
             )
             .await
-            .expect_err("cross-board dependency should fail");
+            .expect("cross-board dependency should succeed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(dep.depends_on_card_ids, vec![card_b.id.clone()]);
+
+        // Target card reflects the dependent and its revision bumped.
+        let b = svc
+            .get_card(
+                authed_ctx_with_object(&subject, &card_b.id),
+                connect_request(&GetCardRequest {
+                    card_id: card_b.id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get b failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert_eq!(b.dependent_card_ids, vec![card_a.id.clone()]);
+        assert_eq!(b.revision, 1, "target revision should bump once");
+
+        // Both boards received a CardUpdated event_log row.
+        for board in [bid_a, bid_b] {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardUpdated'",
+            )
+            .bind(board)
+            .fetch_one(&pool)
+            .await
+            .expect("count failed");
+            assert!(count >= 1, "board {board} should have a CardUpdated event");
+        }
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// KANBAN-014: cross-project dependencies are allowed within one tenant.
+    #[tokio::test]
+    async fn add_card_dependency_allows_cross_project() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid_a = seed_project(&pool, &subject, "CPA").await;
+        let bid_a = seed_board(&pool, pid_a, &tenant_id).await;
+        let cid_a = seed_column(&pool, bid_a, &tenant_id).await;
+        let pid_b = seed_project(&pool, &subject, "CPB").await;
+        let bid_b = seed_board(&pool, pid_b, &tenant_id).await;
+        let cid_b = seed_column(&pool, bid_b, &tenant_id).await;
+
+        let card_a = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid_a.to_string(),
+                    column_id: cid_a.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create a failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let card_b = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_b.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid_b.to_string(),
+                    column_id: cid_b.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create b failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let dep = svc
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&AddCardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("cross-project dependency should succeed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(dep.depends_on_card_ids, vec![card_b.id.clone()]);
+
+        cleanup_project(&pool, pid_a).await;
+        cleanup_project(&pool, pid_b).await;
+    }
+
+    /// KANBAN-014: a dependency target in another tenant is rejected.
+    #[tokio::test]
+    async fn add_card_dependency_rejects_cross_tenant() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let sso_gateway_url = crate::test_support::setup_sso_gateway_url().await;
+        let tenant_b = crate::test_support::containers::create_tenant(
+            &sso_gateway_url,
+            &format!("tenant-b-{}", Id::new()),
+            "Tenant B",
+        )
+        .await
+        .expect("failed to create tenant B");
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "XTD").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        let card_a = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create a failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        // Seed a card directly in tenant B (no RPC access across tenants).
+        let (pid_b, bid_b, col_b, card_b) = (Id::new(), Id::new(), Id::new(), Id::new());
+        sqlx::query(
+            "INSERT INTO projects (id, tenant_id, name, slug, description, owner_id, prefix) \
+             VALUES ($1, $2, 'B Project', 'b-proj', '', 'user:b', 'BP')",
+        )
+        .bind(pid_b)
+        .bind(&tenant_b)
+        .execute(&pool)
+        .await
+        .expect("seed tenant B project failed");
+        sqlx::query("INSERT INTO boards (id, tenant_id, project_id, name, slug) VALUES ($1, $2, $3, 'B Board', 'b-board')")
+            .bind(bid_b)
+            .bind(&tenant_b)
+            .bind(pid_b)
+            .execute(&pool)
+            .await
+            .expect("seed tenant B board failed");
+        sqlx::query("INSERT INTO columns (id, tenant_id, board_id, title, position) VALUES ($1, $2, $3, 'To Do', 0)")
+            .bind(col_b)
+            .bind(&tenant_b)
+            .bind(bid_b)
+            .execute(&pool)
+            .await
+            .expect("seed tenant B column failed");
+        sqlx::query(
+            "INSERT INTO cards (id, tenant_id, project_id, board_id, column_id, ref, title, position, created_by, revision) \
+             VALUES ($1, $2, $3, $4, $5, 'BP-001', 'B Card', 0, 'user:b', 0)",
+        )
+        .bind(card_b)
+        .bind(&tenant_b)
+        .bind(pid_b)
+        .bind(bid_b)
+        .bind(col_b)
+        .execute(&pool)
+        .await
+        .expect("seed tenant B card failed");
+
+        let err = svc
+            .add_card_dependency(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&AddCardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("cross-tenant dependency must fail");
 
         assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+
+        // Cleanup tenant B rows directly (no cascade via project delete here).
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(pid_b)
+            .execute(&pool)
+            .await;
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// KANBAN-014: removing a cross-board dependency unlinks both cards and
+    /// emits on both boards.
+    #[tokio::test]
+    async fn remove_card_dependency_allows_cross_board() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "RCB").await;
+        let bid_a = seed_board(&pool, pid, &tenant_id).await;
+        let cid_a = seed_column(&pool, bid_a, &tenant_id).await;
+        let bid_b = seed_board(&pool, pid, &tenant_id).await;
+        let cid_b = seed_column(&pool, bid_b, &tenant_id).await;
+
+        let card_a = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid_a.to_string(),
+                    column_id: cid_a.to_string(),
+                    title: "A".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create a failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let card_b = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid_b.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid_b.to_string(),
+                    column_id: cid_b.to_string(),
+                    title: "B".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create b failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        svc.add_card_dependency(
+            authed_ctx_with_object(&subject, &bid_a.to_string()),
+            connect_request(&AddCardDependencyRequest {
+                card_id: card_a.id.clone(),
+                depends_on_card_id: card_b.id.clone(),
+                idempotency_key: Id::new().to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("add dependency failed");
+
+        let removed = svc
+            .remove_card_dependency(
+                authed_ctx_with_object(&subject, &bid_a.to_string()),
+                connect_request(&RemoveCardDependencyRequest {
+                    card_id: card_a.id.clone(),
+                    depends_on_card_id: card_b.id.clone(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("cross-board remove should succeed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert!(removed.depends_on_card_ids.is_empty());
+
+        let b = svc
+            .get_card(
+                authed_ctx_with_object(&subject, &card_b.id),
+                connect_request(&GetCardRequest {
+                    card_id: card_b.id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get b failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(b.dependent_card_ids.is_empty());
+        assert_eq!(b.revision, 2, "target revision bumps on add and remove");
 
         cleanup_project(&pool, pid).await;
     }
@@ -5048,7 +5445,12 @@ mod tests {
         .await
         .unwrap()
         .get(0);
-        assert_eq!(event_count, 1, "CardUpdated should be written");
+        // KANBAN-014: one CardUpdated per card — source (depends_on gained)
+        // and target (dependent gained) — both on this shared board.
+        assert_eq!(
+            event_count, 2,
+            "CardUpdated should be written for both cards"
+        );
 
         cleanup_project(&pool, pid).await;
     }

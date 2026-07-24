@@ -141,3 +141,27 @@ sunbeam CLI. Decisions and their reasoning:
   channel flips the outbox into a final drain, 10 s bounded wait. No new
   dependency (tokio `watch` instead of tokio-util's CancellationToken).
 - Coverage: held the release to the human's >90% gate (llvm-cov).
+
+## 2026-07-24 — Cross-board/project card dependencies (v2026.07.6)
+
+KANBAN-014, filed from a real need (KANBAN-009 on kanban/dev depends on
+CLI-004 on cli/dev — the backend rejected the edge with "both cards must
+belong to the authorized board"). Decision: keep the middleware gate exactly
+as-is (`edit` on the source card's board) and relax only the handler's
+target check from same-board to same-tenant. Why: the edge is a mutation of
+the *source* card, so edit on its board is the right authorization; the
+target card is only referenced, and cross-board visibility inside a tenant
+is already the norm (search, aggregated boards). Both cards' revisions bump
+and both boards get a `CardUpdated` event so no stream serves stale
+depends_on/dependent lists. Cross-tenant stays rejected — permission and
+visibility semantics across tenants are undefined (filed as low-priority
+KANBAN-015 until a real use case shows up).
+
+## 2026-07-24 — agent-mail → kanban ticketing migration
+
+Cross-repo coordination moved off agent-mail (deprecated) onto kanban cards
+via `sunbeam kanban` — the same migration sbbb did earlier. The AGENTS.md
+ritual, charter, and state.md now describe the kanban flow; mail references
+in older entries are historical. *Why:* the human standardized cross-repo
+tracking on kanban (this repo's product) so tickets are visible to
+everyone, not just the two mail endpoints.

@@ -35,7 +35,8 @@ timestamp: 2026-07-24T00:00:00Z
 
 ## Pick up first
 
-- Check for open mail: `agent-mail inbox`.
+- Check for open cards on the `kanban` boards (`sunbeam kanban board list
+  kanban`, then `sunbeam kanban card list <board-id>`).
 - Verify the v2026.07.5 release workflow published the GHCR image.
 - Fix the testcontainers leak (see [known-issues.md](known-issues.md)) — it
   flakes permission tests and exhausts the VM ("too many open files",

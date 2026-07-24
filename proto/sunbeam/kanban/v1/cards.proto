@@ -232,7 +232,8 @@ message DeleteCardRequest {
 message DeleteCardResponse {}
 
 // AddCardDependencyRequest links two cards: `card_id` depends on `depends_on_card_id`.
-// Both cards must belong to the same board. idempotency_key is required.
+// `card_id` must belong to the authorized board; `depends_on_card_id` may live
+// on any board or project in the same tenant. idempotency_key is required.
 message AddCardDependencyRequest {
   string card_id = 1;
   string depends_on_card_id = 2;
@@ -244,7 +245,7 @@ message AddCardDependencyResponse {
 }
 
 // RemoveCardDependencyRequest removes a directed dependency edge.
-// Both cards must belong to the same board. idempotency_key is required.
+// Same board/tenant rules as AddCardDependency. idempotency_key is required.
 message RemoveCardDependencyRequest {
   string card_id = 1;
   string depends_on_card_id = 2;
@@ -401,11 +402,13 @@ service CardService {
   rpc DeleteCard(DeleteCardRequest) returns (DeleteCardResponse);
 
   // AddCardDependency creates a directed edge: card_id depends on depends_on_card_id.
-  // Both cards must belong to the same board. Requires "edit" on the board.
+  // Requires "edit" on card_id's board; depends_on_card_id may be on any
+  // board/project in the same tenant. Emits CardUpdated on both boards.
   rpc AddCardDependency(AddCardDependencyRequest) returns (AddCardDependencyResponse);
 
   // RemoveCardDependency removes a directed dependency edge.
-  // Both cards must belong to the same board. Requires "edit" on the board.
+  // Same board/tenant rules as AddCardDependency. Emits CardUpdated on both
+  // boards when an edge was removed.
   rpc RemoveCardDependency(RemoveCardDependencyRequest) returns (RemoveCardDependencyResponse);
 
   // BulkUpdateCardLabels replaces the label set on multiple cards.

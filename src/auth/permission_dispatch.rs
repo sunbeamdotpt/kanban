@@ -286,13 +286,13 @@ static MATRIX: [DispatchEntry; 68] = [
         method: "/sunbeam.kanban.v1.CardService/AddCardDependency",
         namespace: "KanbanBoard",
         relation: "edit",
-        object_id_source: ObjectIdSource::Header, // board id; handler verifies both cards
+        object_id_source: ObjectIdSource::Header, // board id; handler verifies source card, target may be any board in the tenant
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/RemoveCardDependency",
         namespace: "KanbanBoard",
         relation: "edit",
-        object_id_source: ObjectIdSource::Header, // board id; handler verifies both cards
+        object_id_source: ObjectIdSource::Header, // board id; handler verifies source card, target may be any board in the tenant
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/BulkUpdateCardLabels",
