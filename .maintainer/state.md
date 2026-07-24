@@ -10,12 +10,13 @@ timestamp: 2026-07-24T00:00:00Z
 
 ## In flight
 
-- **v2026.07.6 released** (tag pushed, workflow building): cross-board and
-  cross-project card dependencies (KANBAN-014) — target card may live on any
-  board/project in the tenant; both cards bump revision and both boards get
-  `CardUpdated`. No migrations, no new env vars. Deploy task #104 sent to
-  sbbb; once deployed, wire `KANBAN-009 depends_on CLI-004` (the motivating
-  case) and verify.
+- **v2026.07.6 deployed and verified** by sbbb (#105): cross-board/project
+  card dependencies live in prod. Both queued edges wired:
+  `KANBAN-009 depends_on CLI-004`, `CLI-005 depends_on KANBAN-001`.
+- **Process change (sbbb, #105):** cross-repo tasks to sbbb now go as cards
+  on sbbb/dev, NOT agent-mail (their outbound mail watcher is retired). This
+  matches the charter.md edit that rode along in the v2026.07.6 commit —
+  treat that edit as legitimate/deliberate.
 - **v2026.07.5 deployed and verified** by sbbb (#101): realtime spine,
   GithubLinkService, KANBAN-006/012 fixes confirmed in prod.
 - **Cross-tenant dependencies** filed as low-priority KANBAN-015 (design
@@ -24,8 +25,8 @@ timestamp: 2026-07-24T00:00:00Z
   CLI half is CLI-004 on cli/dev (the human is doing the CLI work).
 - Note: `.maintainer/charter.md` was modified outside this session (sbbb
   routing: board card instead of agent-mail; human escalation: in-session)
-  and rode along in the v2026.07.6 commit unreviewed — confirm with the
-  human it was their edit.
+  and rode along in the v2026.07.6 commit unreviewed — CONFIRMED legitimate
+  by sbbb's #105 process-change notice; treat as deliberate.
 
 ## Board state (kanban/dev)
 
