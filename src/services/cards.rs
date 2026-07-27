@@ -875,7 +875,7 @@ impl CardService for CardServiceImpl {
             .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
 
         let col_row = sqlx::query(
-            "SELECT id FROM columns WHERE id = $1 AND board_id = $2 AND tenant_id = $3",
+            "SELECT id, is_done FROM columns WHERE id = $1 AND board_id = $2 AND tenant_id = $3",
         )
         .bind(col_id)
         .bind(board_id)
@@ -884,7 +884,8 @@ impl CardService for CardServiceImpl {
         .await
         .map_err(|e| internal("failed to verify column", e))?
         .ok_or_else(|| ConnectError::not_found("column not found on this board"))?;
-        let _ = col_row;
+        // Cards created directly into a done-marked column start completed.
+        let col_is_done: bool = col_row.get("is_done");
 
         // Begin transaction.
         let mut tx = self
@@ -959,8 +960,9 @@ impl CardService for CardServiceImpl {
 
         sqlx::query(
             "INSERT INTO cards (id, tenant_id, project_id, board_id, column_id, ref, title, description, \
-                                position, priority, urgency, due_date, milestone_id, created_by, revision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::card_priority, $11::card_urgency, $12, $13, $14, 0)",
+                                position, priority, urgency, due_date, milestone_id, completed_at, created_by, revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::card_priority, $11::card_urgency, $12, $13, \
+                     CASE WHEN $15 THEN now() ELSE NULL END, $14, 0)",
         )
         .bind(card_id)
         .bind(&tenant_id)
@@ -980,6 +982,7 @@ impl CardService for CardServiceImpl {
         .bind(due_date)
         .bind(milestone_id)
         .bind(&subject)
+        .bind(col_is_done)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal("failed to insert card", e))?;
@@ -1278,9 +1281,9 @@ impl CardService for CardServiceImpl {
         let prev_revision: i64 = card_row.get("revision");
         let card_project_id: Id = card_row.get("project_id");
 
-        // Fetch target column's board_id.
+        // Fetch target column's board_id and done marker.
         let target_col_row =
-            sqlx::query("SELECT board_id FROM columns WHERE id = $1 AND tenant_id = $2")
+            sqlx::query("SELECT board_id, is_done FROM columns WHERE id = $1 AND tenant_id = $2")
                 .bind(to_col_id)
                 .bind(&tenant_id)
                 .fetch_optional(&self.pool)
@@ -1289,6 +1292,21 @@ impl CardService for CardServiceImpl {
                 .ok_or_else(|| ConnectError::not_found("target column not found"))?;
 
         let target_board_id: Id = target_col_row.get("board_id");
+        let to_is_done: bool = target_col_row.get("is_done");
+
+        // Fetch the source column's done marker (no-op when same-column).
+        let from_is_done: bool = if from_col_id == to_col_id {
+            to_is_done
+        } else {
+            sqlx::query("SELECT is_done FROM columns WHERE id = $1 AND tenant_id = $2")
+                .bind(from_col_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch source column", e))?
+                .map(|r| r.get("is_done"))
+                .unwrap_or(false)
+        };
 
         // Fetch target board's project_id to verify no cross-project move.
         let target_board_row =
@@ -1375,9 +1393,13 @@ impl CardService for CardServiceImpl {
         }
 
         // Place card at new position. A cross-board move (same project) also
-        // re-homes the card's board_id.
+        // re-homes the card's board_id. Moving into a done-marked column sets
+        // completed_at (first transition wins); moving out of one clears it.
         let new_revision_row = sqlx::query(
             "UPDATE cards SET column_id = $2, board_id = $3, position = $4, revision = revision + 1, \
+                              completed_at = CASE WHEN $6 THEN COALESCE(completed_at, now()) \
+                                                  WHEN $7 THEN NULL \
+                                                  ELSE completed_at END, \
                               updated_at = now() \
              WHERE id = $1 AND tenant_id = $5 RETURNING revision",
         )
@@ -1386,6 +1408,8 @@ impl CardService for CardServiceImpl {
         .bind(target_board_id)
         .bind(to_pos)
         .bind(&tenant_id)
+        .bind(to_is_done)
+        .bind(from_is_done && !to_is_done)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal("failed to place card at new position", e))?;
@@ -6062,6 +6086,143 @@ mod tests {
         assert!(
             !cleared.blocked,
             "update_mask naming blocked with a false patch must clear the flag"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn move_card_into_done_column_sets_completed_at_and_back_clears() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "DON").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let col_todo = seed_column(&pool, bid, &tenant_id).await;
+        let col_done = Id::new();
+        sqlx::query(
+            "INSERT INTO columns (id, tenant_id, board_id, title, position, is_done) VALUES ($1, $2, $3, 'Done', 1, true)",
+        )
+        .bind(col_done)
+        .bind(&tenant_id)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: col_todo.to_string(),
+                    title: "Finish me".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            card.completed_at.as_option().is_none(),
+            "card in a regular column must not be completed"
+        );
+
+        let done = svc
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_done.to_string(),
+                    to_position: 1,
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("move to done failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            done.completed_at.as_option().is_some(),
+            "moving into a done column must set completed_at"
+        );
+
+        let reopened = svc
+            .move_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&MoveCardRequest {
+                    card_id: card.id.clone(),
+                    to_column_id: col_todo.to_string(),
+                    to_position: 1,
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("move out of done failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            reopened.completed_at.as_option().is_none(),
+            "moving out of a done column must clear completed_at"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn create_card_in_done_column_starts_completed() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "DNC").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let col_done = Id::new();
+        sqlx::query(
+            "INSERT INTO columns (id, tenant_id, board_id, title, position, is_done) VALUES ($1, $2, $3, 'Done', 0, true)",
+        )
+        .bind(col_done)
+        .bind(&tenant_id)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: col_done.to_string(),
+                    title: "Already done".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            card.completed_at.as_option().is_some(),
+            "card created in a done column must start completed"
         );
 
         cleanup_project(&pool, pid).await;

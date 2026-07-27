@@ -41,6 +41,9 @@ message Column {
   int32 position = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
+  // Marks the column as a completion lane: moving a card into it sets
+  // completed_at, moving a card out clears it.
+  bool is_done = 9;
 }
 
 // Visibility levels for boards and aggregated boards.
@@ -131,6 +134,8 @@ message AddColumnRequest {
   // Position to insert at; 0 means append.
   int32 position = 5;
   string idempotency_key = 6;
+  // Mark the column as a completion lane (see Column.is_done).
+  bool is_done = 7;
 }
 
 message AddColumnResponse {

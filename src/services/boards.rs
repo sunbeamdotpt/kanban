@@ -159,6 +159,7 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
     let accent: Option<String> = row.get("accent");
     let wip_limit: Option<i32> = row.get("wip_limit");
     let position: i32 = row.get("position");
+    let is_done: bool = row.get("is_done");
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
 
@@ -169,6 +170,7 @@ fn column_from_row(row: &sqlx::postgres::PgRow) -> Column {
         accent: accent.unwrap_or_default(),
         wip_limit: wip_limit.unwrap_or(0),
         position,
+        is_done,
         created_at: Some(to_proto_ts(created_at)).into(),
         updated_at: Some(to_proto_ts(updated_at)).into(),
         ..Default::default()
@@ -187,6 +189,7 @@ fn event_column_from_proto(col: &Column) -> EventColumn {
         accent: col.accent.clone(),
         wip_limit: col.wip_limit,
         position: col.position,
+        is_done: col.is_done,
         ..Default::default()
     }
 }
@@ -201,6 +204,7 @@ fn event_column_json(col: &EventColumn) -> serde_json::Value {
         "accent": col.accent,
         "wip_limit": col.wip_limit,
         "position": col.position,
+        "is_done": col.is_done,
     })
 }
 
@@ -273,7 +277,7 @@ pub(crate) async fn fetch_cards_count(pool: &PgPool, board_id: Id, tenant_id: Op
 
 async fn fetch_board_columns(pool: &PgPool, board_id: Id) -> Result<Vec<Column>, ConnectError> {
     let rows = sqlx::query(
-        "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+        "SELECT id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at \
          FROM columns WHERE board_id = $1 ORDER BY position ASC",
     )
     .bind(board_id)
@@ -430,7 +434,7 @@ async fn read_board_snapshot(
     .map_err(|e| internal("failed to read last replayed nats_seq", e))?;
 
     let col_rows = sqlx::query(
-        "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+        "SELECT id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at \
          FROM columns WHERE board_id = $1 AND tenant_id = $2 ORDER BY position ASC",
     )
     .bind(board_id)
@@ -1157,7 +1161,7 @@ impl BoardService for BoardServiceImpl {
 
             if let Some(Some(col_id)) = cached {
                 let row = sqlx::query(
-                    "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+                    "SELECT id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at \
                      FROM columns WHERE tenant_id = $1 AND id = $2",
                 )
                 .bind(&tenant_id)
@@ -1188,10 +1192,11 @@ impl BoardService for BoardServiceImpl {
             // Append at the end: position = MAX(position) + 1.
             sqlx::query(
                 r#"
-                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position)
+                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position, is_done)
                 SELECT $1, $2, $3, $4, $5, $6,
-                       COALESCE((SELECT MAX(position) FROM columns WHERE board_id = $3), -1) + 1
-                RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
+                       COALESCE((SELECT MAX(position) FROM columns WHERE board_id = $3), -1) + 1,
+                       $7
+                RETURNING id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at
                 "#,
             )
             .bind(column_id)
@@ -1208,6 +1213,7 @@ impl BoardService for BoardServiceImpl {
             } else {
                 Some(req.wip_limit)
             })
+            .bind(req.is_done)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to insert column", e))?
@@ -1220,9 +1226,9 @@ impl BoardService for BoardServiceImpl {
                     SET position = position + 1, updated_at = now()
                     WHERE board_id = $3 AND position >= $7
                 )
-                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
+                INSERT INTO columns (id, tenant_id, board_id, title, accent, wip_limit, position, is_done)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at
                 "#,
             )
             .bind(column_id)
@@ -1240,6 +1246,7 @@ impl BoardService for BoardServiceImpl {
                 Some(req.wip_limit)
             })
             .bind(req.position)
+            .bind(req.is_done)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal("failed to insert column at position", e))?
@@ -1305,6 +1312,15 @@ impl BoardService for BoardServiceImpl {
             .map_err(|_| ConnectError::invalid_argument("invalid column_id"))?;
         let patch = req.column.into_option().unwrap_or_default();
 
+        // is_done follows FieldMask semantics: it only changes when the mask
+        // names "is_done" (a bare bool patch cannot distinguish false from
+        // unset).
+        let is_done_apply = req
+            .update_mask
+            .as_option()
+            .map(|m| m.paths.iter().any(|p| p == "is_done"))
+            .unwrap_or(false);
+
         // UPDATE column + ColumnUpdated outbox event in one transaction.
         let mut tx = self
             .pool
@@ -1318,9 +1334,10 @@ impl BoardService for BoardServiceImpl {
                 title      = CASE WHEN $4 != '' THEN $4 ELSE title END,
                 accent     = CASE WHEN $5 != '' THEN $5 ELSE accent END,
                 wip_limit  = CASE WHEN $6 != 0  THEN $6 ELSE wip_limit END,
+                is_done    = CASE WHEN $7 THEN $8 ELSE is_done END,
                 updated_at = now()
             WHERE tenant_id = $1 AND id = $2 AND board_id = $3
-            RETURNING id, board_id, title, accent, wip_limit, position, created_at, updated_at
+            RETURNING id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at
             "#,
         )
         .bind(&tenant_id)
@@ -1329,6 +1346,8 @@ impl BoardService for BoardServiceImpl {
         .bind(&patch.title)
         .bind(&patch.accent)
         .bind(patch.wip_limit)
+        .bind(is_done_apply)
+        .bind(patch.is_done)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| internal("failed to update column", e))?
@@ -1559,7 +1578,7 @@ impl BoardService for BoardServiceImpl {
         // The full ordered column list is emitted so clients can replace
         // their column order without tracking diffs.
         let col_rows = sqlx::query(
-            "SELECT id, board_id, title, accent, wip_limit, position, created_at, updated_at \
+            "SELECT id, board_id, title, accent, wip_limit, position, is_done, created_at, updated_at \
              FROM columns WHERE tenant_id = $1 AND board_id = $2 ORDER BY position ASC",
         )
         .bind(&tenant_id)
@@ -2751,6 +2770,113 @@ mod tests {
         assert_eq!(
             updated.accent, "blue",
             "accent should be unchanged (empty patch)"
+        );
+
+        cleanup_project(&pool, project_id).await;
+    }
+
+    #[tokio::test]
+    async fn update_column_is_done_follows_update_mask() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&pool, &subject).await;
+
+        let board = svc
+            .create_board(
+                authed_ctx_with_object(&subject, &project_id.to_string()),
+                connect_request(&CreateBoardRequest {
+                    project_id: project_id.to_string(),
+                    name: "Done Column Board".to_string(),
+                    description: String::new(),
+                    icon: String::new(),
+                    idempotency_key: String::new(),
+                    visibility: BoardVisibility::Private.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_board failed")
+            .body
+            .board
+            .into_option()
+            .expect("board missing");
+
+        let bid = board.id.clone();
+
+        // AddColumn can mark the column done directly.
+        let col = svc
+            .add_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&AddColumnRequest {
+                    board_id: bid.clone(),
+                    title: "Done".to_string(),
+                    is_done: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("add_column failed")
+            .body
+            .column
+            .into_option()
+            .expect("column missing");
+        assert!(col.is_done, "AddColumn with is_done must mark the column");
+
+        // Without the mask, is_done is untouched even when the patch says false.
+        let untouched = svc
+            .update_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&UpdateColumnRequest {
+                    board_id: bid.clone(),
+                    column_id: col.id.clone(),
+                    column: Some(Column {
+                        title: "Done (renamed)".to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("update_column failed")
+            .body
+            .column
+            .into_option()
+            .expect("column missing");
+        assert!(
+            untouched.is_done,
+            "is_done must not change without the update_mask naming it"
+        );
+
+        // With the mask naming is_done, the patch value applies exactly.
+        let cleared = svc
+            .update_column(
+                authed_ctx_with_object(&subject, &bid),
+                connect_request(&UpdateColumnRequest {
+                    board_id: bid.clone(),
+                    column_id: col.id.clone(),
+                    column: Some(Column::default()).into(),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["is_done".to_string()],
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("update_column failed")
+            .body
+            .column
+            .into_option()
+            .expect("column missing");
+        assert!(
+            !cleared.is_done,
+            "update_mask naming is_done with a false patch must clear it"
         );
 
         cleanup_project(&pool, project_id).await;

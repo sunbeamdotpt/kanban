@@ -592,6 +592,11 @@ fn json_i32(json: &JsonValue, key: &str) -> i32 {
     json.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
 }
 
+/// Read a bool field from the payload JSON; missing/wrong-typed → false.
+fn json_bool(json: &JsonValue, key: &str) -> bool {
+    json.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// Read the (prev_revision, new_revision) pair carried by card mutations.
 fn revision_pair(json: &JsonValue) -> (u64, u64) {
     (
@@ -609,6 +614,7 @@ fn parse_event_column(json: &JsonValue) -> EventColumn {
         accent: json_str(json, "accent"),
         wip_limit: json_i32(json, "wip_limit"),
         position: json_i32(json, "position"),
+        is_done: json_bool(json, "is_done"),
         ..Default::default()
     }
 }
@@ -1249,6 +1255,28 @@ mod tests {
     }
 
     // ── Pure helper tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_event_column_reads_is_done() {
+        let col = parse_event_column(&serde_json::json!({
+            "id": "col-1",
+            "board_id": "board-1",
+            "title": "Done",
+            "accent": "green",
+            "wip_limit": 0,
+            "position": 3,
+            "is_done": true,
+        }));
+        assert!(col.is_done, "is_done must round-trip through the payload");
+
+        // Legacy rows without is_done default to false.
+        let legacy = parse_event_column(&serde_json::json!({
+            "id": "col-2",
+            "board_id": "board-1",
+            "title": "To Do",
+        }));
+        assert!(!legacy.is_done);
+    }
 
     #[test]
     fn build_envelope_populates_fields() {

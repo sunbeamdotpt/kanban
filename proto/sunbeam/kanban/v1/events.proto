@@ -216,6 +216,7 @@ message EventColumn {
   string accent = 4;
   int32 wip_limit = 5;
   int32 position = 6;
+  bool is_done = 7;
 }
 
 // Minimal board snapshot carried inside event envelopes. Mirrors
