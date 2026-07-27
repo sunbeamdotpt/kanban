@@ -1473,4 +1473,42 @@ mod tests {
 
         cleanup_project(&svc.pool, project_id).await;
     }
+
+    // Regression for KANBAN-026: seeded global card templates (0029) used
+    // non-canonical ULIDs; List re-encoded them canonically, so Get 404'd on
+    // the very IDs List returned. Every listed global must round-trip.
+    #[tokio::test]
+    async fn get_card_template_resolves_seeded_globals() {
+        let svc = make_service().await;
+        let subject = format!("user:test-{}", Id::new());
+
+        let list = svc
+            .list_card_templates(
+                authed_ctx(&subject),
+                connect_request(&ListCardTemplatesRequest {
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list_card_templates failed")
+            .body;
+
+        let globals: Vec<_> = list.templates.iter().filter(|t| t.is_global).collect();
+        assert!(
+            globals.len() >= 3,
+            "seeded global card templates (feature/bug/chore) must be listed"
+        );
+
+        for t in globals {
+            svc.get_card_template(
+                authed_ctx(&subject),
+                connect_request(&GetCardTemplateRequest {
+                    template_id: t.id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GetCardTemplate 404s on listed global {}: {e}", t.id));
+        }
+    }
 }

@@ -211,4 +211,20 @@ mod tests {
         assert!(!Id::is_ulid("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!Id::is_ulid("short"));
     }
+
+    // Regression context for KANBAN-026: a 26-char Crockford string whose
+    // first character exceeds the ULID timestamp range (> 7) still parses —
+    // the overflow bits are masked — and re-encodes to a *different*
+    // canonical string. Stored IDs must therefore always be canonical;
+    // migration 0033 rewrites the offending seed rows.
+    #[test]
+    fn noncanonical_ulid_decodes_to_canonical_form() {
+        let id: Id = "ZFV6D6484C46GZSJQAKWTJ70GW".parse().unwrap();
+        assert_eq!(id.to_string(), "7FV6D6484C46GZSJQAKWTJ70GW");
+        let id: Id = "KSNAQWV3M8RRVGRB03V0215953".parse().unwrap();
+        assert_eq!(id.to_string(), "3SNAQWV3M8RRVGRB03V0215953");
+        // Canonical forms round-trip unchanged.
+        let id: Id = "7FV6D6484C46GZSJQAKWTJ70GW".parse().unwrap();
+        assert_eq!(id.to_string(), "7FV6D6484C46GZSJQAKWTJ70GW");
+    }
 }
