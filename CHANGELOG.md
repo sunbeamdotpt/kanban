@@ -6,7 +6,7 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
-## [Unreleased]
+## [2026.07.8] - 2026-07-27
 
 ### Added
 
