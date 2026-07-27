@@ -3,66 +3,60 @@ type: State
 title: Current state of kanban
 description: What is in flight, what is blocked, what the next session should pick up first.
 tags: [state]
-timestamp: 2026-07-24T00:00:00Z
+timestamp: 2026-07-27T00:00:00Z
 ---
 
-# State — 2026-07-24
+# State — 2026-07-27
 
 ## In flight
 
-- **v2026.07.7 released** (tag pushed, release workflow building): KANBAN-017
-  MilestoneService + KANBAN-018 label CRUD (incl. global labels, migration
-  0032), UpdateCard milestone set/clear/validate. Protos already live on
-  buf.build/sunbeamdotpt/kanban. Next: verify GHCR image published, then the
-  CLI repo can pick up CLI-007/CLI-009 + 3.2 milestone grouping — file a
-  heads-up card on cli/dev once deployed.
-- **v2026.07.6 deployed and verified** by sbbb (#105): cross-board/project
-  card dependencies live in prod. Both queued edges wired:
-  `KANBAN-009 depends_on CLI-004`, `CLI-005 depends_on KANBAN-001`.
-- **Process change (sbbb, #105):** cross-repo tasks to sbbb now go as cards
-  on sbbb/dev, NOT agent-mail (their outbound mail watcher is retired).
-- **v2026.07.5 deployed and verified** by sbbb (#101): realtime spine,
-  GithubLinkService, KANBAN-006/012 fixes confirmed in prod.
+- **Committed on mainline (4 conventional commits, NOT pushed, NOT
+  released)**: 56b834c9c1 fix(cards) KANBAN-016, 2c60b87899
+  fix(templates) KANBAN-026+022, ec1c33f21f feat(boards) KANBAN-023,
+  a0a1b02e3a docs. The four cards are in **review** pending release
+  (sienna's call); CHANGELOG staged under [Unreleased]. Verified: cards
+  44/44, boards 27/27, templates 10/10, realtime 59/59, clippy/fmt/
+  permission-coverage clean.
+- **CLI-014 filed on cli/dev**: unblock flag + column is_done CLI support,
+  blocked on this server changeset being released + deployed.
+- v2026.07.7 released previously (MilestoneService + label CRUD).
 
 ## Board state (kanban/dev)
 
-- Done this session: KANBAN-017, KANBAN-018 (pending move to done once tests
-  verified).
-- Done previously: KANBAN-006, KANBAN-007, KANBAN-011, KANBAN-012, KANBAN-014.
-- Open, deferred (design-review gaps per sunbeam): KANBAN-001..005, KANBAN-013.
-- Open, owned by the CLI repo: KANBAN-008..010.
-- Open, unblocked by this session: CLI-007/CLI-009 (label CRUD shipped),
-  cli "3.2" milestone grouping (MilestoneService shipped) — the CLI side can
-  proceed once the release is cut and deployed.
-- KANBAN-016 (UpdateCard blocked-bool one-way patch) still open, low.
-- Filed this session (GitHub auto-sync scope): KANBAN-019 (webhook receiver,
-  high), KANBAN-020 (reconciliation worker, medium), KANBAN-021 (auto-status,
-  medium; depends_on 019+020, product questions need in-session escalation
-  before implementation). Deployment wiring card filed on sbbb/dev
-  (KANBAN_GITHUB_WEBHOOK_SECRET + ingress headers).
+- Fixed this session (pending commit → done): KANBAN-016, KANBAN-022,
+  KANBAN-023, KANBAN-026.
+- Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
+  (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
+  KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
+  escalated to sienna in-session; depends_on 019+020), KANBAN-024 (fix sketch
+  posted; needs IdentityService wiring + gateway scope + design pick),
+  KANBAN-025 (icebox).
+- Owned by the CLI repo: KANBAN-008, KANBAN-010.
+- KANBAN-003: same-project cross-board moves ARE implemented (MoveCard
+  re-homes board_id + parent tuples); proposed closing as implemented in a
+  card comment — human to confirm.
+- **All 18 open cards are assigned to sienna.**
 
 ## Blocked / waiting
 
-- Nothing blocked. `AggregatedBoardDeleted` is undeliverable via the outbox
-  (event row cascade-deletes with the aggregate) — documented known issue.
+- KANBAN-021 blocked on product decisions (state→card mapping, per-board
+  opt-in, user-override rule) — needs sienna's call in-session.
+- `AggregatedBoardDeleted` remains undeliverable via the outbox (documented
+  known issue).
 
 ## Pick up first
 
-- Verify the v2026.07.7 release workflow published the GHCR image (builds
-  take ~20 min), then file a heads-up card on cli/dev: MilestoneService +
-  LabelService live → CLI-007/CLI-009 and 3.2 milestone grouping unblocked.
-- **Dependabot: 1 moderate vulnerability** on the default branch
-  (github.com/sunbeamdotpt/kanban/security/dependabot/20) — surfaced by the
-  v2026.07.7 push; triage it.
-- Cut release 2026.07.7 — DONE this session.
-- Fix the testcontainers leak (see [known-issues.md](known-issues.md)) — it
-  flakes permission tests and exhausts the VM ("too many open files",
-  Docker network pools) on repeated full-suite runs. Cleanup: remove leaked
-  harness containers + `docker network prune -f`.
+- Commit the KANBAN-016/022/023/026 changeset (human confirmed in-session),
+  move the four cards to done, then release per the human's call.
+- After release + deploy: prod-verify `card-template get <global-id>` and
+  milestone stats after marking Done columns is_done (CLI-014).
+- Testcontainers leak is still real: full-suite runs exhaust Docker ports
+  ("address already in use" / sso-gateway bootstrap port race). Cleanup loop
+  that works: `docker rm -f $(docker ps -aq --filter
+  label=org.testcontainers.managed-by=testcontainers)` +
+  `docker network prune -f`, then retry — suites pass on a clean Docker.
+- Dependabot: 1 moderate vulnerability on the default branch
+  (github.com/sunbeamdotpt/kanban/security/dependabot/20) — still untriaged.
 - Remaining stale-doc item: `docs/development/testing.md` +
   `docs/development/architecture.md` claim CI gates that do not exist.
-- Full-suite flakes: gateway permission tests (load) and, historically,
-  `subscribe_project_merges_board_streams_and_project_events` (timeout
-  bumped to 30s — watch whether that fully settles it).
-- Global-label permission semantics (manage-on-any-project) are a stopgap
-  worth revisiting if a tenant-level OpenFGA object ever lands.
+- Global-label permission semantics (manage-on-any-project) remain a stopgap.

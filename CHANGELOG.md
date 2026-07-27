@@ -6,6 +6,34 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [Unreleased]
+
+### Added
+
+- **`Column.is_done` completion lanes (KANBAN-023).** Columns can be marked as
+  completion lanes: `AddColumn` accepts `is_done`, `UpdateColumn` applies it
+  when `update_mask` names `is_done` (a bare bool patch cannot distinguish
+  false from unset), and the marker is exposed on `Column` and `EventColumn`
+  (migration `0034`). Moving a card into a done-marked column sets
+  `completed_at` (first transition wins), moving it out clears it, and cards
+  created directly into a done column start completed — milestone completion
+  stats now advance for board-driven workflows.
+
+### Fixed
+
+- **`UpdateCard` can clear `blocked` (KANBAN-016).** The sparse patch was
+  one-way (`blocked=false` meant "no change"), so a blocked card could never
+  be unblocked. Naming `blocked` in `update_mask` now applies the patch value
+  exactly; without the mask the legacy set-only behavior is unchanged.
+- **`GetCardTemplate` 404s on seeded globals (KANBAN-026, KANBAN-022).**
+  Migration `0029` seeded four template IDs whose first Crockford character
+  exceeds the ULID timestamp range; the `Id` type re-encodes them canonically,
+  so `List` returned IDs that `Get` could not resolve. Migration `0033`
+  rewrites the stored values to their canonical forms and reseeds the three
+  legacy UUID board templates (Kanban/Sprint/Simple) with ULIDs, so every
+  seeded global template now exposes a ULID. Legacy UUIDs on project-scoped
+  rows remain valid read-side.
+
 ## [2026.07.7] - 2026-07-24
 
 ### Added

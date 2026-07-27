@@ -223,3 +223,50 @@ automatic sync and auto-status to "v2". Filed on kanban/dev:
 Deployment wiring (KANBAN_GITHUB_WEBHOOK_SECRET, ingress must pass the
 X-Hub-Signature-256/X-GitHub-* headers intact) filed on sbbb/dev per charter
 rule 4.
+
+## 2026-07-27 — Validated and closed KANBAN-009 (card-template field plumbing)
+
+The card was implemented in the cli repo (`cli/src/kanban/card_templates.rs`)
+but never moved off todo. Validated live against kanban.sunbeam.pt with the
+release CLI: `card-template create` persisted --title/--default-description/
+--label/--checklist; `card-template update` replaced labels and checklist
+wholesale and applied the update-mask paths; round-trip `get` by ID matched.
+Noted (not a blocker): name-based `get` only resolves global templates —
+project-scoped templates need the ULID. Moved KANBAN-009 to done.
+
+## 2026-07-27 — Fixed KANBAN-016/022/023/026; triaged + assigned all open cards
+
+Asked to address every open ticket and assign them all to sienna. Outcome:
+
+- **KANBAN-026 root cause was data, not the read path.** The 0029 seed used
+  four IDs whose first Crockford char exceeds the ULID timestamp range
+  (A/Z/D/K > 7). `Id` decodes by masking the overflow and re-encodes
+  canonically, so List returned '7FV6…' while the row stored 'ZFV6…' → Get
+  404'd. Fixed with migration 0033 (plain UPDATEs; nothing FK-references
+  template ids), which also reseeds the three legacy UUID board templates
+  from 0017 with ULIDs (KANBAN-022). Project-scoped legacy UUID rows stay —
+  `IdKind::Uuid` round-trips them read-side per the card's acceptance.
+- **KANBAN-023 needed a schema answer, not a query change:** there was no
+  "done" marker anywhere (no `columns.is_done`, `completed_at` never written
+  outside fixtures). Added `Column.is_done` (migration 0034, additive proto
+  `Column.is_done=9` / `AddColumnRequest.is_done=7` / `EventColumn.is_done=7`).
+  Bool patch fields use FieldMask semantics (mask names `is_done`), same
+  pattern as `milestone_id`. MoveCard sets completed_at entering a done
+  column (COALESCE — first transition wins) and clears it leaving; CreateCard
+  into a done column starts completed. OpenSearch stays fresh because the
+  outbox already reindexes on CardMoved.
+- **KANBAN-016:** `blocked` got the same FieldMask treatment in UpdateCard;
+  legacy set-only behavior kept when the mask is absent (back-compat).
+- **KANBAN-024 deferred with a fix sketch on the card** — the real work is
+  wiring an IdentityService client (none exists in kanban today) plus a
+  gateway scope for the service app (sbbb/sso-gateway config), and a design
+  pick between hydrate-at-assign vs read-time resolver.
+- Filed **CLI-014** on cli/dev: unblock flag + column is_done CLI support
+  (depends on this server changeset being released).
+- Verification: cards 44/44, boards 27/27, templates 10/10, realtime 59/59,
+  clippy -D warnings clean, fmt clean, permission-coverage OK (77 RPCs).
+  Harness flakiness (sso-gateway bootstrap port race + Docker port
+  exhaustion) needed the known cleanup loop: rm testcontainers-labelled
+  containers + `docker network prune -f` between suite runs.
+- All 18 open cards assigned to sienna; every open card carries a triage
+  comment with the decision (done / deferred-why / owner).
