@@ -10,21 +10,20 @@ timestamp: 2026-07-27T00:00:00Z
 
 ## In flight
 
-- **Committed on mainline (4 conventional commits, NOT pushed, NOT
-  released)**: 56b834c9c1 fix(cards) KANBAN-016, 2c60b87899
-  fix(templates) KANBAN-026+022, ec1c33f21f feat(boards) KANBAN-023,
-  a0a1b02e3a docs. The four cards are in **review** pending release
-  (sienna's call); CHANGELOG staged under [Unreleased]. Verified: cards
-  44/44, boards 27/27, templates 10/10, realtime 59/59, clippy/fmt/
-  permission-coverage clean.
+- **v2026.07.8 released** (b316af1bc4 tagged + pushed, release workflow
+  #30312520954 building, ~20 min): KANBAN-016 (blocked clear via mask),
+  KANBAN-023 (Column.is_done completion lanes, migration 0034), KANBAN-026 +
+  KANBAN-022 (template ID canonicalization, migration 0033). All four cards
+  moved to done. A one-shot reminder (00:23 local) verifies the GHCR image
+  and files the cli/dev heads-up that CLI-014 is unblocked.
 - **CLI-014 filed on cli/dev**: unblock flag + column is_done CLI support,
   blocked on this server changeset being released + deployed.
 - v2026.07.7 released previously (MilestoneService + label CRUD).
 
 ## Board state (kanban/dev)
 
-- Fixed this session (pending commit → done): KANBAN-016, KANBAN-022,
-  KANBAN-023, KANBAN-026.
+- Done this session (v2026.07.8): KANBAN-016, KANBAN-022, KANBAN-023,
+  KANBAN-026.
 - Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
   (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
   KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
@@ -46,10 +45,10 @@ timestamp: 2026-07-27T00:00:00Z
 
 ## Pick up first
 
-- Commit the KANBAN-016/022/023/026 changeset (human confirmed in-session),
-  move the four cards to done, then release per the human's call.
-- After release + deploy: prod-verify `card-template get <global-id>` and
-  milestone stats after marking Done columns is_done (CLI-014).
+- Verify release workflow #30312520954 published the GHCR image (one-shot
+  reminder scheduled 00:23 local), then prod-verify after sbbb deploys:
+  `card-template get <global-id>`, unblock via mask, and milestone stats
+  once Done columns are marked is_done (CLI-014).
 - Testcontainers leak is still real: full-suite runs exhaust Docker ports
   ("address already in use" / sso-gateway bootstrap port race). Cleanup loop
   that works: `docker rm -f $(docker ps -aq --filter

@@ -270,3 +270,15 @@ Asked to address every open ticket and assign them all to sienna. Outcome:
   containers + `docker network prune -f` between suite runs.
 - All 18 open cards assigned to sienna; every open card carries a triage
   comment with the decision (done / deferred-why / owner).
+
+## 2026-07-27 — Released v2026.07.8
+
+Sienna approved the release train in-session. Version bump 2026.7.7 →
+2026.7.8 (Cargo.toml + lock), CHANGELOG [Unreleased] → [2026.07.8],
+`chore(release): v2026.07.8` (b316af1bc4), annotated tag pushed;
+release workflow #30312520954 kicked off (~20 min build, matches the
+v2026.07.7/6 timings). KANBAN-016/022/023/026 moved review → done on
+tag push. GHCR image verification + cli/dev heads-up for CLI-014
+scheduled as a one-shot reminder. Note: the release series was split
+into conventional commits per sienna's request (fix/feat/docs/release)
+rather than folding the bump into a feature commit as v2026.07.7 did.
