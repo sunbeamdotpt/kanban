@@ -1039,6 +1039,8 @@ impl CardService for CardServiceImpl {
     // Sparse patch via CASE WHEN. Bumps revision. event_log: CardUpdated.
     // milestone_id is validated against the card's project and can be cleared
     // by naming "milestone_id" in update_mask with an empty patch value.
+    // blocked can be cleared by naming "blocked" in update_mask — without the
+    // mask the legacy set-only behavior applies (true sets, false is a no-op).
 
     async fn update_card(
         &self,
@@ -1139,6 +1141,16 @@ impl CardService for CardServiceImpl {
                 (true, Some(mid))
             };
 
+        // blocked: legacy set-only behavior (a patch with blocked=true sets
+        // it), plus explicit FieldMask semantics — when the mask names
+        // "blocked" the patch value applies exactly, so false clears it.
+        let mask_has_blocked = req
+            .update_mask
+            .as_option()
+            .map(|m| m.paths.iter().any(|p| p == "blocked"))
+            .unwrap_or(false);
+        let blocked_apply = patch.blocked || mask_has_blocked;
+
         let row = sqlx::query(
             "UPDATE cards SET
                 title       = CASE WHEN $2 != '' THEN $2 ELSE title END,
@@ -1146,7 +1158,7 @@ impl CardService for CardServiceImpl {
                 priority    = CASE WHEN $4 IS NOT NULL THEN $4::card_priority ELSE priority END,
                 urgency     = CASE WHEN $5 IS NOT NULL THEN $5::card_urgency ELSE urgency END,
                 due_date    = CASE WHEN $6 IS NOT NULL THEN $6 ELSE due_date END,
-                blocked     = CASE WHEN $7 THEN $7 ELSE blocked END,
+                blocked     = CASE WHEN $7 THEN $12 ELSE blocked END,
                 cover       = CASE WHEN $8 != '' THEN $8 ELSE cover END,
                 milestone_id = CASE WHEN $9 THEN $10 ELSE milestone_id END,
                 revision    = revision + 1,
@@ -1160,11 +1172,12 @@ impl CardService for CardServiceImpl {
         .bind(priority_str)
         .bind(urgency_str)
         .bind(due_date)
-        .bind(patch.blocked)
+        .bind(blocked_apply)
         .bind(&patch.cover)
         .bind(milestone_apply)
         .bind(milestone_value)
         .bind(&tenant_id)
+        .bind(patch.blocked)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| internal("failed to update card", e))?
@@ -5942,6 +5955,113 @@ mod tests {
                 .await
                 .unwrap_or(false),
             "viewer of board B must see the card after the move"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn update_card_blocked_clears_only_via_update_mask() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "BLK").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let cid = seed_column(&pool, bid, &tenant_id).await;
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Blockable".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        // Legacy path: blocked=true sets without a mask.
+        let blocked = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card {
+                        blocked: true,
+                        ..Default::default()
+                    })
+                    .into(),
+                    update_mask: None.into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("set blocked failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(blocked.blocked, "blocked=true must set the flag");
+
+        // Legacy path: blocked=false without a mask is a no-op.
+        let still_blocked = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card::default()).into(),
+                    update_mask: None.into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("noop update failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            still_blocked.blocked,
+            "blocked=false without update_mask must not clear the flag"
+        );
+
+        // FieldMask path: naming "blocked" applies the patch value exactly.
+        let cleared = svc
+            .update_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&UpdateCardRequest {
+                    card_id: card.id.clone(),
+                    card: Some(Card::default()).into(),
+                    update_mask: Some(FieldMask {
+                        paths: vec!["blocked".to_string()],
+                        ..Default::default()
+                    })
+                    .into(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("clear blocked failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        assert!(
+            !cleared.blocked,
+            "update_mask naming blocked with a false patch must clear the flag"
         );
 
         cleanup_project(&pool, pid).await;
