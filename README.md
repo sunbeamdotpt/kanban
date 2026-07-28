@@ -13,6 +13,9 @@ labels:
 
 # Sunbeam Kanban
 
+[![Matrix](https://img.shields.io/badge/chat-%23hello%3Asunbeam.pt-0dbd8b?logo=matrix)](https://matrix.to/#/#hello:sunbeam.pt)
+[![License](https://img.shields.io/github/license/sunbeamdotpt/kanban)](LICENSE)
+
 Real-time collaborative board management for Sunbeam Studios. Organize cards across projects, share with teammates, link to GitHub issues, search globally, and see changes sync live across tabs and devices.
 
 ## Quick links
