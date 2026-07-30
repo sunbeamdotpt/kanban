@@ -6,6 +6,17 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [Unreleased]
+
+### Added
+
+- **KANBAN-027 regression test.** Added `list_cards_by_board_includes_timestamps_and_completed_at`
+  to lock in the behavior that `ListCardsByBoard` returns `created_at`,
+  `updated_at`, and `completed_at`, and that `MoveCard` sets/clears
+  `completed_at` when a card enters or leaves a done-marked column. The
+  functional fixes ship in this release train via the KANBAN-023 handler
+  changes already on mainline.
+
 ## [2026.07.8] - 2026-07-27
 
 ### Added

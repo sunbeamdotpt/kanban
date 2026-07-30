@@ -3,10 +3,10 @@ type: State
 title: Current state of kanban
 description: What is in flight, what is blocked, what the next session should pick up first.
 tags: [state]
-timestamp: 2026-07-27T00:00:00Z
+timestamp: 2026-07-30T00:00:00Z
 ---
 
-# State — 2026-07-27
+# State — 2026-07-30
 
 ## In flight
 
@@ -16,14 +16,17 @@ timestamp: 2026-07-27T00:00:00Z
   KANBAN-022 (template ID canonicalization, migration 0033). All four cards
   moved to done. A one-shot reminder (00:23 local) verifies the GHCR image
   and files the cli/dev heads-up that CLI-014 is unblocked.
+- **KANBAN-027 done**: symptoms (missing `completed_at` on done-column moves,
+  missing timestamps in `ListCardsByBoard`) were already fixed on mainline;
+  regression test added in `src/services/cards.rs`.
 - **CLI-014 filed on cli/dev**: unblock flag + column is_done CLI support,
   blocked on this server changeset being released + deployed.
 - v2026.07.7 released previously (MilestoneService + label CRUD).
 
 ## Board state (kanban/dev)
 
-- Done this session (v2026.07.8): KANBAN-016, KANBAN-022, KANBAN-023,
-  KANBAN-026.
+- Done this session (v2026.07.8 + KANBAN-027 follow-up): KANBAN-016,
+  KANBAN-022, KANBAN-023, KANBAN-026, KANBAN-027.
 - Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
   (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
   KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
@@ -34,7 +37,7 @@ timestamp: 2026-07-27T00:00:00Z
 - KANBAN-003: same-project cross-board moves ARE implemented (MoveCard
   re-homes board_id + parent tuples); proposed closing as implemented in a
   card comment — human to confirm.
-- **All 18 open cards are assigned to sienna.**
+- **All open cards are assigned to sienna.**
 
 ## Blocked / waiting
 

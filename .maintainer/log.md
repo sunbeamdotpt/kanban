@@ -282,3 +282,19 @@ tag push. GHCR image verification + cli/dev heads-up for CLI-014
 scheduled as a one-shot reminder. Note: the release series was split
 into conventional commits per sienna's request (fix/feat/docs/release)
 rather than folding the bump into a feature commit as v2026.07.7 did.
+
+## 2026-07-30 — KANBAN-027 verified and regression-tested
+
+Card reported two symptoms: (1) `completed_at` never populated when a
+card enters a done column, and (2) `ListCardsByBoard` responses omit
+`created_at`/`updated_at`/`completed_at`. Code review + targeted tests
+show the production observation was already addressed on mainline:
+`MoveCard` sets/clears `completed_at` based on the target/source column
+`is_done` marker (KANBAN-023, migration 0034), and `ListCardsByBoard`
+has selected and returned all three timestamp columns since the initial
+CardService implementation. Added a regression test
+(`list_cards_by_board_includes_timestamps_and_completed_at`) that
+explicitly asserts list responses carry `created_at`, `updated_at`, and
+correct `completed_at` state across done-column transitions. All 45
+card service tests pass; clippy `-D warnings` and `cargo fmt` clean.
+Card moved to done.
