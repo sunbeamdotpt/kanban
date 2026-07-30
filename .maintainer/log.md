@@ -311,3 +311,11 @@ the first attempt was deleted from remote.
 Filed **SBBB-013** on sbbb/dev for production deployment of the
 v2026.07.9 image with verification steps. Linked back to KANBAN-027 in
 the card description and a comment. Assigned to **tony**.
+
+**KANBAN-028 closed as wontfix.** The card asked for direct
+`Authorization: Bearer` scripting against `kanban.sunbeam.pt` ConnectRPC
+endpoints. That is not a supported use case: kanban is an internal RPC
+backend consumed through the sunbeam CLI, and the opaque access token
+from `sunbeam auth token` is scoped for the CLI/gateway flow rather than
+direct ingress. Card moved to done with a comment explaining the design
+and pointing missing-CLI operations (e.g. `--is-done`) to CLI-015.

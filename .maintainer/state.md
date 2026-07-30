@@ -27,7 +27,8 @@ timestamp: 2026-07-30T00:00:00Z
 ## Board state (kanban/dev)
 
 - Done this session: KANBAN-016, KANBAN-022, KANBAN-023, KANBAN-026,
-  KANBAN-027.
+  KANBAN-027, KANBAN-028 (wontfix — direct Bearer scripting against
+  kanban.sunbeam.pt is not supported; use the CLI or file CLI gaps).
 - Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
   (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
   KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
