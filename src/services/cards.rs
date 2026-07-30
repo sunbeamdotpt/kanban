@@ -6227,4 +6227,141 @@ mod tests {
 
         cleanup_project(&pool, pid).await;
     }
+
+    #[tokio::test]
+    async fn list_cards_by_board_includes_timestamps_and_completed_at() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "LTS").await;
+        let bid = seed_board(&pool, pid, &tenant_id).await;
+        let col_todo = seed_column(&pool, bid, &tenant_id).await;
+        let col_done = Id::new();
+        sqlx::query(
+            "INSERT INTO columns (id, tenant_id, board_id, title, position, is_done) VALUES ($1, $2, $3, 'Done', 1, true)",
+        )
+        .bind(col_done)
+        .bind(&tenant_id)
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: col_todo.to_string(),
+                    title: "Timestamped".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let list = svc
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 0,
+                    cursor: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list failed")
+            .body;
+        assert_eq!(list.cards.len(), 1, "expected one card in list");
+        let listed = &list.cards[0];
+        assert!(
+            listed.created_at.as_option().is_some(),
+            "list must include created_at"
+        );
+        assert!(
+            listed.updated_at.as_option().is_some(),
+            "list must include updated_at"
+        );
+        assert!(
+            listed.completed_at.as_option().is_none(),
+            "open card in list must not have completed_at"
+        );
+
+        svc.move_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&MoveCardRequest {
+                card_id: card.id.clone(),
+                to_column_id: col_done.to_string(),
+                to_position: 1,
+                idempotency_key: Id::new().to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("move to done failed");
+
+        let list_done = svc
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 0,
+                    cursor: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list after move failed")
+            .body;
+        assert_eq!(list_done.cards.len(), 1);
+        assert!(
+            list_done.cards[0].completed_at.as_option().is_some(),
+            "list must include completed_at after move to done column"
+        );
+
+        svc.move_card(
+            authed_ctx_with_object(&subject, &card.id),
+            connect_request(&MoveCardRequest {
+                card_id: card.id.clone(),
+                to_column_id: col_todo.to_string(),
+                to_position: 1,
+                idempotency_key: Id::new().to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("move out of done failed");
+
+        let list_reopened = svc
+            .list_cards_by_board(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&ListCardsByBoardRequest {
+                    board_id: bid.to_string(),
+                    column_id: String::new(),
+                    limit: 0,
+                    cursor: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list after reopen failed")
+            .body;
+        assert!(
+            list_reopened.cards[0].completed_at.as_option().is_none(),
+            "list must clear completed_at after move out of done column"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
 }
