@@ -310,4 +310,4 @@ the first attempt was deleted from remote.
 
 Filed **SBBB-013** on sbbb/dev for production deployment of the
 v2026.07.9 image with verification steps. Linked back to KANBAN-027 in
-the card description and a comment.
+the card description and a comment. Assigned to **tony**.
