@@ -6,6 +6,35 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.10] - 2026-07-30
+
+### Added
+
+- **Server-side assignee validation (KANBAN-029).** `AssignCard` and
+  `UnassignCard` previously stored any string as the assignee subject without
+  checking it. Both RPCs now validate the input against the tenant's
+  sso-gateway user directory: an identity ULID, the canonical `user:<ulid>`
+  subject, or an email address are all accepted, resolved, and persisted as
+  the canonical `user:<ulid>` subject. Malformed references return
+  `invalid_argument`; unknown users return `not_found`. There is no legacy
+  passthrough — assignee rows written before this change with non-directory
+  subjects can no longer be removed via `UnassignCard`. Resolution runs
+  through a new `IdentityClient` built on the SDK `AuthClient` (scope
+  `identity:read`, `x-tenant-id` routing); email input is resolved by paging
+  `ListIdentities` and matching `traits.email` case-insensitively, since the
+  gateway has no email-lookup RPC. **Deployment note:** the kanban service
+  application must hold the `identity:read` scope (SBBB-016) or every
+  assign/unassign call fails with a gateway `permission_denied`.
+
+### Changed
+
+- **`proto/iam` re-synced from the registry.** The vendored sso-gateway
+  protos were a stale hand copy (mixed `go_package` options, missing
+  `client_credential.proto`); they are now a `buf export` of
+  `buf.build/sunbeamdotpt/sso-gateway`. The SDK
+  (`github.com/sunbeamdotpt/sdk`, tag `v3.3.0`, `auth` feature) is now a
+  runtime dependency.
+
 ## [2026.07.9] - 2026-07-30
 
 ### Added
