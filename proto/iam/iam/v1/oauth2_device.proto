@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package iam.v1;
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // DeviceAuthorizationRequest initiates an OAuth 2.0 Device Authorization Grant
 // (RFC 8628) on behalf of a client.
@@ -54,6 +54,40 @@ message DeviceTokenResponse {
   string id_token = 6;
 }
 
+// GetDeviceVerificationRequest exchanges the user code shown on a device for
+// a device verification challenge.
+message GetDeviceVerificationRequest {
+  // Short user-facing code displayed by the device.
+  string user_code = 1;
+}
+
+// GetDeviceVerificationResponse carries the challenge identifying the device
+// verification request. The response also forwards the authorization server's
+// session cookies as Set-Cookie headers; the caller must relay them to the
+// browser, which needs them when it follows the post-accept redirect.
+message GetDeviceVerificationResponse {
+  // Opaque gateway challenge identifying the device verification request.
+  string challenge = 1;
+  // The user code being confirmed, echoed for display.
+  string user_code = 2;
+}
+
+// AcceptDeviceVerificationRequest approves the user code shown on a device.
+message AcceptDeviceVerificationRequest {
+  // Challenge returned by GetDeviceVerification, or the raw challenge
+  // delivered to the verification app by the authorization server's redirect.
+  string challenge = 1;
+  // The user code being approved.
+  string user_code = 2;
+}
+
+// AcceptDeviceVerificationResponse tells the verification app where to send
+// the browser next to continue the flow.
+message AcceptDeviceVerificationResponse {
+  // URL the browser must follow to continue the flow.
+  string redirect_to = 1;
+}
+
 // OAuth2DeviceService exposes OAuth 2.0 Device Authorization Grant endpoints
 // through a gateway-owned, Ory-agnostic Connect-RPC contract.
 service OAuth2DeviceService {
@@ -61,4 +95,10 @@ service OAuth2DeviceService {
   rpc AuthorizeDevice(DeviceAuthorizationRequest) returns (DeviceAuthorizationResponse);
   // GetDeviceToken polls for tokens using the device code.
   rpc GetDeviceToken(DeviceTokenRequest) returns (DeviceTokenResponse);
+  // GetDeviceVerification exchanges a user code for a device verification
+  // challenge so the verification app can render the confirmation page.
+  rpc GetDeviceVerification(GetDeviceVerificationRequest) returns (GetDeviceVerificationResponse);
+  // AcceptDeviceVerification approves the user code and returns the URL the
+  // browser must follow to continue the flow.
+  rpc AcceptDeviceVerification(AcceptDeviceVerificationRequest) returns (AcceptDeviceVerificationResponse);
 }

@@ -5,7 +5,7 @@ package iam.v1;
 import "google/protobuf/timestamp.proto";
 import "iam/v1/common.proto";
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // Tenant is an isolated organization in the gateway.
 message Tenant {

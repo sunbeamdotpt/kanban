@@ -18,6 +18,7 @@ use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{error, warn};
 
+use crate::auth::identity_client::{IdentityClient, ResolveError};
 use crate::auth::permission_client::PermissionClient;
 use crate::auth::permission_retry::PermissionRetryExt;
 use sunbeam_g2v::middleware::auth::AuthContext;
@@ -63,6 +64,7 @@ fn page_limit(request_limit: i32) -> i32 {
 pub struct CardServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
+    pub identity: Arc<IdentityClient>,
 }
 
 // ── Permission helpers ─────────────────────────────────────────────────────────
@@ -103,6 +105,15 @@ pub(crate) fn opt_to_proto_ts(dt: Option<DateTime<Utc>>) -> buffa::MessageField<
 fn internal(msg: &str, err: impl std::fmt::Display) -> ConnectError {
     error!(error = %err, "{msg}");
     ConnectError::internal(msg)
+}
+
+/// Map a user-directory resolution failure onto the wire error.
+fn resolve_err(e: ResolveError) -> ConnectError {
+    match e {
+        ResolveError::Invalid(msg) => ConnectError::invalid_argument(msg),
+        ResolveError::NotFound(msg) => ConnectError::not_found(msg),
+        ResolveError::Backend(msg) => internal("identity backend error", msg),
+    }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -2050,6 +2061,9 @@ impl CardService for CardServiceImpl {
     // ── AssignCard ────────────────────────────────────────────────────────────
     //
     // CheckedObjectId = card_id (KanbanCard + edit, per matrix).
+    // The subject input (identity ULID, `user:<ulid>`, or email) is validated
+    // against the tenant's user directory and canonicalized to `user:<ulid>`
+    // before anything is stored.
     // ON CONFLICT DO NOTHING — idempotent.
     // event_log: CardUpdated (assignees patch).
 
@@ -2068,6 +2082,12 @@ impl CardService for CardServiceImpl {
         if req.subject.is_empty() {
             return Err(ConnectError::invalid_argument("subject is required"));
         }
+
+        let subject = self
+            .identity
+            .resolve_subject(&tenant_id, &req.subject)
+            .await
+            .map_err(resolve_err)?;
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -2092,7 +2112,7 @@ impl CardService for CardServiceImpl {
         )
         .bind(&tenant_id)
         .bind(card_id)
-        .bind(&req.subject)
+        .bind(&subject)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal("failed to assign card", e))?;
@@ -2113,7 +2133,7 @@ impl CardService for CardServiceImpl {
             "card_id": card_id.to_string(),
             "prev_revision": prev_revision,
             "new_revision": new_revision,
-            "patch": { "assignees": [req.subject] },
+            "patch": { "assignees": [subject] },
         });
         insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
@@ -2134,6 +2154,8 @@ impl CardService for CardServiceImpl {
     // ── UnassignCard ──────────────────────────────────────────────────────────
     //
     // CheckedObjectId = card_id (KanbanCard + edit, per matrix).
+    // Same subject resolution as AssignCard (ULID, `user:<ulid>`, or email →
+    // canonical `user:<ulid>`) so both verbs accept identical user references.
     // event_log: CardUpdated.
 
     async fn unassign_card(
@@ -2148,6 +2170,12 @@ impl CardService for CardServiceImpl {
 
         let tenant_id = tenant_id_from_request(&ctx)?;
         let req = request.to_owned_message();
+
+        let subject = self
+            .identity
+            .resolve_subject(&tenant_id, &req.subject)
+            .await
+            .map_err(resolve_err)?;
 
         let cur =
             sqlx::query("SELECT board_id, revision FROM cards WHERE id = $1 AND tenant_id = $2")
@@ -2171,7 +2199,7 @@ impl CardService for CardServiceImpl {
             "DELETE FROM card_assignees WHERE card_id = $1 AND subject = $2 AND tenant_id = $3",
         )
         .bind(card_id)
-        .bind(&req.subject)
+        .bind(&subject)
         .bind(&tenant_id)
         .execute(&mut *tx)
         .await
@@ -2193,7 +2221,7 @@ impl CardService for CardServiceImpl {
             "card_id": card_id.to_string(),
             "prev_revision": prev_revision,
             "new_revision": new_revision,
-            "patch": { "unassigned": req.subject },
+            "patch": { "unassigned": subject },
         });
         insert_board_event(&mut tx, &tenant_id, board_id, "CardUpdated", payload).await?;
 
@@ -2945,6 +2973,7 @@ impl CardService for CardServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity_client::canonical_subject;
     use crate::test_support::{connect_ctx, connect_request};
     use buffa_types::google::protobuf::FieldMask;
     use sunbeam_g2v::middleware::auth::AuthContext;
@@ -2959,8 +2988,12 @@ mod tests {
         crate::test_support::setup_permission().await
     }
 
-    fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> CardServiceImpl {
-        CardServiceImpl { pool, permission }
+    async fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> CardServiceImpl {
+        CardServiceImpl {
+            pool,
+            permission,
+            identity: crate::test_support::setup_identity().await,
+        }
     }
 
     /// Create an authenticated context that only carries the caller subject.
@@ -2992,6 +3025,58 @@ mod tests {
     }
 
     // ── Seed helpers ─────────────────────────────────────────────────────────
+
+    /// Register a real identity in the test tenant's user directory and return
+    /// its `(canonical_subject, email)` pair. Assignee validation resolves
+    /// against the sso-gateway directory, so assign/unassign tests must use
+    /// directory-backed identities rather than synthetic subjects.
+    async fn seed_identity(email_prefix: &str) -> (String, String) {
+        let infra = crate::test_support::containers::setup().await;
+        let email = format!(
+            "{email_prefix}-{}@kanban-test.example",
+            Id::new().to_string().to_lowercase()
+        );
+        let id = crate::test_support::containers::create_identity(
+            &infra.sso_gateway_url,
+            &crate::test_support::test_tenant_id(),
+            &email,
+        )
+        .await
+        .expect("create identity failed");
+        (canonical_subject(&id), email)
+    }
+
+    /// Scaffold project → board → column → card for assignee tests, returning
+    /// `(caller_subject, card_id, project_id)`.
+    async fn scaffold_card(
+        svc: &CardServiceImpl,
+        pool: &PgPool,
+        prefix: &str,
+    ) -> (String, String, Id) {
+        let tenant_id = crate::test_support::test_tenant_id();
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(pool, &subject, prefix).await;
+        let bid = seed_board(pool, pid, &tenant_id).await;
+        let cid = seed_column(pool, bid, &tenant_id).await;
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &bid.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: bid.to_string(),
+                    column_id: cid.to_string(),
+                    title: "Assignee validation".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        (subject, card.id, pid)
+    }
 
     async fn seed_project(pool: &PgPool, subject: &str, prefix: &str) -> Id {
         let pid = Id::new();
@@ -3099,7 +3184,7 @@ mod tests {
     async fn create_card_allocates_ref() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3174,7 +3259,7 @@ mod tests {
     async fn create_card_in_different_projects_have_independent_seqs() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3235,7 +3320,7 @@ mod tests {
     async fn move_card_within_same_board_succeeds() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3303,7 +3388,7 @@ mod tests {
     async fn move_card_to_column_on_different_project_returns_invalid_argument() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3360,7 +3445,7 @@ mod tests {
     async fn move_card_with_idempotency_key_replays_returns_same_state() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3445,7 +3530,7 @@ mod tests {
     async fn update_card_bumps_revision_and_writes_event_log_row() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3517,7 +3602,7 @@ mod tests {
     async fn delete_card_cascades_assignees_labels_checklist_comments() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3547,11 +3632,12 @@ mod tests {
         let card_id = card.id.parse::<Id>().unwrap();
 
         // Add assignee, label, checklist item, comment.
+        let (assignee, _) = seed_identity("cascade").await;
         svc.assign_card(
             authed_ctx_with_object(&subject, &card.id),
             connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
-                subject: subject.clone(),
+                subject: assignee,
                 ..Default::default()
             }),
         )
@@ -3624,7 +3710,7 @@ mod tests {
     async fn bulk_update_card_labels_writes_event_log_per_card() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3709,7 +3795,7 @@ mod tests {
     async fn assign_card_idempotent_on_repeat() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3736,11 +3822,12 @@ mod tests {
             .expect("card missing");
 
         // Assign twice — should not duplicate.
+        let (assignee, _) = seed_identity("idempotent").await;
         svc.assign_card(
             authed_ctx_with_object(&subject, &card.id),
             connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
-                subject: subject.clone(),
+                subject: assignee.clone(),
                 ..Default::default()
             }),
         )
@@ -3751,7 +3838,7 @@ mod tests {
             authed_ctx_with_object(&subject, &card.id),
             connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
-                subject: subject.clone(),
+                subject: assignee,
                 ..Default::default()
             }),
         )
@@ -3770,7 +3857,7 @@ mod tests {
     async fn add_checklist_item_appends_to_position_max_plus_one() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3832,7 +3919,7 @@ mod tests {
     async fn add_then_edit_comment_updates_body_and_writes_event_log() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -3918,7 +4005,7 @@ mod tests {
     async fn delete_comment_rejects_when_caller_is_not_author_or_admin() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let author = format!("user:author-{}", Id::new());
@@ -4010,7 +4097,7 @@ mod tests {
     async fn get_card_returns_created_card() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4061,7 +4148,7 @@ mod tests {
     async fn get_card_hides_card_from_other_tenant() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4108,7 +4195,7 @@ mod tests {
     async fn batch_get_cards_filters_by_board() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4157,7 +4244,7 @@ mod tests {
     async fn list_cards_by_board_paginates() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4239,7 +4326,7 @@ mod tests {
     async fn list_cards_by_board_unset_limit_returns_all_cards() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4291,7 +4378,7 @@ mod tests {
     async fn unassign_card_removes_assignee() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4317,11 +4404,12 @@ mod tests {
             .into_option()
             .expect("card missing");
 
+        let (assignee, _) = seed_identity("unassign").await;
         svc.assign_card(
             authed_ctx_with_object(&subject, &card.id),
             connect_request(&AssignCardRequest {
                 card_id: card.id.clone(),
-                subject: "user:alice".to_string(),
+                subject: assignee.clone(),
                 ..Default::default()
             }),
         )
@@ -4333,7 +4421,7 @@ mod tests {
                 authed_ctx_with_object(&subject, &card.id),
                 connect_request(&UnassignCardRequest {
                     card_id: card.id.clone(),
-                    subject: "user:alice".to_string(),
+                    subject: assignee.clone(),
                     ..Default::default()
                 }),
             )
@@ -4345,8 +4433,194 @@ mod tests {
             .expect("card missing");
 
         assert!(
-            updated.assignees.iter().all(|a| a.subject != "user:alice"),
-            "alice must be unassigned"
+            updated.assignees.iter().all(|a| a.subject != assignee),
+            "assignee must be removed"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn assign_card_accepts_bare_ulid_and_stores_canonical_subject() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "AUL").await;
+        let (canonical, _) = seed_identity("bare-ulid").await;
+        let bare_ulid = canonical.strip_prefix("user:").unwrap().to_string();
+
+        let card = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: bare_ulid,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("assign by bare ULID failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(card.assignees.len(), 1);
+        assert_eq!(
+            card.assignees[0].subject, canonical,
+            "bare ULID input must be stored in canonical user:<ulid> form"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn assign_card_accepts_email_and_stores_canonical_subject() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "AEM").await;
+        let (canonical, email) = seed_identity("by-email").await;
+
+        let card = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: email,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("assign by email failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(card.assignees.len(), 1);
+        assert_eq!(
+            card.assignees[0].subject, canonical,
+            "email input must resolve to the canonical user:<ulid> subject"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn assign_card_rejects_malformed_subject() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "ABAD").await;
+
+        let err = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: "tony".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("garbage subject must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn assign_card_rejects_unknown_ulid() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "AUN").await;
+
+        let err = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("unknown ULID must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn assign_card_rejects_unknown_email() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "AUE").await;
+
+        let err = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: format!("ghost-{}@kanban-test.example", Id::new()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("unknown email must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::NotFound);
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    #[tokio::test]
+    async fn unassign_card_resolves_email_reference() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "UEM").await;
+        let (canonical, email) = seed_identity("unassign-email").await;
+
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card_id),
+            connect_request(&AssignCardRequest {
+                card_id: card_id.clone(),
+                subject: canonical.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("assign failed");
+
+        let card = svc
+            .unassign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&UnassignCardRequest {
+                    card_id: card_id.clone(),
+                    // Uppercased on purpose: email matching is case-insensitive.
+                    subject: email.to_uppercase(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("unassign by email failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert!(
+            card.assignees.iter().all(|a| a.subject != canonical),
+            "unassign by email must resolve and remove the canonical subject"
         );
 
         cleanup_project(&pool, pid).await;
@@ -4356,7 +4630,7 @@ mod tests {
     async fn update_checklist_item_persists_changes() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4442,7 +4716,7 @@ mod tests {
     async fn remove_checklist_item_deletes_item() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4524,7 +4798,7 @@ mod tests {
     async fn list_comments_returns_comments() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4586,7 +4860,7 @@ mod tests {
     async fn create_card_persists_urgency() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4646,7 +4920,7 @@ mod tests {
     async fn create_card_defaults_urgency_to_medium() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4685,7 +4959,7 @@ mod tests {
     async fn update_card_persists_urgency() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4747,7 +5021,7 @@ mod tests {
     async fn update_card_sets_and_clears_milestone() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4833,7 +5107,7 @@ mod tests {
     async fn create_card_rejects_milestone_from_other_project() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4867,7 +5141,7 @@ mod tests {
     async fn update_card_rejects_unknown_milestone() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4919,7 +5193,7 @@ mod tests {
     async fn priority_enum_still_round_trips() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -4959,7 +5233,7 @@ mod tests {
     async fn add_card_dependency_links_cards() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5045,7 +5319,7 @@ mod tests {
     async fn remove_card_dependency_unlinks_cards() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5143,7 +5417,7 @@ mod tests {
     async fn add_card_dependency_rejects_self_dependency() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5193,7 +5467,7 @@ mod tests {
     async fn add_card_dependency_allows_cross_board() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5296,7 +5570,7 @@ mod tests {
     async fn add_card_dependency_allows_cross_project() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5371,7 +5645,7 @@ mod tests {
     async fn add_card_dependency_rejects_cross_tenant() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let sso_gateway_url = crate::test_support::setup_sso_gateway_url().await;
@@ -5473,7 +5747,7 @@ mod tests {
     async fn remove_card_dependency_allows_cross_board() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5574,7 +5848,7 @@ mod tests {
     async fn add_card_dependency_idempotent() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5657,7 +5931,7 @@ mod tests {
     async fn dependency_mutation_bumps_revision_and_event_log() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5747,7 +6021,7 @@ mod tests {
     async fn create_card_heals_stale_ref_counter_prefix() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -5795,7 +6069,7 @@ mod tests {
     async fn create_card_writes_parent_tuple() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let owner = format!("user:test-owner-{}", Id::new());
@@ -5851,7 +6125,7 @@ mod tests {
     async fn delete_card_removes_tuples() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let owner = format!("user:test-owner-{}", Id::new());
@@ -5907,7 +6181,7 @@ mod tests {
     async fn move_card_across_boards_updates_parent_tuple() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let owner = format!("user:test-owner-{}", Id::new());
@@ -5988,7 +6262,7 @@ mod tests {
     async fn update_card_blocked_clears_only_via_update_mask() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -6095,7 +6369,7 @@ mod tests {
     async fn move_card_into_done_column_sets_completed_at_and_back_clears() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -6186,7 +6460,7 @@ mod tests {
     async fn create_card_in_done_column_starts_completed() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());
@@ -6232,7 +6506,7 @@ mod tests {
     async fn list_cards_by_board_includes_timestamps_and_completed_at() {
         let pool = setup_pool().await;
         let permission = setup_permission().await;
-        let svc = make_service(pool.clone(), Arc::clone(&permission));
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
         let tenant_id = crate::test_support::test_tenant_id();
 
         let subject = format!("user:test-{}", Id::new());

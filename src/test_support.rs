@@ -221,6 +221,13 @@ pub async fn setup_permission() -> std::sync::Arc<crate::auth::permission_client
     containers::setup().await.permission.clone()
 }
 
+/// Start the shared testcontainers stack (if not already started) and return an
+/// identity client backed by the sso-gateway.
+#[cfg(test)]
+pub async fn setup_identity() -> std::sync::Arc<crate::auth::identity_client::IdentityClient> {
+    containers::setup().await.identity.clone()
+}
+
 /// Start the shared testcontainers stack (if not already started) and return the
 /// sso-gateway base URL.
 #[cfg(test)]
@@ -258,10 +265,12 @@ pub(crate) mod containers {
     use sunbeam_g2v::config::NatsConfig;
     use sunbeam_g2v::mq::NatsClient;
 
+    use crate::auth::identity_client::{IdentityClient, IdentityClientConfig};
     use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
     use std::collections::HashMap;
 
     type PermissionClientCache = HashMap<(String, String, String), Arc<PermissionClient>>;
+    type IdentityClientCache = HashMap<(String, String, String), Arc<IdentityClient>>;
 
     use crate::iam_proto::iam::v1::{
         ApplicationServiceClient, CreateApplicationRequest, CreateTenantRequest,
@@ -351,6 +360,7 @@ pub(crate) mod containers {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
         pub permission: Arc<PermissionClient>,
+        pub identity: Arc<IdentityClient>,
         pub sso_gateway_url: String,
     }
 
@@ -389,6 +399,11 @@ pub(crate) mod containers {
     /// tests do not each trigger a separate OAuth2 token fetch against the
     /// sso-gateway.
     static PERMISSION_CLIENT_CACHE: OnceCell<tokio::sync::Mutex<PermissionClientCache>> =
+        OnceCell::const_new();
+
+    /// Shared identity clients keyed by service credentials, for the same
+    /// token-fetch deduplication as the permission cache.
+    static IDENTITY_CLIENT_CACHE: OnceCell<tokio::sync::Mutex<IdentityClientCache>> =
         OnceCell::const_new();
 
     /// Set when the shared bootstrap panics inside the `SHARED` initializer.
@@ -449,8 +464,11 @@ pub(crate) mod containers {
     /// Use externally-provided services when the standard env vars are set.
     ///
     /// The caller is expected to have bootstrapped an OAuth2 application with
-    /// `permission:admin` and `tenant:admin` and to expose its credentials via
-    /// `SSO_GATEWAY_CLIENT_ID` and `SSO_GATEWAY_CLIENT_SECRET`.
+    /// `permission:admin`, `tenant:admin`, and `identity:read` and to expose
+    /// its credentials via `SSO_GATEWAY_CLIENT_ID` and
+    /// `SSO_GATEWAY_CLIENT_SECRET`. The tenant must also have a default
+    /// identity schema registered (the container harness registers one; with
+    /// external services, call `ensure_default_identity_schema` once).
     async fn from_env() -> Option<SharedInfra> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let nats_url = std::env::var("NATS_URL").ok()?;
@@ -830,7 +848,7 @@ pub(crate) mod containers {
             client_secret.to_string(),
         );
         let mut clients = cache.lock().await;
-        let permission = clients.entry(key).or_insert_with(|| {
+        let permission = clients.entry(key.clone()).or_insert_with(|| {
             Arc::new(
                 PermissionClient::new(&PermissionClientConfig {
                     base_url: sso_gateway_url.to_string(),
@@ -844,20 +862,44 @@ pub(crate) mod containers {
         let permission = Arc::clone(permission);
         drop(clients);
 
+        let identity_cache = IDENTITY_CLIENT_CACHE
+            .get_or_init(|| async { tokio::sync::Mutex::new(IdentityClientCache::new()) })
+            .await;
+        let mut clients = identity_cache.lock().await;
+        let identity = clients.entry(key).or_insert_with(|| {
+            Arc::new(
+                IdentityClient::new(&IdentityClientConfig {
+                    base_url: sso_gateway_url.to_string(),
+                    token_url: format!("{sso_gateway_url}/oauth2/token"),
+                    client_id: client_id.to_string(),
+                    client_secret: client_secret.to_string(),
+                })
+                .expect("failed to build identity client"),
+            )
+        });
+        let identity = Arc::clone(identity);
+        drop(clients);
+
         TestInfra {
             pool,
             nats,
             permission,
+            identity,
             sso_gateway_url: sso_gateway_url.to_string(),
         }
     }
 
     /// Create the well-known `kanban-test` tenant and its Kanban service
-    /// application with `permission:admin`.
+    /// application with `permission:admin`, `tenant:admin`, and `identity:read`.
     async fn bootstrap_kanban_app(
         sso_gateway_url: &str,
     ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
-        create_tenant_app(sso_gateway_url, "kanban-test", "Kanban Test Tenant").await
+        let (tenant_id, client_id, client_secret) =
+            create_tenant_app(sso_gateway_url, "kanban-test", "Kanban Test Tenant").await?;
+        // Assignee-validation tests create identities in this tenant; the
+        // gateway requires a default identity schema before CreateIdentity.
+        ensure_default_identity_schema(sso_gateway_url, &tenant_id).await?;
+        Ok((tenant_id, client_id, client_secret))
     }
 
     /// Create a tenant using the system bootstrap client and return its id.
@@ -897,9 +939,9 @@ pub(crate) mod containers {
         Ok(tenant.id)
     }
 
-    /// Create a tenant and a Kanban service application with `permission:admin`
-    /// and `tenant:admin` inside it, returning `(tenant_id, client_id,
-    /// client_secret)`.
+    /// Create a tenant and a Kanban service application with `permission:admin`,
+    /// `tenant:admin`, and `identity:read` inside it, returning `(tenant_id,
+    /// client_id, client_secret)`.
     ///
     /// The system bootstrap client first exchanges its credentials for an access
     /// token; that token is used to call the IAM Connect-RPC endpoints. The new
@@ -948,9 +990,14 @@ pub(crate) mod containers {
                             redirect_uris: vec![],
                             grant_types: vec!["client_credentials".to_string()],
                             response_types: vec!["token".to_string()],
-                            scope: vec!["permission:admin".to_string(), "tenant:admin".to_string()],
+                            scope: vec![
+                                "permission:admin".to_string(),
+                                "tenant:admin".to_string(),
+                                "identity:read".to_string(),
+                            ],
                             token_endpoint_auth_method: "client_secret_post".to_string(),
                             cross_tenant: true,
+                            skip_consent: false,
                             __buffa_unknown_fields: Default::default(),
                         },
                         tenant_options.clone(),
@@ -990,6 +1037,121 @@ pub(crate) mod containers {
         };
 
         Ok((tenant_id, secret.client_id, secret.client_secret))
+    }
+
+    /// Build an `identity:admin`-scoped gateway client for `tenant_id` using
+    /// the system bootstrap credentials.
+    async fn identity_admin_client(
+        sso_gateway_url: &str,
+        tenant_id: &str,
+    ) -> Result<sdk::auth::AuthClient, Box<dyn std::error::Error + Send + Sync>> {
+        let admin_token = fetch_bootstrap_token(sso_gateway_url, "identity:admin")
+            .await
+            .map_err(|e| format!("failed to fetch admin token: {e}"))?;
+
+        let client = sdk::auth::AuthClient::builder(sso_gateway_url)
+            .auth(sunbeam_g2v::client::BearerToken::new(admin_token))
+            .build()
+            .map_err(|e| format!("failed to build identity admin client: {e}"))?;
+        let base_uri = sso_gateway_url
+            .parse::<http::Uri>()
+            .map_err(|e| format!("invalid sso-gateway URL: {e}"))?;
+        sdk::auth::AuthClient::new(client, base_uri)
+            .map(|c| c.with_tenant(tenant_id))
+            .map_err(|e| format!("failed to build identity admin client: {e}").into())
+    }
+
+    /// Register the minimal email-password identity schema as the tenant
+    /// default. The gateway rejects `CreateIdentity` until one exists.
+    ///
+    /// Idempotent: both the `AlreadyExists` RPC error and the raw duplicate-key
+    /// violation the gateway surfaces as `internal` (parallel first-time
+    /// registration race) are treated as success.
+    pub async fn ensure_default_identity_schema(
+        sso_gateway_url: &str,
+        tenant_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let auth = identity_admin_client(sso_gateway_url, tenant_id).await?;
+
+        let schema_json: buffa_types::google::protobuf::Struct =
+            serde_json::from_value(serde_json::json!({
+                "$id": "https://schemas.ory.sh/presets/kratos/quickstart/email-password/identity.schema.json",
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Person",
+                "type": "object",
+                "properties": {
+                    "traits": {
+                        "type": "object",
+                        "properties": {
+                            "email": {
+                                "type": "string",
+                                "format": "email",
+                                "title": "E-Mail",
+                                "ory.sh/kratos": {
+                                    "credentials": { "password": { "identifier": true } },
+                                    "recovery": { "via": "email" },
+                                    "verification": { "via": "email" }
+                                }
+                            }
+                        },
+                        "required": ["email"],
+                        "additionalProperties": false
+                    }
+                }
+            }))
+            .map_err(|e| format!("failed to build identity schema: {e}"))?;
+
+        let result = auth
+            .identity()
+            .create_identity_schema(sdk::auth::v1::CreateIdentitySchemaRequest {
+                schema_id: "default".to_string(),
+                schema_json: buffa::MessageField::some(schema_json),
+                is_default: true,
+                ..Default::default()
+            })
+            .await;
+
+        if let Err(e) = result {
+            let duplicate = e.code == connectrpc::ErrorCode::AlreadyExists
+                || e.to_string()
+                    .contains("tenant_identity_schemas_tenant_id_schema_id_key");
+            if !duplicate {
+                return Err(format!("CreateIdentitySchema failed: {e}").into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Register an identity with the given email in `tenant_id`'s user
+    /// directory and return its gateway identity ULID.
+    ///
+    /// Uses the system bootstrap client with `identity:admin`.
+    pub async fn create_identity(
+        sso_gateway_url: &str,
+        tenant_id: &str,
+        email: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        ensure_default_identity_schema(sso_gateway_url, tenant_id).await?;
+        let auth = identity_admin_client(sso_gateway_url, tenant_id).await?;
+
+        let traits: buffa_types::google::protobuf::Struct =
+            serde_json::from_value(serde_json::json!({ "email": email }))
+                .map_err(|e| format!("failed to build identity traits: {e}"))?;
+
+        let identity = auth
+            .identity()
+            .create_identity(sdk::auth::v1::CreateIdentityRequest {
+                schema_id: String::new(),
+                traits: buffa::MessageField::some(traits),
+                password: String::new(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("CreateIdentity failed: {e}"))?
+            .into_owned();
+
+        Ok(identity.id)
     }
 
     /// Exchange the system bootstrap client credentials for an access token with

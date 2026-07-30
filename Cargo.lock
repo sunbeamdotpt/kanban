@@ -3824,15 +3824,18 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdk"
-version = "3.0.0"
-source = "git+https://github.com/sunbeamdotpt/sdk?tag=v3.0.0#e189eba703753047214274052b3589d2b7af02e8"
+version = "3.3.0"
+source = "git+https://github.com/sunbeamdotpt/sdk?tag=v3.3.0#3d12d67c9a267875f2a877f190d6b8eaad4bc6c6"
 dependencies = [
  "async-trait",
  "base64",
  "bollard",
+ "buffa",
+ "buffa-types",
  "bytes",
  "chrono",
  "clap",
+ "connectrpc",
  "connectrpc-build",
  "dirs",
  "flate2",
@@ -3840,6 +3843,7 @@ dependencies = [
  "hmac 0.12.1",
  "hostname",
  "http",
+ "http-body",
  "indicatif",
  "jiff",
  "libc",
@@ -3849,6 +3853,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "sunbeam-g2v",
  "tar",
  "tempfile",
  "testcontainers",

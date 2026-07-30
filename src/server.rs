@@ -27,6 +27,7 @@ use sunbeam_g2v::config::NatsConfig;
 use sunbeam_g2v::middleware::auth::{AuthMiddlewareState, auth_middleware};
 use sunbeam_g2v::mq::NatsClient;
 
+use crate::auth::identity_client::{IdentityClient, IdentityClientConfig};
 use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
 use crate::auth::session_client::SsoGatewaySessionClient;
 
@@ -681,6 +682,19 @@ pub async fn run_with_config(
 
     info!("Permission client initialised");
 
+    // ── 5b. Identity client for user-directory lookups (assignee validation) ─
+    let identity = Arc::new(
+        IdentityClient::new(&IdentityClientConfig {
+            base_url: config.sso_gateway_url.clone(),
+            token_url: config.sso_gateway_token_url.clone(),
+            client_id: config.sso_gateway_client_id.clone(),
+            client_secret: config.sso_gateway_client_secret.clone(),
+        })
+        .context("failed to build identity client")?,
+    );
+
+    info!("Identity client initialised");
+
     // ── 7. Prometheus metrics ───────────────────────────────────────────────
     let metrics = Arc::new(
         KanbanMetrics::with_buckets(config.rpc_duration_buckets_secs.clone())
@@ -725,6 +739,7 @@ pub async fn run_with_config(
     let connect_router = Arc::new(CardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
+        identity: Arc::clone(&identity),
     })
     .register(connect_router);
     let connect_router = Arc::new(GitHubServiceImpl {

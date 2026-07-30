@@ -6,7 +6,7 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "iam/v1/common.proto";
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // ScimUser is the gateway's view of a SCIM user.
 message ScimUser {

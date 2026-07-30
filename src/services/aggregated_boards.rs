@@ -1370,6 +1370,7 @@ mod tests {
         CardServiceImpl {
             pool: infra.pool.clone(),
             permission: Arc::clone(&infra.permission),
+            identity: Arc::clone(&infra.identity),
         }
     }
 

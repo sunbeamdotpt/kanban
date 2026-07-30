@@ -8,7 +8,7 @@ import "google/protobuf/timestamp.proto";
 import "iam/v1/identity.proto";
 import "iam/v1/oauth2_consent.proto";
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // BrowserIdentity is the gateway's view of an identity inside a browser session.
 // It is intentionally separate from the admin Identity message in identity.proto.
@@ -117,6 +117,11 @@ message SelfServiceFlow {
   bool refresh = 12;
   // Requested authenticator assurance level.
   string requested_aal = 13;
+  // Set when a submit completes with a browser-redirect outcome (Kratos
+  // `browser_location_change_required`, e.g. a login-challenge flow that must
+  // bounce the browser back to the authorize URL). The session cookie rides on
+  // this response's Set-Cookie headers; the browser must follow this URL.
+  string redirect_browser_to = 14;
 }
 
 // UiContainer carries the action, method, nodes and messages rendered by the UI.

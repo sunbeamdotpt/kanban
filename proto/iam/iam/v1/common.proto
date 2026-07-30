@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package iam.v1;
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // PageRequest carries pagination parameters for list RPCs.
 message PageRequest {

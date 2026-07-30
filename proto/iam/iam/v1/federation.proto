@@ -4,7 +4,7 @@ package iam.v1;
 
 import "iam/v1/identity.proto";
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // DiscoverLoginMethodRequest asks the gateway how a user should authenticate.
 message DiscoverLoginMethodRequest {

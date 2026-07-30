@@ -4,7 +4,7 @@ package iam.v1;
 
 import "google/protobuf/struct.proto";
 
-option go_package = "github.com/sunbeam-pt/sso-gateway/proto/iam/v1;iamv1";
+option go_package = "github.com/sunbeamdotpt/sso-gateway/proto/iam/v1;iamv1";
 
 // OAuth2Client surfaces the client metadata relevant to consent/logout decisions.
 message OAuth2Client {

@@ -273,7 +273,10 @@ message BulkUpdateCardLabelsResponse {
 
 message AssignCardRequest {
   string card_id = 1;
-  // OIDC subject to assign.
+  // User to assign. Accepts an identity ULID, the canonical `user:<ulid>`
+  // subject, or an email address. Validated against the tenant's user
+  // directory and stored canonicalized as `user:<ulid>`; unknown or
+  // malformed references are rejected.
   string subject = 2;
 }
 
@@ -283,6 +286,9 @@ message AssignCardResponse {
 
 message UnassignCardRequest {
   string card_id = 1;
+  // Same user reference forms as AssignCardRequest.subject (ULID,
+  // `user:<ulid>`, or email); resolved to the canonical subject before
+  // removal.
   string subject = 2;
 }
 

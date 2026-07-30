@@ -37,6 +37,10 @@ message Application {
   // via the x-tenant-id header. Only the system tenant may create or enable
   // cross-tenant applications.
   bool cross_tenant = 12;
+  // When true, the application is treated as first-party: the consent screen
+  // is skipped and consent is accepted automatically on every authorization
+  // request.
+  bool skip_consent = 13;
 }
 
 // ApplicationSecret contains the credentials returned after secret rotation.
@@ -65,6 +69,10 @@ message CreateApplicationRequest {
   // via the x-tenant-id header. Only the system tenant may create
   // cross-tenant applications.
   bool cross_tenant = 7;
+  // When true, the application is treated as first-party: the consent screen
+  // is skipped and consent is accepted automatically on every authorization
+  // request.
+  bool skip_consent = 8;
 }
 
 // GetApplicationRequest identifies an application to fetch.
@@ -88,25 +96,33 @@ message ListApplicationsResponse {
 }
 
 // UpdateApplicationRequest is the input for updating an existing application.
+// The update is a partial update: proto3 scalar and repeated fields cannot
+// distinguish "unset" from "empty", so any field left at its zero value
+// (empty string or empty list) keeps its currently stored value.
 message UpdateApplicationRequest {
   // Gateway identifier for the application.
   string id = 1;
-  // Human-readable name of the application.
+  // Human-readable name of the application; empty leaves it unchanged.
   string name = 2;
-  // Allowed OAuth2 redirect URIs.
+  // Allowed OAuth2 redirect URIs; empty leaves them unchanged.
   repeated string redirect_uris = 3;
-  // Allowed OAuth2 grant types.
+  // Allowed OAuth2 grant types; empty leaves them unchanged.
   repeated string grant_types = 4;
-  // Allowed OAuth2 response types.
+  // Allowed OAuth2 response types; empty leaves them unchanged.
   repeated string response_types = 5;
-  // OAuth2 scopes the client may request.
+  // OAuth2 scopes the client may request; empty leaves them unchanged.
   repeated string scope = 6;
-  // Client authentication method used at the token endpoint.
+  // Client authentication method used at the token endpoint; empty leaves it
+  // unchanged.
   string token_endpoint_auth_method = 7;
   // When set, toggles whether the application's client credentials may target
   // any tenant via the x-tenant-id header. Only the system tenant may enable
   // cross-tenant applications; omitting this field leaves the flag unchanged.
   google.protobuf.BoolValue cross_tenant = 8;
+  // When set, toggles whether the application is treated as first-party (the
+  // consent screen is skipped on every authorization request); omitting this
+  // field leaves the flag unchanged.
+  google.protobuf.BoolValue skip_consent = 9;
 }
 
 // DeleteApplicationRequest identifies an application to delete.
