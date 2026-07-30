@@ -3,18 +3,20 @@ type: State
 title: Current state of kanban
 description: What is in flight, what is blocked, what the next session should pick up first.
 tags: [state]
-timestamp: 2026-07-30T22:00:00Z
+timestamp: 2026-07-30T23:30:00Z
 ---
 
-# State — 2026-07-30
+# State — 2026-07-31
 
 ## In flight
 
-- **v2026.07.10 released** (bad67a6776 feat + d2165219d4 release, tag pushed):
-  KANBAN-029 server-side assignee validation. Release workflow run
-  30588840172 in progress (~19m like v2026.07.9). KANBAN-029 moved to done.
-  **SBBB-017 filed** (deploy v2026.07.10 to prod, assigned to tony, depends_on
-  **SBBB-016** identity:read scope — hard dependency, assigns 403 without it).
+- **v2026.07.11 released** (8189150ade, tag pushed): Dockerfile fix — the sdk
+  build.rs runs `buf export` at compile time; builder stage now installs
+  pinned `bufbuild/buf:1.71.0`. **v2026.07.10's image build FAILED** (run
+  30588840172, no image published) — same code, do not deploy. Release
+  workflow run 30590298809 in progress. **SBBB-017** updated to v2026.07.11
+  (deploy, assigned to tony, depends_on **SBBB-016** identity:read — hard
+  dependency, assigns 403 without it). KANBAN-029 done.
 - **v2026.07.9 released** (84ab8a43af tagged + pushed): KANBAN-027 regression
   test + deployment of the already-landed handler fixes for `completed_at` on
   done-column moves and timestamps in `ListCardsByBoard`. Release workflow
@@ -56,8 +58,9 @@ timestamp: 2026-07-30T22:00:00Z
 
 ## Pick up first
 
-- Verify release workflow run 30588840172 published the v2026.07.10 GHCR
-  image, then track SBBB-017 (prod deploy, tony) — remember SBBB-016
+- Verify release workflow run 30590298809 published the v2026.07.11 GHCR
+  image (v2026.07.10's build failed — no image exists for it), then track
+  SBBB-017 (prod deploy, tony) — remember SBBB-016
   (identity:read) must be applied with it. Prod-verify after deploy:
   `sunbeam kanban card assign <card> <email>` stores `user:<ulid>`; garbage
   input is rejected.

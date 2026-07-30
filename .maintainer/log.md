@@ -377,3 +377,18 @@ sbbb/dev and assigned to tony@sunbeam.pt (resolved to
 before the deploy or every assign/unassign 403s. The deploy card carries
 post-deploy verification steps (assign by email stores `user:<ulid>`;
 garbage input rejected).
+
+2026-07-31 — **v2026.07.10 image build failed; re-released as v2026.07.11.**
+The scheduled post-release check caught run 30588840172 red: the sdk's
+`build.rs` shells out to `buf export buf.build/sunbeamdotpt/sso-gateway` at
+compile time, and kanban's Dockerfile builder image has no `buf` — the
+multi-arch build died ~9 minutes in, before any image was published.
+Root cause notes: (1) this only bites Docker/CI builds — local dev machines
+have buf installed, so `cargo build` never exposed it; (2) any repo adding
+an sdk dependency needs buf in its Dockerfile from now on. Fix: builder
+stage copies the pinned `bufbuild/buf:1.71.0` binary; verified locally with
+a full `docker buildx build --platform linux/amd64` before re-tagging
+(8189150ade). v2026.07.11 contains the same application code as
+v2026.07.10; SBBB-017 updated to the new tag with a "do not deploy
+v2026.07.10" warning. Lesson recorded: verify the release workflow, not
+just the tag — the 00:17 cron did its job.
