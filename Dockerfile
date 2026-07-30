@@ -12,10 +12,17 @@ ARG VERSION=0.1.0
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 
+# Pinned buf CLI: the sdk dependency's build.rs exports the sso-gateway
+# protos from buf.build at compile time and panics when buf is missing.
+FROM --platform=$BUILDPLATFORM bufbuild/buf:1.71.0 AS buf
+
 FROM --platform=$BUILDPLATFORM rust:1.95-bookworm AS builder
 
 # Bring in xx cross-compilation helpers.
 COPY --from=xx / /
+
+# Bring in the buf CLI (sdk build.rs runs `buf export`).
+COPY --from=buf /usr/local/bin/buf /usr/local/bin/buf
 
 # Install host build dependencies. protobuf-compiler is needed by tonic-prost-build;
 # clang + lld are used by xx-cargo for cross-compilation.

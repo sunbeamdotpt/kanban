@@ -6,6 +6,16 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [2026.07.11] - 2026-07-30
+
+### Fixed
+
+- **Docker image build.** The `sdk` dependency's build script runs
+  `buf export buf.build/sunbeamdotpt/sso-gateway` at compile time; the
+  builder stage had no `buf` binary, so the v2026.07.10 image build failed
+  and published nothing. The builder now installs the pinned
+  `bufbuild/buf:1.71.0` CLI. No application-code changes versus v2026.07.10.
+
 ## [2026.07.10] - 2026-07-30
 
 ### Added
