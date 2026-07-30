@@ -283,7 +283,7 @@ scheduled as a one-shot reminder. Note: the release series was split
 into conventional commits per sienna's request (fix/feat/docs/release)
 rather than folding the bump into a feature commit as v2026.07.7 did.
 
-## 2026-07-30 — KANBAN-027 verified and regression-tested
+## 2026-07-30 — KANBAN-027 verified, regression-tested, and released v2026.07.9
 
 Card reported two symptoms: (1) `completed_at` never populated when a
 card enters a done column, and (2) `ListCardsByBoard` responses omit
@@ -297,4 +297,17 @@ CardService implementation. Added a regression test
 explicitly asserts list responses carry `created_at`, `updated_at`, and
 correct `completed_at` state across done-column transitions. All 45
 card service tests pass; clippy `-D warnings` and `cargo fmt` clean.
-Card moved to done.
+KANBAN-027 moved to done.
+
+Cut v2026.07.9 so the fix ships: conventional commits split as
+`test(cards): KANBAN-027 regression test...`,
+`docs: changelog + maintainer state for KANBAN-027`, and
+`chore(release): v2026.07.9` (84ab8a43af), annotated tag `v2026.07.9`
+pushed. Origin had diverged with a README/docs-server commit
+(ad026a2669) between local work and push, so mainline was rebased and
+the tag force-updated; an accidental local `v1.0.0-rc6` tag pushed in
+the first attempt was deleted from remote.
+
+Filed **SBBB-013** on sbbb/dev for production deployment of the
+v2026.07.9 image with verification steps. Linked back to KANBAN-027 in
+the card description and a comment.

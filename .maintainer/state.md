@@ -10,23 +10,24 @@ timestamp: 2026-07-30T00:00:00Z
 
 ## In flight
 
-- **v2026.07.8 released** (b316af1bc4 tagged + pushed, release workflow
-  #30312520954 building, ~20 min): KANBAN-016 (blocked clear via mask),
+- **v2026.07.9 released** (84ab8a43af tagged + pushed): KANBAN-027 regression
+  test + deployment of the already-landed handler fixes for `completed_at` on
+  done-column moves and timestamps in `ListCardsByBoard`. Release workflow
+  triggered by tag `v2026.07.9`; **SBBB-013** filed on sbbb/dev for production
+  deployment.
+- **v2026.07.8 released** (b316af1bc4): KANBAN-016 (blocked clear via mask),
   KANBAN-023 (Column.is_done completion lanes, migration 0034), KANBAN-026 +
-  KANBAN-022 (template ID canonicalization, migration 0033). All four cards
-  moved to done. A one-shot reminder (00:23 local) verifies the GHCR image
-  and files the cli/dev heads-up that CLI-014 is unblocked.
-- **KANBAN-027 done**: symptoms (missing `completed_at` on done-column moves,
-  missing timestamps in `ListCardsByBoard`) were already fixed on mainline;
-  regression test added in `src/services/cards.rs`.
-- **CLI-014 filed on cli/dev**: unblock flag + column is_done CLI support,
-  blocked on this server changeset being released + deployed.
+  KANBAN-022 (template ID canonicalization, migrations 0033). All four cards
+  moved to done. CLI-014 (unblock flag + column is_done CLI support) is
+  unblocked once sbbb deploys v2026.07.8/v2026.07.9.
+- **KANBAN-027 done**: symptoms were already fixed on mainline by KANBAN-023;
+  regression test added in `src/services/cards.rs` and card moved to done.
 - v2026.07.7 released previously (MilestoneService + label CRUD).
 
 ## Board state (kanban/dev)
 
-- Done this session (v2026.07.8 + KANBAN-027 follow-up): KANBAN-016,
-  KANBAN-022, KANBAN-023, KANBAN-026, KANBAN-027.
+- Done this session: KANBAN-016, KANBAN-022, KANBAN-023, KANBAN-026,
+  KANBAN-027.
 - Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
   (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
   KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
@@ -48,10 +49,12 @@ timestamp: 2026-07-30T00:00:00Z
 
 ## Pick up first
 
-- Verify release workflow #30312520954 published the GHCR image (one-shot
-  reminder scheduled 00:23 local), then prod-verify after sbbb deploys:
-  `card-template get <global-id>`, unblock via mask, and milestone stats
-  once Done columns are marked is_done (CLI-014).
+- Track SBBB-013 deployment of kanban v2026.07.9; prod-verify KANBAN-027 with
+  `sunbeam kanban card get <done-card-ref> -o json` (completed_at populated)
+  and `sunbeam kanban card list <board-id> -o json` (timestamps present).
+- Verify release workflow for v2026.07.9 published the GHCR image, then
+  prod-verify CLI-014 items after sbbb deploys: `card-template get <global-id>`,
+  unblock via mask, and milestone stats once Done columns are marked is_done.
 - Testcontainers leak is still real: full-suite runs exhaust Docker ports
   ("address already in use" / sso-gateway bootstrap port race). Cleanup loop
   that works: `docker rm -f $(docker ps -aq --filter
