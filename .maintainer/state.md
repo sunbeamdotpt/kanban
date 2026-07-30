@@ -10,11 +10,13 @@ timestamp: 2026-07-30T23:30:00Z
 
 ## In flight
 
-- **v2026.07.11 released** (8189150ade, tag pushed): Dockerfile fix — the sdk
+- **v2026.07.11 released and image LIVE** (8189150ade; run 30590298809
+  success; `ghcr.io/sunbeamdotpt/kanban:v2026.07.11` multi-arch amd64+arm64,
+  floating tags updated): Dockerfile fix — the sdk
   build.rs runs `buf export` at compile time; builder stage now installs
   pinned `bufbuild/buf:1.71.0`. **v2026.07.10's image build FAILED** (run
-  30588840172, no image published) — same code, do not deploy. Release
-  workflow run 30590298809 in progress. **SBBB-017** updated to v2026.07.11
+  30588840172, no image published) — same code, do not deploy.
+  **SBBB-017** updated to v2026.07.11 and marked image-live
   (deploy, assigned to tony, depends_on **SBBB-016** identity:read — hard
   dependency, assigns 403 without it). KANBAN-029 done.
 - **v2026.07.9 released** (84ab8a43af tagged + pushed): KANBAN-027 regression
@@ -58,8 +60,9 @@ timestamp: 2026-07-30T23:30:00Z
 
 ## Pick up first
 
-- Verify release workflow run 30590298809 published the v2026.07.11 GHCR
-  image (v2026.07.10's build failed — no image exists for it), then track
+- ~~Verify release workflow run 30590298809 published the v2026.07.11 GHCR
+  image~~ DONE (00:46 check: success, multi-arch image live, SBBB-017
+  commented). Track
   SBBB-017 (prod deploy, tony) — remember SBBB-016
   (identity:read) must be applied with it. Prod-verify after deploy:
   `sunbeam kanban card assign <card> <email>` stores `user:<ulid>`; garbage

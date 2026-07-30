@@ -392,3 +392,10 @@ a full `docker buildx build --platform linux/amd64` before re-tagging
 v2026.07.10; SBBB-017 updated to the new tag with a "do not deploy
 v2026.07.10" warning. Lesson recorded: verify the release workflow, not
 just the tag — the 00:17 cron did its job.
+
+2026-07-31 — **v2026.07.11 image live.** The 00:46 verification confirmed
+run 30590298809 succeeded and `ghcr.io/sunbeamdotpt/kanban:v2026.07.11`
+exists as a multi-arch index (linux/amd64 + linux/arm64; floating
+v2026.07 / v2026 / latest updated). SBBB-017 commented image-live; the
+deploy itself (tony) and SBBB-016 (identity:read) are the remaining
+production steps.
