@@ -3,13 +3,18 @@ type: State
 title: Current state of kanban
 description: What is in flight, what is blocked, what the next session should pick up first.
 tags: [state]
-timestamp: 2026-07-30T00:00:00Z
+timestamp: 2026-07-30T22:00:00Z
 ---
 
 # State — 2026-07-30
 
 ## In flight
 
+- **v2026.07.10 released** (bad67a6776 feat + d2165219d4 release, tag pushed):
+  KANBAN-029 server-side assignee validation. Release workflow run
+  30588840172 in progress (~19m like v2026.07.9). KANBAN-029 moved to done.
+  **SBBB-017 filed** (deploy v2026.07.10 to prod, assigned to tony, depends_on
+  **SBBB-016** identity:read scope — hard dependency, assigns 403 without it).
 - **v2026.07.9 released** (84ab8a43af tagged + pushed): KANBAN-027 regression
   test + deployment of the already-landed handler fixes for `completed_at` on
   done-column moves and timestamps in `ListCardsByBoard`. Release workflow
@@ -28,14 +33,15 @@ timestamp: 2026-07-30T00:00:00Z
 
 - Done this session: KANBAN-016, KANBAN-022, KANBAN-023, KANBAN-026,
   KANBAN-027, KANBAN-028 (wontfix — direct Bearer scripting against
-  kanban.sunbeam.pt is not supported; use the CLI or file CLI gaps).
+  kanban.sunbeam.pt is not supported; use the CLI or file CLI gaps),
+  KANBAN-029 (assignee validation; shipped in v2026.07.10).
 - Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
   (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
   KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
   escalated to sienna in-session; depends_on 019+020), KANBAN-024 (fix sketch
   posted; needs IdentityService wiring + gateway scope + design pick),
   KANBAN-025 (icebox).
-- Owned by the CLI repo: KANBAN-008, KANBAN-010.
+- Owned by the CLI repo: KANBAN-008, KANBAN-010, CLI-018.
 - KANBAN-003: same-project cross-board moves ARE implemented (MoveCard
   re-homes board_id + parent tuples); proposed closing as implemented in a
   card comment — human to confirm.
@@ -50,6 +56,11 @@ timestamp: 2026-07-30T00:00:00Z
 
 ## Pick up first
 
+- Verify release workflow run 30588840172 published the v2026.07.10 GHCR
+  image, then track SBBB-017 (prod deploy, tony) — remember SBBB-016
+  (identity:read) must be applied with it. Prod-verify after deploy:
+  `sunbeam kanban card assign <card> <email>` stores `user:<ulid>`; garbage
+  input is rejected.
 - Track SBBB-013 deployment of kanban v2026.07.9; prod-verify KANBAN-027 with
   `sunbeam kanban card get <done-card-ref> -o json` (completed_at populated)
   and `sunbeam kanban card list <board-id> -o json` (timestamps present).

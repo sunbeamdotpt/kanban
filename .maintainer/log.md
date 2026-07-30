@@ -319,3 +319,61 @@ backend consumed through the sunbeam CLI, and the opaque access token
 from `sunbeam auth token` is scoped for the CLI/gateway flow rather than
 direct ingress. Card moved to done with a comment explaining the design
 and pointing missing-CLI operations (e.g. `--is-done`) to CLI-015.
+
+2026-07-30 — Created **KANBAN-029** on kanban/dev (todo, high priority).
+User assignments currently accept identifiers without validation. The card
+captures the requirement to accept either a ULID or an email address as input,
+resolve/validate it against the authoritative user directory, and persist only
+the canonical ULID. This keeps storage stable while making the API more
+forgiving for callers. No implementation started; card links back to the
+requirement and includes acceptance criteria plus test coverage expectations.
+
+2026-07-30 — **KANBAN-029 implemented: server-side assignee validation.**
+AssignCard/UnassignCard now resolve the subject input (identity ULID,
+`user:<ulid>`, or email) against the sso-gateway user directory and store only
+the canonical `user:<ulid>`; malformed input gets `invalid_argument`, unknown
+users `not_found`. Decisions and the why:
+
+- **sdk `AuthClient`, not a local client.** sienna flagged that the SDK
+  (`sdk` repo, `auth` feature, generated from `buf.build/sunbeamdotpt/sso-gateway`)
+  already provides the identity surface and is what liminal and other apps use.
+  Added `sdk = { git, tag = "v3.3.0", features = ["auth"] }` as a real
+  dependency; `src/auth/identity_client.rs` is a thin wrapper (scope
+  `identity:read`, `x-tenant-id` routing, g2v token cache shared per process).
+- **proto/iam re-synced via `buf export`, not hand copy.** The vendored files
+  had drifted (mixed `sunbeam-pt`/`sunbeamdotpt` go_package options, missing
+  `client_credential.proto`, stale application/oauth2_device). Charter now
+  names the sync command: `buf export buf.build/sunbeamdotpt/sso-gateway -o
+  proto/iam`. `skip_consent` added to the harness CreateApplicationRequest as
+  a result.
+- **No legacy passthrough.** Per sienna: the legacy path (accepting arbitrary
+  subjects like Kratos UUIDs or unvalidated strings) is broken behavior and is
+  rejected, not grandfathered. Consequence: assignee rows written before this
+  change with garbage subjects cannot be removed via UnassignCard — cleanup
+  needs a data migration if it ever matters.
+- **Email resolution is a directory scan.** The gateway has no email-lookup
+  RPC (`ListIdentities` ignores filters; SCIM filter is declared unsupported),
+  so `find_by_email` pages the tenant directory and matches `traits.email`
+  case-insensitively — same approach the CLI already uses. Fine at current
+  directory sizes; worth a gateway-side filter RPC eventually.
+- **UnassignCard validates too** so both verbs accept identical references.
+- **Production needs `identity:read`** on the kanban service app — filed
+  SBBB-016 (hard dependency; without it every assign fails with
+  permission_denied).
+- Harness: test app gained `identity:read`; default identity schema is
+  registered once at bootstrap (parallel-test `CreateIdentitySchema` race
+  surfaces as `internal` duplicate-key, not `AlreadyExists` — both tolerated).
+- Related: CLI-018 filed — the CLI passes non-email assign input through
+  unchecked (`card assign <ref> tony` stores "tony").
+
+2026-07-30 — **v2026.07.10 released; release train run for KANBAN-029.**
+Feature commit bad67a6776, release commit d2165219d4, tag `v2026.07.10`
+pushed; workflow run 30588840172 building the multi-arch GHCR image.
+KANBAN-029 moved to done at tag time (house pattern: done on release,
+deployment tracked separately). Deployment ticket **SBBB-017** filed on
+sbbb/dev and assigned to tony@sunbeam.pt (resolved to
+`user:01KWF0KYZ0W8Y42YE36J5SZ0CF`), with an explicit `depends_on` link to
+**SBBB-016** (identity:read scope) — the scope must be applied with or
+before the deploy or every assign/unassign 403s. The deploy card carries
+post-deploy verification steps (assign by email stores `user:<ulid>`;
+garbage input rejected).

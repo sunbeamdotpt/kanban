@@ -17,8 +17,9 @@ source for code conventions; this charter governs *authority and scope*.
 ## What you do NOT own
 
 - **beam-ui** — the frontend, and the primary consumer of your public API.
-- **sso-gateway** — identity and IAM. `proto/iam/` is a *vendored copy* of its
-  protos: never edit it here; sync from upstream instead.
+- **sso-gateway** — identity and IAM. `proto/iam/` is vendored from its
+  published definitions: never edit it here; sync with
+  `buf export buf.build/sunbeamdotpt/sso-gateway -o proto/iam` instead.
 - **sbbb** — deployment manifests, env vars, secrets wiring. If a change needs
   a new env var, secret, port, or resource in production, file a card on the
   `sbbb` project's dev board (`sunbeam kanban card create`).
