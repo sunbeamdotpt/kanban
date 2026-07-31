@@ -137,6 +137,7 @@ fn columns_to_json(columns: &[TemplateColumn]) -> serde_json::Value {
                 "title": c.title,
                 "position": c.position,
                 "accent": c.accent,
+                "is_done": c.is_done,
             })
         })
         .collect();
@@ -161,6 +162,9 @@ fn columns_from_json(value: &serde_json::Value) -> Vec<TemplateColumn> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
+            // Pre-KANBAN-033 template rows carry no is_done key: they
+            // default to false, matching Column.is_done's semantics.
+            is_done: v.get("is_done").and_then(|x| x.as_bool()).unwrap_or(false),
             ..Default::default()
         })
         .collect()
@@ -949,6 +953,156 @@ mod tests {
                 .any(|t| t.name == "Kanban" && t.is_global),
             "global Kanban seed template should be present"
         );
+    }
+
+    #[test]
+    fn template_columns_json_round_trips_is_done() {
+        let columns = vec![
+            TemplateColumn {
+                title: "To Do".to_string(),
+                position: 0,
+                accent: "blue".to_string(),
+                is_done: false,
+                ..Default::default()
+            },
+            TemplateColumn {
+                title: "Done".to_string(),
+                position: 1,
+                accent: "green".to_string(),
+                is_done: true,
+                ..Default::default()
+            },
+        ];
+
+        let parsed = columns_from_json(&columns_to_json(&columns));
+        assert_eq!(parsed.len(), 2);
+        assert!(!parsed[0].is_done);
+        assert!(parsed[1].is_done);
+
+        // Pre-KANBAN-033 rows carry no is_done key: default to false.
+        let legacy = columns_from_json(&serde_json::json!([
+            {"title": "Done", "position": 1, "accent": "green"}
+        ]));
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].is_done);
+    }
+
+    #[tokio::test]
+    async fn template_is_done_round_trips_through_create_and_get() {
+        let svc = make_service().await;
+        let subject = format!("user:test-{}", Id::new());
+        let project_id = create_test_project(&svc.pool, &svc.permission, &subject).await;
+
+        let created = svc
+            .create_template(
+                authed_ctx(&subject),
+                connect_request(&CreateTemplateRequest {
+                    project_id: project_id.to_string(),
+                    name: "Completion Lane".to_string(),
+                    description: String::new(),
+                    columns: vec![
+                        TemplateColumn {
+                            title: "Doing".to_string(),
+                            position: 0,
+                            accent: "amber".to_string(),
+                            ..Default::default()
+                        },
+                        TemplateColumn {
+                            title: "Done".to_string(),
+                            position: 1,
+                            accent: "green".to_string(),
+                            is_done: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create_template failed")
+            .body
+            .template
+            .into_option()
+            .expect("template missing");
+
+        assert_eq!(created.columns.len(), 2);
+        assert!(!created.columns[0].is_done);
+        assert!(
+            created.columns[1].is_done,
+            "is_done must persist through create"
+        );
+
+        let fetched = svc
+            .get_template(
+                authed_ctx(&subject),
+                connect_request(&GetTemplateRequest {
+                    template_id: created.id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get_template failed")
+            .body
+            .template
+            .into_option()
+            .expect("template missing");
+
+        assert!(
+            fetched.columns[1].is_done,
+            "is_done must survive the JSONB round trip"
+        );
+
+        cleanup_template(
+            &svc.pool,
+            "board_templates",
+            created.id.parse::<Id>().unwrap(),
+        )
+        .await;
+        cleanup_project(&svc.pool, project_id).await;
+    }
+
+    /// Migration 0035 flags the Done column of every seeded global template.
+    #[tokio::test]
+    async fn global_seed_templates_mark_done_column_is_done() {
+        let svc = make_service().await;
+        let subject = format!("user:test-{}", Id::new());
+
+        let list = svc
+            .list_templates(
+                authed_ctx(&subject),
+                connect_request(&ListTemplatesRequest {
+                    project_id: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list_templates failed")
+            .body;
+
+        let globals: Vec<_> = list.templates.iter().filter(|t| t.is_global).collect();
+        assert!(
+            globals.len() >= 4,
+            "expected the four seeded global templates, got {}",
+            globals.len()
+        );
+        for template in globals {
+            let done_columns: Vec<_> = template
+                .columns
+                .iter()
+                .filter(|c| c.title.eq_ignore_ascii_case("done"))
+                .collect();
+            assert_eq!(
+                done_columns.len(),
+                1,
+                "global template {} should have exactly one Done column",
+                template.name
+            );
+            assert!(
+                done_columns[0].is_done,
+                "global template {} Done column must be is_done (migration 0035)",
+                template.name
+            );
+        }
     }
 
     #[tokio::test]

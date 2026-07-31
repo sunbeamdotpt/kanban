@@ -22,6 +22,9 @@ message TemplateColumn {
   int32 position = 2;
   // CSS color token, e.g. "blue" | "amber" | "green".
   string accent = 3;
+  // Marks the completion lane: cards moved into a column created with
+  // is_done get completed_at stamped (see Column.is_done).
+  bool is_done = 4;
 }
 
 // BoardTemplate is a reusable column layout.
