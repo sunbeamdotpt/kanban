@@ -240,6 +240,16 @@ pub struct Cli {
     #[arg(long, env = "SSO_GATEWAY_CLIENT_SECRET", default_value = "")]
     sso_gateway_client_secret: String,
 
+    /// HTTP timeout for sso-gateway token introspection calls. When the
+    /// gateway wedges, this bounds how long requests hang before failing
+    /// closed (KANBAN-031).
+    #[arg(
+        long,
+        env = "KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS",
+        default_value = "10"
+    )]
+    sso_introspection_timeout_secs: u64,
+
     /// System tenant id used for globally-shared resources (e.g. system-wide
     /// board/card templates). Must be a valid tenant id in the sso-gateway.
     #[arg(long, env = "KANBAN_SYSTEM_TENANT_ID", default_value = "system")]
@@ -433,6 +443,7 @@ impl Cli {
             sso_gateway_introspection_url: self.sso_gateway_introspection_url,
             sso_gateway_client_id: self.sso_gateway_client_id,
             sso_gateway_client_secret: self.sso_gateway_client_secret,
+            sso_introspection_timeout_secs: self.sso_introspection_timeout_secs,
             system_tenant_id: self.system_tenant_id,
             database_url: self.database_url,
             database_max_connections: self.database_max_connections,
@@ -480,6 +491,7 @@ pub struct AppConfig {
     pub sso_gateway_introspection_url: String,
     pub sso_gateway_client_id: String,
     pub sso_gateway_client_secret: String,
+    pub sso_introspection_timeout_secs: u64,
     pub system_tenant_id: String,
     pub database_url: String,
     pub database_max_connections: u32,
@@ -828,7 +840,7 @@ pub async fn run_with_config(
     });
 
     let auth_state = AuthMiddlewareState::new(Arc::new(
-        SsoGatewaySessionClient::new(
+        SsoGatewaySessionClient::with_timeout(
             &config.sso_gateway_introspection_url,
             OAuth2ClientCredentials::new(
                 &config.sso_gateway_token_url,
@@ -836,6 +848,7 @@ pub async fn run_with_config(
                 &config.sso_gateway_client_secret,
             )
             .with_scope("tenant:admin"),
+            Duration::from_secs(config.sso_introspection_timeout_secs),
         )
         .context("failed to build sso-gateway session client")?,
     ));
@@ -1083,6 +1096,7 @@ mod tests {
             "--sso-gateway-introspection-url=http://sso-gateway:4445/oauth2/introspect",
             "--sso-gateway-client-id=kanban-client",
             "--sso-gateway-client-secret=kanban-secret",
+            "--sso-introspection-timeout-secs=3",
             "--database-url=postgres://db",
             "--database-max-connections=50",
             "--database-acquire-timeout-secs=5",
@@ -1123,6 +1137,7 @@ mod tests {
         );
         assert_eq!(cfg.sso_gateway_client_id, "kanban-client");
         assert_eq!(cfg.sso_gateway_client_secret, "kanban-secret");
+        assert_eq!(cfg.sso_introspection_timeout_secs, 3);
         assert_eq!(cfg.database_url, "postgres://db");
         assert_eq!(cfg.database_max_connections, 50);
         assert_eq!(cfg.database_acquire_timeout_secs, 5);
@@ -1168,6 +1183,7 @@ mod tests {
         );
         assert_eq!(cfg.sso_gateway_client_id, "");
         assert_eq!(cfg.sso_gateway_client_secret, "");
+        assert_eq!(cfg.sso_introspection_timeout_secs, 10);
         assert_eq!(cfg.database_max_connections, 20);
         assert_eq!(cfg.database_acquire_timeout_secs, 10);
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
@@ -1266,6 +1282,7 @@ mod tests {
             sso_gateway_client_id: std::env::var("SSO_GATEWAY_CLIENT_ID").unwrap_or_default(),
             sso_gateway_client_secret: std::env::var("SSO_GATEWAY_CLIENT_SECRET")
                 .unwrap_or_default(),
+            sso_introspection_timeout_secs: 10,
             system_tenant_id: std::env::var("KANBAN_SYSTEM_TENANT_ID")
                 .unwrap_or_else(|_| "system".into()),
             database_url: isolated_url.to_string(),

@@ -240,6 +240,7 @@ All configuration is centralized in `src/server.rs` via `clap` derive flags. Eve
 | `SSO_GATEWAY_INTROSPECTION_URL` | `http://localhost:4445/oauth2/introspect` | sso-gateway OAuth2 introspection endpoint. The gateway base URL — permission API, token endpoint, readiness proxy — is derived from it. |
 | `SSO_GATEWAY_CLIENT_ID` | `''` | OAuth2 client ID for the service client-credentials used to call the sso-gateway. Introspection authenticates with a bearer token scoped `tenant:admin`; permission calls use `permission:admin`; user-directory lookups (assignee validation) use `identity:read`. The app must hold all three scopes. |
 | `SSO_GATEWAY_CLIENT_SECRET` | `''` | OAuth2 client secret for the above |
+| `KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS` | `10` | HTTP timeout for sso-gateway token introspection calls |
 
 ### Dependencies
 

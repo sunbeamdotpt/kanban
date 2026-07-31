@@ -12,20 +12,49 @@
 //! [`TokenProvider`], which caches by `expires_in` and refreshes on demand.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sunbeam_g2v::client::TokenProvider;
 use sunbeam_g2v::middleware::auth::{AuthError, session::SessionClient};
+use tracing::warn;
+
+/// Default introspection HTTP timeout.
+const DEFAULT_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Session client that introspects bearer tokens at the sso-gateway
 /// `/oauth2/introspect` endpoint and preserves the `tenant_id` claim.
+///
+/// Every rejection is WARN-logged with a failure class and the call latency:
+/// the g2v auth middleware collapses all session errors into a bare 401, so
+/// these logs are the only place the failure reason survives (KANBAN-031).
 #[derive(Clone)]
 pub struct SsoGatewaySessionClient {
     client: reqwest::Client,
     introspection_url: String,
     provider: Arc<dyn TokenProvider>,
+}
+
+/// Failure classes for authn rejection logs.
+mod failure_class {
+    pub const MISSING_TOKEN: &str = "missing-token";
+    pub const SERVICE_TOKEN: &str = "service-token";
+    pub const TIMEOUT: &str = "timeout";
+    pub const TRANSPORT: &str = "transport";
+    pub const GATEWAY_ERROR: &str = "gateway-error";
+    pub const BAD_RESPONSE: &str = "bad-response";
+    pub const INACTIVE: &str = "inactive";
+}
+
+/// Log one authn rejection with its failure class and introspection latency.
+fn log_rejection(class: &str, detail: &str, started: Instant) {
+    warn!(
+        failure_class = class,
+        latency_ms = started.elapsed().as_millis() as u64,
+        detail,
+        "authn rejection: token introspection failed"
+    );
 }
 
 impl SsoGatewaySessionClient {
@@ -35,8 +64,17 @@ impl SsoGatewaySessionClient {
         introspection_url: impl Into<String>,
         provider: impl TokenProvider,
     ) -> Result<Self, AuthError> {
+        Self::with_timeout(introspection_url, provider, DEFAULT_INTROSPECTION_TIMEOUT)
+    }
+
+    /// Create a client with an explicit introspection HTTP timeout.
+    pub fn with_timeout(
+        introspection_url: impl Into<String>,
+        provider: impl TokenProvider,
+        timeout: Duration,
+    ) -> Result<Self, AuthError> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(timeout)
             .build()
             .map_err(|e| {
                 AuthError::InvalidSession(format!("failed to build introspection HTTP client: {e}"))
@@ -50,9 +88,15 @@ impl SsoGatewaySessionClient {
 
     /// POST one introspection request for `token`, authenticated with a
     /// service token from the provider.
-    async fn introspect(&self, token: &str) -> Result<reqwest::Response, AuthError> {
+    ///
+    /// The returned error string is prefixed with the failure class so
+    /// `to_session` can log rejections without re-classifying.
+    async fn introspect(&self, token: &str) -> Result<reqwest::Response, (String, AuthError)> {
         let service_token = self.provider.token().await.map_err(|e| {
-            AuthError::InvalidSession(format!("failed to fetch service token: {e}"))
+            (
+                failure_class::SERVICE_TOKEN.to_string(),
+                AuthError::InvalidSession(format!("failed to fetch service token: {e}")),
+            )
         })?;
         self.client
             .post(&self.introspection_url)
@@ -60,7 +104,17 @@ impl SsoGatewaySessionClient {
             .form(&[("token", token)])
             .send()
             .await
-            .map_err(|e| AuthError::InvalidSession(format!("introspection request failed: {e}")))
+            .map_err(|e| {
+                let class = if e.is_timeout() {
+                    failure_class::TIMEOUT
+                } else {
+                    failure_class::TRANSPORT
+                };
+                (
+                    class.to_string(),
+                    AuthError::InvalidSession(format!("introspection request failed: {e}")),
+                )
+            })
     }
 }
 
@@ -72,35 +126,67 @@ impl SessionClient for SsoGatewaySessionClient {
         token: Option<&str>,
     ) -> Result<Value, AuthError> {
         let _ = cookie;
-        let token = token.ok_or_else(|| AuthError::InvalidSession("missing token".to_string()))?;
+        let started = Instant::now();
+        let Some(token) = token else {
+            log_rejection(failure_class::MISSING_TOKEN, "missing token", started);
+            return Err(AuthError::InvalidSession("missing token".to_string()));
+        };
 
-        let response = self.introspect(token).await?;
+        let response = match self.introspect(token).await {
+            Ok(response) => response,
+            Err((class, err)) => {
+                log_rejection(&class, &err.to_string(), started);
+                return Err(err);
+            }
+        };
         // A 401 means the cached service token was rejected gateway-side
         // (revoked or expired early); invalidate it and retry once with a
         // fresh token before failing the request.
         let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             self.provider.invalidate();
-            self.introspect(token).await?
+            match self.introspect(token).await {
+                Ok(response) => response,
+                Err((class, err)) => {
+                    log_rejection(&class, &err.to_string(), started);
+                    return Err(err);
+                }
+            }
         } else {
             response
         };
 
         if !response.status().is_success() {
+            let status = response.status();
+            log_rejection(
+                failure_class::GATEWAY_ERROR,
+                &format!("introspection returned {status}"),
+                started,
+            );
             return Err(AuthError::InvalidSession(format!(
-                "introspection returned {}",
-                response.status()
+                "introspection returned {status}"
             )));
         }
 
-        let body: Value = response.json().await.map_err(|e| {
-            AuthError::InvalidSession(format!("invalid introspection response: {e}"))
-        })?;
+        let body: Value = match response.json().await {
+            Ok(body) => body,
+            Err(e) => {
+                log_rejection(
+                    failure_class::BAD_RESPONSE,
+                    &format!("invalid introspection response: {e}"),
+                    started,
+                );
+                return Err(AuthError::InvalidSession(format!(
+                    "invalid introspection response: {e}"
+                )));
+            }
+        };
 
         let active = body
             .get("active")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !active {
+            log_rejection(failure_class::INACTIVE, "token inactive", started);
             return Err(AuthError::InvalidSession("token inactive".to_string()));
         }
 
@@ -110,6 +196,11 @@ impl SessionClient for SsoGatewaySessionClient {
             .unwrap_or("")
             .to_string();
         if subject.is_empty() {
+            log_rejection(
+                failure_class::BAD_RESPONSE,
+                "introspection response missing sub",
+                started,
+            );
             return Err(AuthError::InvalidSession(
                 "introspection response missing sub".to_string(),
             ));
@@ -335,6 +426,41 @@ mod tests {
             .expect_err("missing token should fail");
 
         assert!(matches!(err, AuthError::InvalidSession(_)));
+    }
+
+    /// A stalled gateway must fail closed within the configured timeout
+    /// instead of hanging the request (KANBAN-031).
+    #[tokio::test]
+    async fn to_session_fails_closed_on_introspection_timeout() {
+        let app = Router::new().route(
+            "/oauth2/introspect",
+            post(move |Form(_form): Form<IntrospectForm>| async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Json(json!({"active": true, "sub": "user:test"}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = SsoGatewaySessionClient::with_timeout(
+            format!("http://{addr}/oauth2/introspect"),
+            BearerToken::new("service-token"),
+            Duration::from_millis(100),
+        )
+        .expect("client should build");
+
+        let err = client
+            .to_session(None, Some("any-token"))
+            .await
+            .expect_err("stalled introspection should time out");
+        let AuthError::InvalidSession(detail) = err else {
+            panic!("expected InvalidSession");
+        };
+        assert!(
+            detail.contains("introspection request failed"),
+            "timeout should surface as a transport-class failure: {detail}"
+        );
     }
 
     #[derive(Deserialize)]
