@@ -66,14 +66,13 @@ timestamp: 2026-07-31T15:00:00Z
 - KANBAN-035 prod note: email hydration needs `identity:read` (same SBBB-016
   scope); without it resolve_email logs a warning and emails arrive empty —
   reads do NOT fail.
-- Testcontainers leak is still real: full-suite runs flake with
-  PoolTimedOut / permission-expand errors / NATS "connection refused" when
-  Docker is exhausted, and subscribe tests need the harness env (run the
-  FULL suite, not subscribe-only subsets — child tests read NATS_URL from
-  the shared harness bootstrap). Cleanup loop: `docker rm -f $(docker ps -aq
+- Testcontainers leak is still real but now **ticketed**: KANBAN-036
+  (startup reaper for stale containers/networks), KANBAN-037 (retry
+  transient gateway/OpenFGA bootstrap failures), KANBAN-038 (self-
+  bootstrapping env helpers — subset runs fail spuriously without them).
+  Until they land, the cleanup loop stands: `docker rm -f $(docker ps -aq
   --filter label=org.testcontainers.managed-by=testcontainers)` +
-  `docker network prune -f`, then rerun; the 2026-07-31 full suite passed
-  334/336 with the 2 failures passing in isolation.
+  `docker network prune -f`, then rerun the FULL suite.
 - Dependabot: 1 moderate vulnerability on the default branch
   (github.com/sunbeamdotpt/kanban/security/dependabot/20) — still untriaged.
 - Remaining stale-doc item: `docs/development/testing.md` +

@@ -456,3 +456,16 @@ parallel-load flakiness), clippy `-D warnings` clean, fmt clean,
 permission-coverage OK (77 RPCs). Release NOT cut — releases escalate per
 charter; CHANGELOG staged under [Unreleased] and cards left in review per
 sienna's instruction.
+
+2026-07-31 — **Test-flake root causes ticketed (KANBAN-036/037/038), not
+fixed.** Sienna called time on harness work for the day; the three distinct
+causes are filed with root-cause analysis instead of being fixed ad hoc:
+(036) the leak is structural — statics never drop, so the OnceCell-held
+containers are never removed, and the "testcontainers removes them at exit"
+comment is wrong; fix is a startup reaper with an age filter so concurrent
+suites don't reap each other. (037) transient gateway/OpenFGA failures under
+parallel load need harness-side retries (production already has
+grant_with_retry). (038) env-reading test helpers depend on another test
+having triggered containers::setup() first — subset runs fail spuriously;
+fix is self-bootstrapping helpers. All three assigned to sienna, todo,
+medium.
