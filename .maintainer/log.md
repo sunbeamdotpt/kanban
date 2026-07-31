@@ -399,3 +399,60 @@ exists as a multi-arch index (linux/amd64 + linux/arm64; floating
 v2026.07 / v2026 / latest updated). SBBB-017 commented image-live; the
 deploy itself (tony) and SBBB-016 (identity:read) are the remaining
 production steps.
+
+2026-07-31 — **KANBAN-030 verified done (executed by tony overnight).** The
+completed_at backfill ran as two documented one-off psql runs against
+kanban_db rather than a migration: (1) 41 done-titled columns flagged
+is_done=true — the real gap, since both the KANBAN-027 live stamping and any
+backfill key on that flag; (2) 67 historical done cards stamped, 66 with
+exact move-into-done times recovered from event_log CardMoved payloads, 1
+via updated_at fallback (card created directly in done). Verified: 0 done
+cards unstamped, 0 non-done stamped; burndown regenerated (29 → 70
+completions). Why one-off over migration: the defect only existed in this
+prod instance and the code path was already fixed going forward.
+
+2026-07-31 — **New-card triage: 031/033/035 implemented, 032/002 deduped.**
+Five new cards landed since the last session; all assigned to sienna.
+
+- **KANBAN-031 split across repos.** Root cause of the empty
+  `unauthenticated:` detail and silent rejections is g2v's auth_middleware
+  (`authenticate_session` map_err(|_| …) drops the AuthError; the 401 body
+  is not Connect-shaped, so RPC clients show an empty detail). Kanban-side
+  shipped (4394353ab9): SsoGatewaySessionClient WARN-logs every rejection
+  with failure class + latency, and KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS
+  (default 10s = old hardcoded value) makes the fail-closed policy explicit.
+  The middleware-layer remainder (Connect-shaped detail, method/path
+  logging, IntrospectionConfig knobs) filed as **G2V-001** (high) on
+  g2v/dev; KANBAN-031 depends_on it and sits in review. *Why not fix g2v
+  directly:* charter rule 4 — cross-repo changes flow through cards on the
+  owning team's board.
+- **KANBAN-033** (046ad2c590): additive `TemplateColumn.is_done` (tag 4) +
+  JSON round-trip + migration 0035 flagging Done in the four seeded global
+  templates. Project-scoped custom templates deliberately untouched — the
+  proto field now lets owners opt in explicitly. Test asserts every seeded
+  global template's Done column is flagged.
+- **KANBAN-035** (a21571d0b2): additive `Assignee.email` (tag 4) hydrated
+  read-time from the directory. Chose read-time hydration over
+  hydrate-at-assign (the KANBAN-024 design fork) because the card's clients
+  (liminal, sdk) need existing rows covered without a backfill, and the
+  identity client already existed from KANBAN-029. A 5-minute TTL
+  subject→email cache keeps list endpoints from hammering the gateway;
+  legacy/unknown subjects and backend errors resolve to empty email and
+  never fail a card read. Wired the identity client into Board/Project/
+  AggregatedBoard services and the outbox dispatcher (CardCreated hydration)
+  so snapshots and live events carry emails too — snapshots are liminal's
+  primary render path, so hydrating only the RPC reads would have left the
+  bug half-fixed. Proto pushed to BSR (7933c4d8da80, buf breaking clean),
+  unblocking sdk SDK-012 proto-side.
+- **KANBAN-002 + KANBAN-032 closed as duplicates of KANBAN-034**, which is
+  now the canonical cross-project TransferCard ticket carrying the design
+  questions (relocate-in-place vs recreate-and-close, moved disposition,
+  soft-delete semantics). No implementation: it needs a design decision
+  first, and a new RPC is additive-but-public API.
+
+Verification: full `cargo test` 334/336 (the 2 failures — permission-client
+and aggregated-boards flakes — pass in isolation; known gateway/OpenFGA
+parallel-load flakiness), clippy `-D warnings` clean, fmt clean,
+permission-coverage OK (77 RPCs). Release NOT cut — releases escalate per
+charter; CHANGELOG staged under [Unreleased] and cards left in review per
+sienna's instruction.

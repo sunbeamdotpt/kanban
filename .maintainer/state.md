@@ -3,56 +3,54 @@ type: State
 title: Current state of kanban
 description: What is in flight, what is blocked, what the next session should pick up first.
 tags: [state]
-timestamp: 2026-07-30T23:30:00Z
+timestamp: 2026-07-31T15:00:00Z
 ---
 
 # State — 2026-07-31
 
 ## In flight
 
-- **v2026.07.11 released and image LIVE** (8189150ade; run 30590298809
-  success; `ghcr.io/sunbeamdotpt/kanban:v2026.07.11` multi-arch amd64+arm64,
-  floating tags updated): Dockerfile fix — the sdk
-  build.rs runs `buf export` at compile time; builder stage now installs
-  pinned `bufbuild/buf:1.71.0`. **v2026.07.10's image build FAILED** (run
-  30588840172, no image published) — same code, do not deploy.
-  **SBBB-017** updated to v2026.07.11 and marked image-live
-  (deploy, assigned to tony, depends_on **SBBB-016** identity:read — hard
-  dependency, assigns 403 without it). KANBAN-029 done.
-- **v2026.07.9 released** (84ab8a43af tagged + pushed): KANBAN-027 regression
-  test + deployment of the already-landed handler fixes for `completed_at` on
-  done-column moves and timestamps in `ListCardsByBoard`. Release workflow
-  triggered by tag `v2026.07.9`; **SBBB-013** filed on sbbb/dev for production
-  deployment.
-- **v2026.07.8 released** (b316af1bc4): KANBAN-016 (blocked clear via mask),
-  KANBAN-023 (Column.is_done completion lanes, migration 0034), KANBAN-026 +
-  KANBAN-022 (template ID canonicalization, migrations 0033). All four cards
-  moved to done. CLI-014 (unblock flag + column is_done CLI support) is
-  unblocked once sbbb deploys v2026.07.8/v2026.07.9.
-- **KANBAN-027 done**: symptoms were already fixed on mainline by KANBAN-023;
-  regression test added in `src/services/cards.rs` and card moved to done.
-- v2026.07.7 released previously (MilestoneService + label CRUD).
+- **Unreleased on mainline** (3 commits, awaiting a release decision from
+  sienna — releases escalate per charter):
+  - `4394353ab9` fix(auth): KANBAN-031 kanban-side — session client WARN-logs
+    authn rejections with failure class + latency; new
+    `KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS` (default 10).
+  - `046ad2c590` feat(templates): KANBAN-033 — `TemplateColumn.is_done`
+    (additive proto tag 4) + migration 0035 flagging Done in the four seeded
+    global templates.
+  - `a21571d0b2` feat(cards): KANBAN-035 — `Assignee.email` (additive proto
+    tag 4) hydrated read-time from the directory (5-min TTL cache);
+    Board/Project/AggregatedBoard services and the outbox dispatcher now
+    hold the identity client.
+  - Proto pushed: `buf.build/sunbeamdotpt/kanban:7933c4d8da8043888567c2127d23dc7b`
+    (buf lint + breaking clean, additive only). sdk SDK-012 unblocked
+    proto-side.
+- **v2026.07.11 released and image LIVE** (8189150ade; run 30590298809;
+  GHCR multi-arch): Dockerfile buf fix. **v2026.07.10's image build FAILED —
+  do not deploy.** SBBB-017 (prod deploy, tony) depends_on SBBB-016
+  (identity:read — hard dependency, assigns 403 without it).
 
 ## Board state (kanban/dev)
 
-- Done this session: KANBAN-016, KANBAN-022, KANBAN-023, KANBAN-026,
-  KANBAN-027, KANBAN-028 (wontfix — direct Bearer scripting against
-  kanban.sunbeam.pt is not supported; use the CLI or file CLI gaps),
-  KANBAN-029 (assignee validation; shipped in v2026.07.10).
-- Deferred with triage comments on each card: KANBAN-001..005, KANBAN-013
-  (2026-07-24 design-review deferral stands), KANBAN-015 (by design),
-  KANBAN-019/020 (scoped, ready; not started), KANBAN-021 (product decisions
-  escalated to sienna in-session; depends_on 019+020), KANBAN-024 (fix sketch
-  posted; needs IdentityService wiring + gateway scope + design pick),
-  KANBAN-025 (icebox).
+- In review this session: KANBAN-031 (kanban-side shipped; blocked on
+  **G2V-001** for the middleware-layer detail/logging — filed on g2v/dev,
+  depends_on link set), KANBAN-033, KANBAN-035.
+- Done this session: KANBAN-002 + KANBAN-032 (duplicates of KANBAN-034,
+  which stays in todo as the canonical cross-project TransferCard ticket
+  with design questions noted), KANBAN-030 (completed_at backfill — executed
+  by tony overnight as two one-off psql runs: 41 done-titled columns flagged
+  is_done, 67 cards stamped from event_log; full trail on the card).
+- Deferred with triage comments (unchanged): KANBAN-001/004/005, KANBAN-013,
+  KANBAN-015, KANBAN-019/020, KANBAN-021, KANBAN-024, KANBAN-025 (icebox).
 - Owned by the CLI repo: KANBAN-008, KANBAN-010, CLI-018.
-- KANBAN-003: same-project cross-board moves ARE implemented (MoveCard
-  re-homes board_id + parent tuples); proposed closing as implemented in a
-  card comment — human to confirm.
-- **All open cards are assigned to sienna.**
+- KANBAN-003: cross-board same-project moves ARE implemented; proposed close
+  pending human confirmation.
+- All open cards assigned to sienna.
 
 ## Blocked / waiting
 
+- KANBAN-031 in review, depends_on G2V-001 (g2v auth_middleware must emit
+  Connect-shaped error detail + WARN-log with method/path).
 - KANBAN-021 blocked on product decisions (state→card mapping, per-board
   opt-in, user-override rule) — needs sienna's call in-session.
 - `AggregatedBoardDeleted` remains undeliverable via the outbox (documented
@@ -60,24 +58,22 @@ timestamp: 2026-07-30T23:30:00Z
 
 ## Pick up first
 
-- ~~Verify release workflow run 30590298809 published the v2026.07.11 GHCR
-  image~~ DONE (00:46 check: success, multi-arch image live, SBBB-017
-  commented). Track
-  SBBB-017 (prod deploy, tony) — remember SBBB-016
-  (identity:read) must be applied with it. Prod-verify after deploy:
-  `sunbeam kanban card assign <card> <email>` stores `user:<ulid>`; garbage
-  input is rejected.
-- Track SBBB-013 deployment of kanban v2026.07.9; prod-verify KANBAN-027 with
-  `sunbeam kanban card get <done-card-ref> -o json` (completed_at populated)
-  and `sunbeam kanban card list <board-id> -o json` (timestamps present).
-- Verify release workflow for v2026.07.9 published the GHCR image, then
-  prod-verify CLI-014 items after sbbb deploys: `card-template get <global-id>`,
-  unblock via mask, and milestone stats once Done columns are marked is_done.
-- Testcontainers leak is still real: full-suite runs exhaust Docker ports
-  ("address already in use" / sso-gateway bootstrap port race). Cleanup loop
-  that works: `docker rm -f $(docker ps -aq --filter
-  label=org.testcontainers.managed-by=testcontainers)` +
-  `docker network prune -f`, then retry — suites pass on a clean Docker.
+- Cut release v2026.07.12 with sienna's approval: the three mainline
+  commits + CHANGELOG [Unreleased]. After release: file sbbb deploy card
+  (v2026.07.12) and move 033/035 (and 031 if G2V-001 landed) to done.
+- Track SBBB-017 (prod deploy of v2026.07.11, tony) — SBBB-016
+  (identity:read) must be applied with it. Prod-verify assign-by-email.
+- KANBAN-035 prod note: email hydration needs `identity:read` (same SBBB-016
+  scope); without it resolve_email logs a warning and emails arrive empty —
+  reads do NOT fail.
+- Testcontainers leak is still real: full-suite runs flake with
+  PoolTimedOut / permission-expand errors / NATS "connection refused" when
+  Docker is exhausted, and subscribe tests need the harness env (run the
+  FULL suite, not subscribe-only subsets — child tests read NATS_URL from
+  the shared harness bootstrap). Cleanup loop: `docker rm -f $(docker ps -aq
+  --filter label=org.testcontainers.managed-by=testcontainers)` +
+  `docker network prune -f`, then rerun; the 2026-07-31 full suite passed
+  334/336 with the 2 failures passing in isolation.
 - Dependabot: 1 moderate vulnerability on the default branch
   (github.com/sunbeamdotpt/kanban/security/dependabot/20) — still untriaged.
 - Remaining stale-doc item: `docs/development/testing.md` +

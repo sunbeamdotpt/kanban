@@ -6,6 +6,41 @@ All notable changes to the Kanban backend will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project now adheres to [Calendar Versioning](https://calver.org) (CalVer, `YYYY.0M.PATCH`).
 
+## [Unreleased]
+
+### Added
+
+- **Assignee email hydration (KANBAN-035).** The `Assignee` message gains an
+  additive `email` field (tag 4), populated read-time from the tenant's
+  sso-gateway user directory on every card read path: card RPCs,
+  `SubscribeBoard` snapshots, `SubscribeProject` child streams, aggregated
+  boards, and outbox `CardCreated` hydration. Lookups go through a 5-minute
+  TTL cache in `IdentityClient`; legacy or unknown subjects resolve to an
+  empty email and directory errors never fail a card read. Clients can now
+  fall back to email when `display_name` is empty instead of rendering raw
+  `user:<ULID>` subjects. Published to
+  `buf.build/sunbeamdotpt/kanban:7933c4d8da8043888567c2127d23dc7b`.
+- **`TemplateColumn.is_done` (KANBAN-033).** Board templates can now express
+  the completion lane: additive `is_done` field (tag 4) on `TemplateColumn`,
+  persisted through the template columns JSON. Migration 0035 flags the Done
+  column of the four seeded global templates (standard, Kanban, Sprint,
+  Simple), so boards built from them stamp `completed_at` without a manual
+  column update. Project-scoped custom templates are unchanged and can opt
+  in explicitly.
+- **Introspection timeout knob (KANBAN-031).** New
+  `KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS` (default 10, the previous
+  hardcoded value) bounds sso-gateway token introspection calls, making the
+  fail-closed policy explicit and tunable.
+
+### Changed
+
+- **Authn rejection logging (KANBAN-031).** The sso-gateway session client
+  now WARN-logs every authentication rejection with a failure class
+  (`missing-token`, `service-token`, `timeout`, `transport`,
+  `gateway-error`, `bad-response`, `inactive`) and the introspection
+  latency. The g2v middleware still collapses the client-visible error
+  detail; surfacing the failure class to RPC clients is tracked as G2V-001.
+
 ## [2026.07.11] - 2026-07-30
 
 ### Fixed
