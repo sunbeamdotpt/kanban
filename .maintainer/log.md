@@ -579,3 +579,10 @@ extend the KANBAN-019 receiver with push events (no CLI hooks — sienna
 dislikes them). The #time command forces a new TimeTrackingService
 (specified in RFC section 7). Filed KANBAN-041 (phase 1, high) and
 KANBAN-042 (TimeTrackingService/phase 3, medium, depends_on 041).
+
+2026-07-31 — **RFC out for review: PR #3** (docs/smart-commits-rfc branched
+off origin/mainline so the doc reviews standalone, independent of the
+unreleased mainline commits). Assigned to tony (GitHub: mckenzietony,
+resolved via org member list). Review focus posted in the PR body:
+grammar semantics, pusher-identity authorization, time-tracking totals,
+rollout phasing + the sso-gateway verified-login dependency.
