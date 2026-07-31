@@ -1685,7 +1685,6 @@ impl BoardService for BoardServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sunbeam_g2v::config::NatsConfig;
     use sunbeam_g2v::middleware::auth::AuthContext;
     use sunbeam_g2v::mq::NatsClient;
 
@@ -1696,21 +1695,12 @@ mod tests {
 
     // ── Subscribe test helpers ───────────────────────────────────────────────
 
-    fn nats_url() -> String {
-        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
-    }
-
+    /// NATS client from the shared testcontainers harness. Bootstrapping here
+    /// (instead of reading `NATS_URL` from the process env) keeps subset test
+    /// runs working: `containers::setup()` is idempotent and exports the
+    /// connection URLs itself.
     async fn connect_nats() -> Arc<NatsClient> {
-        Arc::new(
-            NatsClient::connect(&NatsConfig {
-                url: nats_url(),
-                jetstream: true,
-                lease_duration: 30,
-                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-            })
-            .await
-            .expect("NATS connect failed — set NATS_URL"),
-        )
+        crate::test_support::containers::setup().await.nats
     }
 
     async fn ensure_stream(nats: &NatsClient) {

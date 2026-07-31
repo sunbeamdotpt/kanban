@@ -1086,18 +1086,9 @@ mod tests {
     }
 
     async fn make_service(pool: PgPool, permission: Arc<PermissionClient>) -> ProjectServiceImpl {
-        let nats_url =
-            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-        let nats = Arc::new(
-            sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
-                url: nats_url,
-                jetstream: true,
-                lease_duration: 30,
-                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-            })
-            .await
-            .expect("NATS connect failed"),
-        );
+        // NATS client from the shared testcontainers harness; bootstrapping
+        // here keeps subset test runs independent of execution order.
+        let nats = crate::test_support::containers::setup().await.nats;
         let registry = Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-projects"));
         ProjectServiceImpl {
             pool,
@@ -2226,17 +2217,8 @@ mod tests {
         let board_b = crate::test_support::seed_board(&pool, &tenant_id, project_id).await;
 
         // NATS client for the outbox drain; ensure the JetStream stream exists.
-        let nats = Arc::new(
-            sunbeam_g2v::mq::NatsClient::connect(&sunbeam_g2v::config::NatsConfig {
-                url: std::env::var("NATS_URL")
-                    .unwrap_or_else(|_| "nats://localhost:4222".to_string()),
-                jetstream: true,
-                lease_duration: 30,
-                auth_token: std::env::var("NATS_AUTH_TOKEN").ok(),
-            })
-            .await
-            .expect("NATS connect failed"),
-        );
+        // Sourced from the shared harness so subset runs bootstrap it on demand.
+        let nats = crate::test_support::containers::setup().await.nats;
         crate::realtime::jetstream_bootstrap::ensure_kanban_stream(
             &nats,
             &crate::realtime::jetstream_bootstrap::default_config(),
