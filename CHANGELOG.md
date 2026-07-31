@@ -10,6 +10,19 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
 
 ### Added
 
+- **Cross-project card transfer (KANBAN-034).** New `TransferCard` RPC
+  relocates a card to a board in another project **in place** — comments,
+  attachments, checklist, assignees, github links, and dependencies stay
+  attached (no recreate-and-close). The ref is re-minted under the target
+  project's prefix and the previous ref is returned (it stops resolving);
+  project-scoped fields are scrubbed (milestone cleared, project-scoped
+  labels dropped, global labels kept); `completed_at` follows only the
+  normal is_done column rule — a transfer is not a completion. Requires
+  edit on the source card (header) AND edit on the target board (checked
+  handler-side). Emits the new `CardTransferred` event on BOTH boards'
+  streams with the full post-transfer card hydrated at dispatch time, and
+  the search index is updated on dispatch.
+Published to `buf.build/sunbeamdotpt/kanban:096a3791210a45a89ad2d820c7c028c5`.
 - **Assignee email hydration (KANBAN-035).** The `Assignee` message gains an
   additive `email` field (tag 4), populated read-time from the tenant's
   sso-gateway user directory on every card read path: card RPCs,
@@ -31,6 +44,17 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   `KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS` (default 10, the previous
   hardcoded value) bounds sso-gateway token introspection calls, making the
   fail-closed policy explicit and tunable.
+
+### Fixed
+
+- **Global labels panicked card reads.** `fetch_labels` decoded
+  `labels.project_id` as non-optional, but global labels store NULL
+  (migration 0032) — any card carrying a global label failed every
+  full-card read. Decode as optional; globals emit an empty `project_id`.
+- **Live `CardMoved` events carried empty columns.** The outbox mapped
+  `from_column_id`/`column_id`/`position` while the MoveCard handler
+  writes `from_column`/`to_column`/`to_position`; stored payloads were
+  correct, only the live stream mapping was wrong.
 
 ### Changed
 

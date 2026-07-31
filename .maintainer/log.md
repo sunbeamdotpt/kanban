@@ -520,3 +520,44 @@ on the card with the implementation implications (ref re-mint under the
 target project with no alias, milestone/project-label scrub, dual-board
 authorization, no completed_at stamp, events on both boards). Priority
 bumped to high; unblocked and ready for implementation.
+
+2026-07-31 — **KANBAN-034 implemented + two latent bugs found in passing;
+harness tickets 036/037/038 implemented via parallel agents.**
+
+Parallel session shape: two coder agents (confined to src/test_support.rs
+and to non-cards test modules respectively, no cargo/git allowed) while the
+maintainer implemented TransferCard. Integration was synchronous afterward:
+clippy --all-targets clean, full suite, then hunk-split conventional
+commits. Worked well; the file partitioning is what made it conflict-free.
+
+- **TransferCard (KANBAN-034, relocate-in-place per sienna's decision).**
+  Additive proto (TransferCard RPC, CardTransferred event tag 50), matrix
+  entry KanbanCard+edit on the source card plus a handler-side edit check on
+  the target board (dual authorization — one header object can't span two
+  projects). One tx: re-home project/board/column, re-mint ref under the
+  target project (previous_ref returned; no alias), milestone cleared,
+  project-scoped labels scrubbed (globals survive), completed_at follows
+  only the is_done rule, CardTransferred on BOTH boards with the full card
+  hydrated at dispatch, search index reindexed, permission parent tuple
+  re-homed. Idempotency replay recovers previous_ref from the event payload.
+- **Latent bug 1: fetch_labels panicked on global labels.** project_id is
+  NULL for globals (migration 0032) but decoded as non-optional Id — any
+  card carrying a global label crashed every full-card read. Found by the
+  TransferCard test attaching a global label. Fixed (Option decode).
+- **Latent bug 2: live CardMoved events carried empty columns.** The
+  MoveCard handler writes from_column/to_column/to_position in the event
+  payload; the outbox mapped from_column_id/column_id/position. Stored
+  payloads were correct (which is why KANBAN-030's event-log backfill
+  worked) — only the live stream mapping was wrong, and the outbox unit
+  test mirrored the wrong keys. Fixed both; test now documents that keys
+  must match the handler.
+- **KANBAN-036/037 (agent):** startup reaper for stale testcontainers
+  (label + sso<hex>-name based, age-filtered, never blanket-prunes
+  networks) + with_retry around gateway bootstrap calls and a readiness
+  settle. Reap window tightened 30m → 10m at integration: a full suite is
+  ~2–4 min, so 10m still protects concurrent runs but stops iteration-loop
+  accumulation (observed today: 6 concurrent stacks, 66 containers, gateway
+  flaking from host contention).
+- **KANBAN-038 (agent):** env-reading test helpers in boards.rs/projects.rs
+  now self-bootstrap via containers::setup(); verified `cargo test
+  services::boards::tests::subscribe` standalone 7/7 (was 2/7).

@@ -10,8 +10,15 @@ timestamp: 2026-07-31T15:00:00Z
 
 ## In flight
 
-- **Unreleased on mainline** (3 commits, awaiting a release decision from
-  sienna — releases escalate per charter):
+- **Unreleased on mainline** (now 8 commits, awaiting a release decision
+  from sienna — releases escalate per charter):
+  - `6ab6901f66` feat(cards): KANBAN-034 TransferCard (relocate-in-place).
+  - `e3f67c83cf` fix(realtime): CardMoved event payload keys.
+  - `093678758f` fix(cards): fetch_labels global-label panic.
+  - `295544220b` test(harness): KANBAN-038 self-bootstrap helpers.
+  - `e42a3ee77f` test(harness): KANBAN-036 reaper + KANBAN-037 retries.
+  - Proto pushed: `buf.build/sunbeamdotpt/kanban:096a3791210a45a89ad2d820c7c028c5`
+    (TransferCard + CardTransferred, buf breaking clean).
   - `4394353ab9` fix(auth): KANBAN-031 kanban-side — session client WARN-logs
     authn rejections with failure class + latency; new
     `KANBAN_SSO_INTROSPECTION_TIMEOUT_SECS` (default 10).
@@ -74,13 +81,11 @@ timestamp: 2026-07-31T15:00:00Z
 - KANBAN-035 prod note: email hydration needs `identity:read` (same SBBB-016
   scope); without it resolve_email logs a warning and emails arrive empty —
   reads do NOT fail.
-- Testcontainers leak is still real but now **ticketed**: KANBAN-036
-  (startup reaper for stale containers/networks), KANBAN-037 (retry
-  transient gateway/OpenFGA bootstrap failures), KANBAN-038 (self-
-  bootstrapping env helpers — subset runs fail spuriously without them).
-  Until they land, the cleanup loop stands: `docker rm -f $(docker ps -aq
-  --filter label=org.testcontainers.managed-by=testcontainers)` +
-  `docker network prune -f`, then rerun the FULL suite.
+- Testcontainers leak FIXED on mainline (KANBAN-036/037/038, in review):
+  startup reaper (>10 min old stacks, safe for concurrent runs), gateway
+  bootstrap retries + readiness settle, self-bootstrapping test helpers.
+  Full suite after integration: 336 passed, 3 port/timing flakes passing
+  in isolation. If flakes resurface, the manual cleanup loop still works.
 - Dependabot: 1 moderate vulnerability on the default branch
   (github.com/sunbeamdotpt/kanban/security/dependabot/20) — still untriaged.
 - Remaining stale-doc item: `docs/development/testing.md` +
