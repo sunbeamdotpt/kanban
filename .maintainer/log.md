@@ -469,3 +469,35 @@ grant_with_retry). (038) env-reading test helpers depend on another test
 having triggered containers::setup() first — subset runs fail spuriously;
 fix is self-bootstrapping helpers. All three assigned to sienna, todo,
 medium.
+
+2026-07-31 — **Full open-card triage pass (priorities, deps, ownership).**
+Triggered by sienna: "properly triage these cards, fix priorities and
+dependencies". Outcomes:
+
+- **KANBAN-039 root-caused to the CLI, not the server.** Label add/set 403s
+  for every caller because the CLI sends the card id as x-sunbeam-object-id
+  while BulkUpdateCardLabels is gated on KanbanBoard+edit (board id in
+  header; every other card RPC is KanbanCard-scoped, which is why only this
+  one breaks). Server contract is correct; fix is one line CLI-side
+  (object_id_options(&card.board_id) — the CLI already fetched the card).
+  Filed CLI-023 (high) with the exact fix; KANBAN-039 depends_on it.
+  *Why no server-side acceptance of card ids:* changing the matrix entry
+  would break any client already sending board ids correctly, and the
+  header contract is deliberately uniform.
+- **KANBAN-003 closed as implemented** — verified in code: MoveCard
+  re-homes board_id + parent tuple, test-covered since v2026.07.3. (The
+  2026-07-27 session had proposed closing pending human confirmation;
+  sienna's triage request was taken as that confirmation.)
+- **KANBAN-008/010 stay as canonical tickets** despite being CLI-owned
+  work: no equivalent cards exist on cli/dev, and closing them would lose
+  the tracking. Comments reconfirm scope + server-side context.
+- **KANBAN-021 marked blocked** — deps on 019/020 were already linked; the
+  real gate is the pending product decision (sienna, in-session).
+- **KANBAN-024 narrowed by comment** — the email tier shipped with
+  KANBAN-035; remaining scope is display_name/avatar hydration (design pick
+  + SBBB-016). Priority kept medium since email removes the raw-ULID worst
+  case.
+- **Priorities reviewed, mostly left as-is:** KANBAN-019 kept high (stale
+  link state is a data-visibility defect with only a manual workaround);
+  KANBAN-015 stays low (cross-tenant rejected by design until a use case);
+  the rest were already correctly medium.

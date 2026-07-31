@@ -32,19 +32,23 @@ timestamp: 2026-07-31T15:00:00Z
 
 ## Board state (kanban/dev)
 
-- In review this session: KANBAN-031 (kanban-side shipped; blocked on
-  **G2V-001** for the middleware-layer detail/logging — filed on g2v/dev,
-  depends_on link set), KANBAN-033, KANBAN-035.
+- Full triage pass 2026-07-31 (details in log.md): KANBAN-003 closed as
+  implemented (test-covered since v2026.07.3); KANBAN-039 root-caused to a
+  CLI header bug → CLI-023 (high), depends_on set; KANBAN-021 marked
+  blocked (product decision pending); KANBAN-024 narrowed to
+  display_name/avatar after 035 shipped the email tier; KANBAN-008/010
+  confirmed canonical (no cli/dev equivalents). Priorities reviewed; only
+  pre-existing sane values kept.
+- In review: KANBAN-031 (blocked on **G2V-001**), KANBAN-033, KANBAN-035.
 - Done this session: KANBAN-002 + KANBAN-032 (duplicates of KANBAN-034,
   which stays in todo as the canonical cross-project TransferCard ticket
   with design questions noted), KANBAN-030 (completed_at backfill — executed
   by tony overnight as two one-off psql runs: 41 done-titled columns flagged
   is_done, 67 cards stamped from event_log; full trail on the card).
 - Deferred with triage comments (unchanged): KANBAN-001/004/005, KANBAN-013,
-  KANBAN-015, KANBAN-019/020, KANBAN-021, KANBAN-024, KANBAN-025 (icebox).
-- Owned by the CLI repo: KANBAN-008, KANBAN-010, CLI-018.
-- KANBAN-003: cross-board same-project moves ARE implemented; proposed close
-  pending human confirmation.
+  KANBAN-015, KANBAN-019/020, KANBAN-025 (icebox).
+- Owned by the CLI repo but tracked here (no cli/dev equivalents):
+  KANBAN-008, KANBAN-010.
 - All open cards assigned to sienna.
 
 ## Blocked / waiting
