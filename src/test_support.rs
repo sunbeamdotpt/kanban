@@ -266,7 +266,9 @@ pub(crate) mod containers {
     use sunbeam_g2v::mq::NatsClient;
 
     use crate::auth::identity_client::{IdentityClient, IdentityClientConfig};
-    use crate::auth::permission_client::{PermissionClient, PermissionClientConfig};
+    use crate::auth::permission_client::{
+        KANBAN_NAMESPACE, PermissionClient, PermissionClientConfig,
+    };
     use std::collections::HashMap;
 
     type PermissionClientCache = HashMap<(String, String, String), Arc<PermissionClient>>;
@@ -354,8 +356,9 @@ pub(crate) mod containers {
     ///
     /// A fresh `TestInfra` is returned on every call so that each test owns
     /// its own Postgres pool and clients. The heavy container handles are kept
-    /// alive in the static `SHARED` singleton; testcontainers removes the
-    /// containers when the test process exits.
+    /// alive in the static `SHARED` singleton — and statics are never dropped,
+    /// so the containers outlive the test process. `reap_stale_resources`
+    /// removes the leftovers at the start of the next run (KANBAN-036).
     pub struct TestInfra {
         pub pool: sqlx::PgPool,
         pub nats: Arc<NatsClient>,
@@ -412,6 +415,238 @@ pub(crate) mod containers {
     /// bootstrap (and leak another container set) only to fail at the same
     /// place.
     static BOOTSTRAP_FAILED: AtomicBool = AtomicBool::new(false);
+
+    // ── Startup reaper (KANBAN-036) ────────────────────────────────────────
+    //
+    // `SHARED` is a static and statics are never dropped, so the container
+    // handles in `SharedInfra` never run their `Drop` impls: every
+    // `cargo test` process leaks its whole stack (containers plus the
+    // sso-gateway Docker network), and repeated runs exhaust Docker's address
+    // pools. The reaper runs once per process at bootstrap, before any new
+    // container is created, and removes leftovers from previous runs. The
+    // 30-minute age cutoff is what makes this safe with concurrent
+    // `cargo test` processes: their containers are younger than the cutoff
+    // and are never touched.
+
+    /// Only resources older than this are reaped, so a concurrent test run
+    /// never loses its live containers. 10 minutes far exceeds any full-suite
+    /// duration (~2–4 min), so overlapping runs are still safe while
+    /// iteration loops stop accumulating stacks.
+    const REAP_MIN_AGE_SECS: u64 = 10 * 60;
+
+    /// Best-effort removal of stale containers and networks from previous
+    /// test runs. Every failure is logged and swallowed; reaping must never
+    /// abort the bootstrap.
+    fn reap_stale_resources() {
+        reap_stale_containers();
+        reap_stale_sso_networks();
+    }
+
+    /// Remove testcontainers-managed and sso-gateway-stack containers older
+    /// than [`REAP_MIN_AGE_SECS`]. The sdk `SsoGateway` stack containers are
+    /// testcontainers-managed too, but listing them by name as well keeps the
+    /// reaper working even if the label convention changes.
+    fn reap_stale_containers() {
+        let until = format!("until={}m", REAP_MIN_AGE_SECS / 60);
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for filter in [
+            "label=org.testcontainers.managed-by=testcontainers",
+            // sdk `SsoGateway` stack containers are named
+            // `sso<hex nanos>-{postgres,hydra,kratos,keto,openfga,gateway}`.
+            "name=^sso[0-9a-f]+-",
+        ] {
+            match docker_lines(&["ps", "-aq", "--filter", filter, "--filter", &until]) {
+                Ok(found) => ids.extend(found),
+                Err(e) => tracing::warn!(error = %e, "reaper: failed to list stale containers"),
+            }
+        }
+
+        if ids.is_empty() {
+            tracing::debug!("reaper: no stale containers from previous test runs");
+            return;
+        }
+
+        let count = ids.len();
+        match std::process::Command::new("docker")
+            .arg("rm")
+            .arg("-f")
+            .args(ids.iter().map(String::as_str))
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                tracing::info!(count, "reaped stale containers from previous test runs");
+            }
+            // `docker rm` removes what it can even when it exits non-zero.
+            Ok(out) => tracing::warn!(
+                count,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "reaper: docker rm exited non-zero"
+            ),
+            Err(e) => tracing::warn!(error = %e, count, "reaper: failed to run docker rm"),
+        }
+    }
+
+    /// Remove orphaned sso-gateway stack networks (`sso<hex nanos>-net`) that
+    /// are older than [`REAP_MIN_AGE_SECS`] and have no attached containers.
+    /// The age is decoded from the nanosecond timestamp the sdk embeds in the
+    /// name, so no Docker timestamp parsing is needed. Networks that cannot
+    /// be identified as harness-created are left alone; never run a blanket
+    /// `docker network prune` (it would delete unrelated user networks).
+    fn reap_stale_sso_networks() {
+        let names = match docker_lines(&[
+            "network",
+            "ls",
+            "--filter",
+            "name=^sso[0-9a-f]+-net$",
+            "--format",
+            "{{.Name}}",
+        ]) {
+            Ok(names) => names,
+            Err(e) => {
+                tracing::warn!(error = %e, "reaper: failed to list stale networks");
+                return;
+            }
+        };
+
+        let mut reaped = 0usize;
+        for name in names {
+            if !sso_name_is_stale(&name, "-net") {
+                continue;
+            }
+            // Only remove networks with no attached containers; `{{json
+            // .Containers}}` renders as `null` (or `{}`) when empty.
+            match docker_lines(&["network", "inspect", "-f", "{{json .Containers}}", &name]) {
+                Ok(lines) => {
+                    let empty = lines.is_empty() || lines.iter().all(|l| l == "null" || l == "{}");
+                    if !empty {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        network = %name,
+                        "reaper: failed to inspect network"
+                    );
+                    continue;
+                }
+            }
+            match std::process::Command::new("docker")
+                .args(["network", "rm", &name])
+                .output()
+            {
+                Ok(out) if out.status.success() => reaped += 1,
+                Ok(out) => tracing::warn!(
+                    network = %name,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "reaper: docker network rm exited non-zero"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        network = %name,
+                        "reaper: failed to run docker network rm"
+                    );
+                }
+            }
+        }
+
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                "reaped stale sso-gateway networks from previous test runs"
+            );
+        } else {
+            tracing::debug!("reaper: no stale sso-gateway networks");
+        }
+    }
+
+    /// Decode the age of an sdk `SsoGateway` stack resource from its name.
+    /// The stack names everything `sso<hex nanos since UNIX_EPOCH><suffix>`,
+    /// so the creation time is embedded in the name itself. Returns false for
+    /// anything that does not match the convention exactly.
+    fn sso_name_is_stale(name: &str, suffix: &str) -> bool {
+        let Some(hex) = name
+            .strip_prefix("sso")
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            return false;
+        };
+        let Ok(nanos) = u128::from_str_radix(hex, 16) else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        now.saturating_sub(nanos) > u128::from(REAP_MIN_AGE_SECS) * 1_000_000_000
+    }
+
+    /// Run a read-only `docker` CLI command and return its non-empty stdout
+    /// lines. Used by the startup reaper; the daemon endpoint comes from
+    /// `DOCKER_HOST`, which `ensure_docker_host` has already resolved.
+    fn docker_lines(args: &[&str]) -> Result<Vec<String>, String> {
+        let output = std::process::Command::new("docker")
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to spawn docker: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "docker {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    // ── Transient-failure retries (KANBAN-037) ─────────────────────────────
+    //
+    // Under parallel test load the freshly started sso-gateway (and its
+    // Hydra/OpenFGA backends) answers some early calls with transient errors
+    // — "permission expand failed", OAuth2 serialization conflicts, dropped
+    // connections while a backend warms up. These always pass on retry, so
+    // the bootstrap wraps every gateway-touching step in `with_retry`.
+
+    /// Run `f` until it succeeds, with exponential backoff between attempts.
+    ///
+    /// `what` names the operation for logs; `attempts` caps the total number
+    /// of tries. Backoff starts at 250 ms and doubles after each failure.
+    /// Retries are logged at warn; the final failure is returned to the
+    /// caller.
+    async fn with_retry<T, E, F, Fut>(what: &str, attempts: u32, f: F) -> Result<T, E>
+    where
+        E: std::fmt::Display,
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match f().await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if attempt >= attempts {
+                        return Err(e);
+                    }
+                    let backoff = Duration::from_millis(250u64 << (attempt - 1));
+                    tracing::warn!(
+                        what = %what,
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %e,
+                        "transient failure; retrying"
+                    );
+                    sleep(backoff).await;
+                }
+            }
+        }
+    }
 
     /// Set up the shared test infrastructure and return a fresh `TestInfra`
     /// for the calling test.
@@ -497,6 +732,14 @@ pub(crate) mod containers {
 
     /// Start all containers, run migrations, and return the shared URLs/handles.
     async fn start_containers() -> SharedInfra {
+        // Reap containers/networks leaked by previous test processes before
+        // creating new ones (KANBAN-036). Blocking docker CLI calls run off
+        // the async worker; all failures are logged inside the reaper and
+        // never abort the bootstrap.
+        if let Err(e) = tokio::task::spawn_blocking(reap_stale_resources).await {
+            tracing::warn!(error = %e, "reaper task failed to join");
+        }
+
         eprintln!(
             "[testcontainers] starting Postgres, NATS, sso-gateway, MinIO, and OpenSearch..."
         );
@@ -557,7 +800,8 @@ pub(crate) mod containers {
 
         // Register the Kanban permission namespace + authorization model in
         // the kanban-test tenant (the service app's home tenant). Idempotent on
-        // the gateway side.
+        // the gateway side. Retried: the freshly started gateway/OpenFGA can
+        // fail early calls transiently (KANBAN-037).
         let provisioner = PermissionClient::new(&PermissionClientConfig {
             base_url: sso_gateway_url.clone(),
             token_url: format!("{sso_gateway_url}/oauth2/token"),
@@ -565,10 +809,20 @@ pub(crate) mod containers {
             client_secret: client_secret.clone(),
         })
         .expect("failed to build permission client for namespace provisioning");
-        provisioner
-            .ensure_kanban_namespace()
-            .await
-            .expect("failed to ensure Kanban permission namespace");
+        with_retry("ensure Kanban permission namespace", 3, || {
+            provisioner.ensure_kanban_namespace()
+        })
+        .await
+        .expect("failed to ensure Kanban permission namespace");
+
+        // Readiness settle: one retrying permission round-trip against the
+        // freshly provisioned namespace, so the parallel test stampede that
+        // follows bootstrap does not hit a half-warm gateway/OpenFGA.
+        with_retry("permission settle round-trip", 3, || {
+            provisioner.get_namespace(KANBAN_NAMESPACE)
+        })
+        .await
+        .expect("sso-gateway permission backend did not settle after provisioning");
 
         // Run migrations against the fresh Postgres instance.
         {
@@ -925,16 +1179,22 @@ pub(crate) mod containers {
 
         let tenant_client = TenantServiceClient::new(transport, config);
 
-        let tenant = tenant_client
-            .create_tenant(CreateTenantRequest {
-                slug: slug.to_string(),
-                display_name: display_name.to_string(),
-                settings: Default::default(),
-                __buffa_unknown_fields: Default::default(),
-            })
-            .await
-            .map_err(|e| format!("CreateTenant failed: {e}"))?
-            .into_owned();
+        // Retried: a half-warm gateway can fail the first calls transiently
+        // (KANBAN-037). Slug conflicts only occur if a previous attempt
+        // actually created the tenant, which cannot happen on a fresh stack.
+        let tenant = with_retry("create tenant", 3, || async {
+            tenant_client
+                .create_tenant(CreateTenantRequest {
+                    slug: slug.to_string(),
+                    display_name: display_name.to_string(),
+                    settings: Default::default(),
+                    __buffa_unknown_fields: Default::default(),
+                })
+                .await
+                .map_err(|e| format!("CreateTenant failed: {e}"))
+                .map(|r| r.into_owned())
+        })
+        .await?;
 
         Ok(tenant.id)
     }
@@ -977,64 +1237,50 @@ pub(crate) mod containers {
             connectrpc::client::CallOptions::default().with_header("x-tenant-id", &tenant_id);
 
         // Hydra serializes OAuth2 client writes; parallel tests can lose the
-        // race with a transient "Unable to serialize access" conflict. Retry
+        // race with a transient "Unable to serialize access" conflict, and a
+        // half-warm gateway can fail early calls outright (KANBAN-037). Retry
         // only the app provisioning — the tenant already exists at this point.
-        let mut attempt = 0u32;
-        let secret = loop {
-            attempt += 1;
-            let created = async {
-                let app = app_client
-                    .create_application_with_options(
-                        CreateApplicationRequest {
-                            name: "kanban-service".to_string(),
-                            redirect_uris: vec![],
-                            grant_types: vec!["client_credentials".to_string()],
-                            response_types: vec!["token".to_string()],
-                            scope: vec![
-                                "permission:admin".to_string(),
-                                "tenant:admin".to_string(),
-                                "identity:read".to_string(),
-                            ],
-                            token_endpoint_auth_method: "client_secret_post".to_string(),
-                            cross_tenant: true,
-                            skip_consent: false,
-                            __buffa_unknown_fields: Default::default(),
-                        },
-                        tenant_options.clone(),
-                    )
-                    .await
-                    .map_err(|e| format!("CreateApplication failed: {e}"))?
-                    .into_owned();
-                eprintln!(
-                    "[kanban-test] created app id={} tenant={} cross_tenant={}",
-                    app.id, tenant_id, app.cross_tenant
-                );
+        let secret = with_retry("provision kanban-service application", 5, || async {
+            let app = app_client
+                .create_application_with_options(
+                    CreateApplicationRequest {
+                        name: "kanban-service".to_string(),
+                        redirect_uris: vec![],
+                        grant_types: vec!["client_credentials".to_string()],
+                        response_types: vec!["token".to_string()],
+                        scope: vec![
+                            "permission:admin".to_string(),
+                            "tenant:admin".to_string(),
+                            "identity:read".to_string(),
+                        ],
+                        token_endpoint_auth_method: "client_secret_post".to_string(),
+                        cross_tenant: true,
+                        skip_consent: false,
+                        __buffa_unknown_fields: Default::default(),
+                    },
+                    tenant_options.clone(),
+                )
+                .await
+                .map_err(|e| format!("CreateApplication failed: {e}"))?
+                .into_owned();
+            eprintln!(
+                "[kanban-test] created app id={} tenant={} cross_tenant={}",
+                app.id, tenant_id, app.cross_tenant
+            );
 
-                app_client
-                    .rotate_secret_with_options(
-                        RotateSecretRequest {
-                            id: app.id,
-                            __buffa_unknown_fields: Default::default(),
-                        },
-                        tenant_options.clone(),
-                    )
-                    .await
-                    .map_err(|e| format!("RotateSecret failed: {e}"))
-                    .map(|r| r.into_owned())
-            }
-            .await;
-
-            match created {
-                Ok(secret) => break secret,
-                Err(e) => {
-                    let transient = e.contains("Unable to serialize access");
-                    if !transient || attempt >= 5 {
-                        return Err(e.into());
-                    }
-                    sleep(Duration::from_millis(250 * u64::from(attempt))).await;
-                }
-            }
-        };
+            app_client
+                .rotate_secret_with_options(
+                    RotateSecretRequest {
+                        id: app.id,
+                        __buffa_unknown_fields: Default::default(),
+                    },
+                    tenant_options.clone(),
+                )
+                .await
+                .map_err(|e| format!("RotateSecret failed: {e}"))
+                .map(|r| r.into_owned())
+        })
+        .await?;
 
         Ok((tenant_id, secret.client_id, secret.client_secret))
     }
@@ -1101,24 +1347,33 @@ pub(crate) mod containers {
             }))
             .map_err(|e| format!("failed to build identity schema: {e}"))?;
 
-        let result = auth
-            .identity()
-            .create_identity_schema(sdk::auth::v1::CreateIdentitySchemaRequest {
-                schema_id: "default".to_string(),
-                schema_json: buffa::MessageField::some(schema_json),
-                is_default: true,
-                ..Default::default()
-            })
-            .await;
+        // Retried (KANBAN-037): a half-warm gateway can fail the first calls
+        // transiently. The duplicate tolerance stays inside the retried
+        // closure so an `AlreadyExists` race still counts as success.
+        with_retry("register default identity schema", 3, || async {
+            let result = auth
+                .identity()
+                .create_identity_schema(sdk::auth::v1::CreateIdentitySchemaRequest {
+                    schema_id: "default".to_string(),
+                    schema_json: buffa::MessageField::some(schema_json.clone()),
+                    is_default: true,
+                    ..Default::default()
+                })
+                .await;
 
-        if let Err(e) = result {
-            let duplicate = e.code == connectrpc::ErrorCode::AlreadyExists
-                || e.to_string()
-                    .contains("tenant_identity_schemas_tenant_id_schema_id_key");
-            if !duplicate {
-                return Err(format!("CreateIdentitySchema failed: {e}").into());
+            match result {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.code == connectrpc::ErrorCode::AlreadyExists
+                        || e.to_string()
+                            .contains("tenant_identity_schemas_tenant_id_schema_id_key") =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(format!("CreateIdentitySchema failed: {e}")),
             }
-        }
+        })
+        .await?;
 
         Ok(())
     }
@@ -1160,21 +1415,26 @@ pub(crate) mod containers {
     /// The gateway's OAuth2 token endpoint expects HTTP Basic authentication
     /// (`client_secret_basic`) rather than form-encoded credentials.
     async fn fetch_bootstrap_token(sso_gateway_url: &str, scope: &str) -> reqwest::Result<String> {
-        let client = reqwest::Client::new();
-        let resp: serde_json::Value = client
-            .post(format!("{sso_gateway_url}/oauth2/token"))
-            .basic_auth(
-                "system-bootstrap-client",
-                Some(SYSTEM_BOOTSTRAP_CLIENT_SECRET),
-            )
-            .form(&[("grant_type", "client_credentials"), ("scope", scope)])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        // Retried (KANBAN-037): the token endpoint can 5xx or drop connections
+        // while Hydra warms up; token fetches are idempotent.
+        with_retry("fetch bootstrap token", 3, || async {
+            let client = reqwest::Client::new();
+            let resp: serde_json::Value = client
+                .post(format!("{sso_gateway_url}/oauth2/token"))
+                .basic_auth(
+                    "system-bootstrap-client",
+                    Some(SYSTEM_BOOTSTRAP_CLIENT_SECRET),
+                )
+                .form(&[("grant_type", "client_credentials"), ("scope", scope)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
 
-        Ok(resp["access_token"].as_str().unwrap_or("").to_string())
+            Ok(resp["access_token"].as_str().unwrap_or("").to_string())
+        })
+        .await
     }
 
     async fn connect_pool(database_url: &str) -> sqlx::PgPool {
