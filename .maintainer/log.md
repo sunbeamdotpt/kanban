@@ -501,3 +501,22 @@ dependencies". Outcomes:
   link state is a data-visibility defect with only a manual workaround);
   KANBAN-015 stays low (cross-tenant rejected by design until a use case);
   the rest were already correctly medium.
+
+2026-07-31 — **CLI-owned cards transferred; KANBAN-034 design decided.**
+KANBAN-008 and KANBAN-010 were CLI work tracked on kanban's board with no
+cli/dev equivalents; filed CLI-024 (template columns / board create
+--template/--columns) and CLI-025 (member add raw-subject passthrough +
+help text) with full server-side context, assigned to sienna, and closed
+the kanban copies as transferred. KANBAN-039 closed as transferred to
+CLI-023 (the one-line object-id header fix) with post-fix verification
+steps. *Why transfer instead of keeping dual tickets:* one canonical ticket
+per piece of work, on the board of the repo that implements it (charter
+rule 4); kanban's board only tracks kanban work.
+
+**KANBAN-034 design decision (sienna, in-session): relocate-in-place** for
+cross-project transfer — the card keeps comments/attachments/checklist/
+links/assignees/history; no recreate-and-close, no source stub. Recorded
+on the card with the implementation implications (ref re-mint under the
+target project with no alias, milestone/project-label scrub, dual-board
+authorization, no completed_at stamp, events on both boards). Priority
+bumped to high; unblocked and ready for implementation.

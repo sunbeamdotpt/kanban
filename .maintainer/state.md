@@ -47,8 +47,12 @@ timestamp: 2026-07-31T15:00:00Z
   is_done, 67 cards stamped from event_log; full trail on the card).
 - Deferred with triage comments (unchanged): KANBAN-001/004/005, KANBAN-013,
   KANBAN-015, KANBAN-019/020, KANBAN-025 (icebox).
-- Owned by the CLI repo but tracked here (no cli/dev equivalents):
-  KANBAN-008, KANBAN-010.
+- Owned by the CLI repo: transferred to cli/dev 2026-07-31 — KANBAN-008 →
+  CLI-024, KANBAN-010 → CLI-025, KANBAN-039 → CLI-023 (all closed here as
+  transferred, assigned to sienna).
+- **KANBAN-034 design decided (sienna): relocate-in-place**, card keeps all
+  attachments/history; bumped to high, unblocked, ready for implementation
+  (implications on the card).
 - All open cards assigned to sienna.
 
 ## Blocked / waiting
