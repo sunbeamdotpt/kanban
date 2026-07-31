@@ -711,9 +711,9 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
             let (prev_revision, new_revision) = revision_pair(json);
             Some(Payload::CardMoved(Box::new(CardMoved {
                 card_id,
-                from_column: json_str(json, "from_column_id"),
-                to_column: json_str(json, "column_id"),
-                to_position: json_i32(json, "position"),
+                from_column: json_str(json, "from_column"),
+                to_column: json_str(json, "to_column"),
+                to_position: json_i32(json, "to_position"),
                 prev_revision,
                 new_revision,
                 idempotency_key,
@@ -1412,11 +1412,12 @@ mod tests {
 
     #[test]
     fn build_payload_card_moved() {
+        // Keys must match the MoveCard handler's event payload (cards.rs).
         let json = serde_json::json!({
             "card_id": "card-1",
-            "from_column_id": "col-a",
-            "column_id": "col-b",
-            "position": 2,
+            "from_column": "col-a",
+            "to_column": "col-b",
+            "to_position": 2,
             "prev_revision": 7,
             "new_revision": 8,
             "idempotency_key": "idem-3"
