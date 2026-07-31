@@ -1,7 +1,7 @@
 ---
 title: "Smart Commit Integration"
 docname: draft-sunbeam-kanban-smart-commits-00
-status: Draft
+status: Planned Implementation
 category: design
 description: Forge-triggered card metadata integration — smart-commit grammar, pusher-identity authorization, processing pipeline, and time tracking for Sunbeam Kanban.
 tags:
@@ -35,8 +35,12 @@ anti-goal: commits MUST NOT alter a card's workflow position.
 
 ## Document Status
 
-This document is in **Draft** status. It has not been reviewed by the
-architecture review board and MUST NOT be treated as a final specification.
+This document is in **Planned Implementation** status. It was reviewed
+and approved on 2026-07-31 (PR #3). Implementation tickets are filed on
+the kanban project board (KANBAN-041 lineage, broken out per the rollout
+phases in Section 13) and each ticket conforms to this specification.
+Design changes discovered during implementation MUST be reflected back
+into this document before the affected ticket ships.
 
 ## Table of Contents
 
