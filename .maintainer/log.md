@@ -561,3 +561,21 @@ commits. Worked well; the file partitioning is what made it conflict-free.
 - **KANBAN-038 (agent):** env-reading test helpers in boards.rs/projects.rs
   now self-bootstrap via containers::setup(); verified `cargo test
   services::boards::tests::subscribe` standalone 7/7 (was 2/7).
+
+2026-07-31 — **Smart commit integration RFC drafted
+(docs/development/smart-commits.md, draft-sunbeam-kanban-smart-commits-00).**
+Designed interactively with sienna using the sunbeam-rfc-design skill
+(IETF structure, RFC 2119 discipline). Locked decisions: Jira-style
+command grammar (#fixes/#comment/#time/#label/#assign) but ZERO process
+actions — commits never move cards between columns/projects (explicit
+anti-goal, "breaks processes higher than commits"); any branch (no
+process actions => no default-branch gating); authority =
+GitHub-authenticated PUSHER mapped via github_identities (verified login
+trait preferred; never commit author email — spoofing defeated by
+construction); project→repo mapping capped at 50 as a project-management
+hygiene gate (also acceptance + bare-ref resolution); per-command audit
+rows, pushes never fail, summary comments list successes only; placement =
+extend the KANBAN-019 receiver with push events (no CLI hooks — sienna
+dislikes them). The #time command forces a new TimeTrackingService
+(specified in RFC section 7). Filed KANBAN-041 (phase 1, high) and
+KANBAN-042 (TimeTrackingService/phase 3, medium, depends_on 041).
