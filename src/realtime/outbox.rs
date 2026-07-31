@@ -90,6 +90,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auth::identity_client::IdentityClient;
 use crate::id::Id;
 use anyhow::{Context, Result};
 use buffa::Message;
@@ -143,6 +144,9 @@ impl Default for OutboxConfig {
 pub struct OutboxDispatcher {
     pool: PgPool,
     nats: Arc<NatsClient>,
+    /// User-directory client used to hydrate assignee emails when CardCreated
+    /// events carry a full card snapshot (KANBAN-035).
+    identity: Arc<IdentityClient>,
     /// Polling interval when no NOTIFY mechanism is wired.
     /// 250ms floor — JetStream publish round-trip is ~1–5ms so latency is
     /// dominated by the poll, not the network.
@@ -166,10 +170,16 @@ pub struct OutboxDispatcher {
 
 impl OutboxDispatcher {
     /// Construct a dispatcher with the provided configuration.
-    pub fn new(pool: PgPool, nats: Arc<NatsClient>, config: OutboxConfig) -> Self {
+    pub fn new(
+        pool: PgPool,
+        nats: Arc<NatsClient>,
+        identity: Arc<IdentityClient>,
+        config: OutboxConfig,
+    ) -> Self {
         Self {
             pool,
             nats,
+            identity,
             poll_interval: config.poll_interval,
             batch_size: config.batch_size,
             pod_name: config.pod_name,
@@ -517,8 +527,13 @@ impl OutboxDispatcher {
                 .get("card_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<Id>().ok())
-            && let Ok(card) =
-                crate::services::cards::fetch_full_card(&self.pool, card_id, tenant_id).await
+            && let Ok(card) = crate::services::cards::fetch_full_card(
+                &self.pool,
+                card_id,
+                tenant_id,
+                &self.identity,
+            )
+            .await
         {
             return Some(Payload::CardCreated(Box::new(CardCreated {
                 card: Some(card).into(),
@@ -902,8 +917,18 @@ mod tests {
         Arc::clone(&containers::setup().await.nats)
     }
 
-    fn make_dispatcher(pool: PgPool, nats: Arc<NatsClient>, board_id: Id) -> OutboxDispatcher {
-        OutboxDispatcher::new(pool, nats, OutboxConfig::default()).with_board_filter(board_id)
+    async fn make_dispatcher(
+        pool: PgPool,
+        nats: Arc<NatsClient>,
+        board_id: Id,
+    ) -> OutboxDispatcher {
+        OutboxDispatcher::new(
+            pool,
+            nats,
+            crate::test_support::setup_identity().await,
+            OutboxConfig::default(),
+        )
+        .with_board_filter(board_id)
     }
 
     /// Count event_log rows for a board where nats_seq IS NOT NULL.
@@ -984,6 +1009,7 @@ mod tests {
         }
 
         let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .await
             .with_opensearch(Arc::clone(&os), index.clone());
 
         // CardCreated → document indexed.
@@ -1041,7 +1067,7 @@ mod tests {
         let id2 = seed_event_log(&pool, board_id, "CardUpdated").await;
         let id3 = seed_event_log(&pool, board_id, "CardDeleted").await;
 
-        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id).await;
         let n = dispatcher.drain_once().await.expect("drain_once failed");
 
         assert_eq!(n, 3, "expected 3 dispatched rows");
@@ -1097,7 +1123,7 @@ mod tests {
         // Insert 1 already-dispatched row.
         let _id = seed_event_log_dispatched(&pool, board_id, "CardCreated", 42).await;
 
-        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id).await;
         let n = dispatcher.drain_once().await.expect("drain_once failed");
 
         assert_eq!(
@@ -1125,7 +1151,7 @@ mod tests {
         let (project_id, board_id, _col_id, _card_id) = seed_card_chain(&pool).await;
         let _id = seed_event_log(&pool, board_id, "CardCreated").await;
 
-        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id).await;
 
         // First call dispatches the row.
         let n1 = dispatcher
@@ -1145,7 +1171,7 @@ mod tests {
         );
 
         // Simulate restart: construct a fresh dispatcher against the same DB.
-        let dispatcher2 = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+        let dispatcher2 = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id).await;
         let n3 = dispatcher2
             .drain_once()
             .await
@@ -1180,10 +1206,14 @@ mod tests {
         }
 
         // Use batch_size=3.
-        let dispatcher =
-            OutboxDispatcher::new(pool.clone(), Arc::clone(&nats), OutboxConfig::default())
-                .with_batch_size(3)
-                .with_board_filter(board_id);
+        let dispatcher = OutboxDispatcher::new(
+            pool.clone(),
+            Arc::clone(&nats),
+            crate::test_support::setup_identity().await,
+            OutboxConfig::default(),
+        )
+        .with_batch_size(3)
+        .with_board_filter(board_id);
 
         let mut total = 0usize;
         loop {
@@ -1237,7 +1267,7 @@ mod tests {
         let (project_id, board_id, _col_id, _card_id) = seed_card_chain(&pool).await;
         seed_event_log(&pool, board_id, "CardCreated").await;
 
-        let dispatcher = make_dispatcher(pool.clone(), bad_nats, board_id);
+        let dispatcher = make_dispatcher(pool.clone(), bad_nats, board_id).await;
         let n = dispatcher
             .drain_once()
             .await
@@ -1763,7 +1793,7 @@ mod tests {
         let tenant_id = crate::test_support::test_tenant_id();
         let (project_id, board_id, col_id, card_id) = seed_card_chain(&pool).await;
 
-        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id);
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id).await;
 
         let json = serde_json::json!({
             "card_id": card_id.to_string(),
@@ -1836,7 +1866,7 @@ mod tests {
         .await
         .expect("insert project event failed");
 
-        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), project_id);
+        let dispatcher = make_dispatcher(pool.clone(), Arc::clone(&nats), project_id).await;
         let n = dispatcher.drain_once().await.expect("drain_once failed");
         assert_eq!(n, 1, "project row must be dispatched");
 
@@ -1874,6 +1904,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .await
             .with_shutdown(shutdown_rx)
             .spawn();
 
@@ -1914,6 +1945,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = make_dispatcher(pool.clone(), Arc::clone(&nats), board_id)
+            .await
             .with_poll_interval(Duration::from_secs(60))
             .with_shutdown(shutdown_rx)
             .spawn();

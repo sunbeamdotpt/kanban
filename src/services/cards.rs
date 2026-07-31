@@ -313,21 +313,41 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id, tenant_id: &str) ->
     .collect()
 }
 
-pub(crate) async fn fetch_assignees(pool: &PgPool, card_id: Id, tenant_id: &str) -> Vec<Assignee> {
-    sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 AND tenant_id = $2 ORDER BY assigned_at")
-        .bind(card_id)
-        .bind(tenant_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| Assignee {
-            subject: r.get("subject"),
+pub(crate) async fn fetch_assignees(
+    pool: &PgPool,
+    card_id: Id,
+    tenant_id: &str,
+    identity: &IdentityClient,
+) -> Vec<Assignee> {
+    let subjects: Vec<String> =
+        sqlx::query("SELECT subject FROM card_assignees WHERE card_id = $1 AND tenant_id = $2 ORDER BY assigned_at")
+            .bind(card_id)
+            .bind(tenant_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.get("subject"))
+            .collect();
+
+    let mut assignees = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        // Best-effort read-time hydration (KANBAN-035): clients fall back to
+        // email when display_name is empty; the directory lookup is cached
+        // and never fails the card read.
+        let email = identity
+            .resolve_email(tenant_id, &subject)
+            .await
+            .unwrap_or_default();
+        assignees.push(Assignee {
+            subject,
             display_name: String::new(),
             avatar_url: String::new(),
+            email,
             ..Default::default()
-        })
-        .collect()
+        });
+    }
+    assignees
 }
 
 pub(crate) async fn fetch_checklist(
@@ -422,6 +442,7 @@ pub(crate) async fn fetch_full_card(
     pool: &PgPool,
     card_id: Id,
     tenant_id: &str,
+    identity: &IdentityClient,
 ) -> Result<Card, ConnectError> {
     let row = sqlx::query(
         "SELECT id, project_id, board_id, column_id, ref, title, description, \
@@ -437,7 +458,7 @@ pub(crate) async fn fetch_full_card(
     .ok_or_else(|| ConnectError::not_found("card not found"))?;
 
     let labels = fetch_labels(pool, card_id, tenant_id).await;
-    let assignees = fetch_assignees(pool, card_id, tenant_id).await;
+    let assignees = fetch_assignees(pool, card_id, tenant_id, identity).await;
     let checklist = fetch_checklist(pool, card_id, tenant_id).await;
     let comments_count = fetch_comments_count(pool, card_id, tenant_id).await;
     let attachments_count = fetch_attachments_count(pool, card_id, tenant_id).await;
@@ -584,7 +605,7 @@ impl CardService for CardServiceImpl {
             .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
 
         let tenant_id = tenant_id_from_request(&ctx)?;
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(GetCardResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -643,7 +664,7 @@ impl CardService for CardServiceImpl {
         for row in &rows {
             let cid: Id = row.get("id");
             let labels = fetch_labels(&self.pool, cid, &tenant_id).await;
-            let assignees = fetch_assignees(&self.pool, cid, &tenant_id).await;
+            let assignees = fetch_assignees(&self.pool, cid, &tenant_id, &self.identity).await;
             let checklist = fetch_checklist(&self.pool, cid, &tenant_id).await;
             let comments_count = fetch_comments_count(&self.pool, cid, &tenant_id).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid, &tenant_id).await;
@@ -802,7 +823,7 @@ impl CardService for CardServiceImpl {
         for row in rows {
             let cid: Id = row.get("id");
             let labels = fetch_labels(&self.pool, cid, &tenant_id).await;
-            let assignees = fetch_assignees(&self.pool, cid, &tenant_id).await;
+            let assignees = fetch_assignees(&self.pool, cid, &tenant_id, &self.identity).await;
             let checklist = fetch_checklist(&self.pool, cid, &tenant_id).await;
             let comments_count = fetch_comments_count(&self.pool, cid, &tenant_id).await;
             let attachments_count = fetch_attachments_count(&self.pool, cid, &tenant_id).await;
@@ -857,7 +878,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) =
             check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
         {
-            return fetch_full_card(&self.pool, existing_id, &tenant_id)
+            return fetch_full_card(&self.pool, existing_id, &tenant_id, &self.identity)
                 .await
                 .map(|card| {
                     Response::new(CreateCardResponse {
@@ -1040,7 +1061,7 @@ impl CardService for CardServiceImpl {
         // Store idempotency.
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(CreateCardResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -1074,7 +1095,7 @@ impl CardService for CardServiceImpl {
         if let Some(_existing) =
             check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
         {
-            return fetch_full_card(&self.pool, card_id, &tenant_id)
+            return fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
                 .await
                 .map(|card| {
                     Response::new(UpdateCardResponse {
@@ -1229,7 +1250,7 @@ impl CardService for CardServiceImpl {
 
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(UpdateCardResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -1265,7 +1286,7 @@ impl CardService for CardServiceImpl {
             .await?
             .is_some()
         {
-            return fetch_full_card(&self.pool, card_id, &tenant_id)
+            return fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
                 .await
                 .map(|card| {
                     Response::new(MoveCardResponse {
@@ -1482,7 +1503,7 @@ impl CardService for CardServiceImpl {
 
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(MoveCardResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -1611,7 +1632,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) =
             check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
         {
-            return fetch_full_card(&self.pool, existing_id, &tenant_id)
+            return fetch_full_card(&self.pool, existing_id, &tenant_id, &self.identity)
                 .await
                 .map(|card| {
                     Response::new(AddCardDependencyResponse {
@@ -1731,7 +1752,7 @@ impl CardService for CardServiceImpl {
 
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(AddCardDependencyResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -1777,7 +1798,7 @@ impl CardService for CardServiceImpl {
         if let Some(existing_id) =
             check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key).await?
         {
-            return fetch_full_card(&self.pool, existing_id, &tenant_id)
+            return fetch_full_card(&self.pool, existing_id, &tenant_id, &self.identity)
                 .await
                 .map(|card| {
                     Response::new(RemoveCardDependencyResponse {
@@ -1904,7 +1925,7 @@ impl CardService for CardServiceImpl {
 
         store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
 
-        let card = fetch_full_card(&self.pool, card_id, &tenant_id).await?;
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(RemoveCardDependencyResponse {
             card: Some(card).into(),
             ..Default::default()
@@ -1958,7 +1979,7 @@ impl CardService for CardServiceImpl {
             // Re-fetch all cards and return.
             let mut cards = vec![];
             for &cid in &card_ids {
-                if let Ok(c) = fetch_full_card(&self.pool, cid, &tenant_id).await {
+                if let Ok(c) = fetch_full_card(&self.pool, cid, &tenant_id, &self.identity).await {
                     cards.push(c);
                 }
             }
@@ -2049,7 +2070,7 @@ impl CardService for CardServiceImpl {
 
         let mut cards = vec![];
         for cid in updated_card_ids {
-            cards.push(fetch_full_card(&self.pool, cid, &tenant_id).await?);
+            cards.push(fetch_full_card(&self.pool, cid, &tenant_id, &self.identity).await?);
         }
 
         Ok(Response::new(BulkUpdateCardLabelsResponse {
@@ -2141,7 +2162,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id, &tenant_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
             .await
             .map(|card| {
                 Response::new(AssignCardResponse {
@@ -2229,7 +2250,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id, &tenant_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
             .await
             .map(|card| {
                 Response::new(UnassignCardResponse {
@@ -2345,7 +2366,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id, &tenant_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
             .await
             .map(|card| {
                 Response::new(AddChecklistItemResponse {
@@ -2443,7 +2464,7 @@ impl CardService for CardServiceImpl {
             .await
             .map_err(|e| internal("commit failed", e))?;
 
-        fetch_full_card(&self.pool, card_id, &tenant_id)
+        fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity)
             .await
             .map(|card| {
                 Response::new(UpdateChecklistItemResponse {
@@ -3845,7 +3866,8 @@ mod tests {
         .await
         .expect("assign 2 failed");
 
-        let c = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id)
+        let identity = crate::test_support::setup_identity().await;
+        let c = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id, &identity)
             .await
             .unwrap();
         assert_eq!(c.assignees.len(), 1, "duplicate assign must be idempotent");
@@ -3898,7 +3920,8 @@ mod tests {
             .expect("add checklist failed");
         }
 
-        let updated = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id)
+        let identity = crate::test_support::setup_identity().await;
+        let updated = fetch_full_card(&pool, card.id.parse::<Id>().unwrap(), &tenant_id, &identity)
             .await
             .unwrap();
         assert_eq!(updated.checklist.len(), 3);
@@ -4505,6 +4528,104 @@ mod tests {
             card.assignees[0].subject, canonical,
             "email input must resolve to the canonical user:<ulid> subject"
         );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// KANBAN-035: assignee email is hydrated read-time from the user
+    /// directory on both the mutation response and a fresh GetCard.
+    #[tokio::test]
+    async fn get_card_hydrates_assignee_email() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "AHY").await;
+        let (canonical, email) = seed_identity("hydrate").await;
+
+        let card = svc
+            .assign_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&AssignCardRequest {
+                    card_id: card_id.clone(),
+                    subject: canonical.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("assign failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(card.assignees.len(), 1);
+        assert_eq!(
+            card.assignees[0].email, email,
+            "assign response must carry the directory email"
+        );
+
+        let fetched = svc
+            .get_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&GetCardRequest {
+                    card_id: card_id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get_card failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(fetched.assignees.len(), 1);
+        assert_eq!(fetched.assignees[0].subject, canonical);
+        assert_eq!(
+            fetched.assignees[0].email, email,
+            "GetCard must hydrate the assignee email from the directory"
+        );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    /// Subjects with no directory identity (legacy rows) keep an empty email
+    /// instead of failing the card read.
+    #[tokio::test]
+    async fn get_card_tolerates_assignee_without_directory_identity() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "ALG").await;
+        let ghost = canonical_subject(&Id::new().to_string());
+        sqlx::query("INSERT INTO card_assignees (card_id, tenant_id, subject) VALUES ($1, $2, $3)")
+            .bind(card_id.parse::<Id>().unwrap())
+            .bind(crate::test_support::test_tenant_id())
+            .bind(&ghost)
+            .execute(&pool)
+            .await
+            .expect("seed legacy assignee failed");
+
+        let fetched = svc
+            .get_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&GetCardRequest {
+                    card_id: card_id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get_card must not fail on a directory-less assignee")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(fetched.assignees.len(), 1);
+        assert_eq!(fetched.assignees[0].subject, ghost);
+        assert_eq!(fetched.assignees[0].email, "");
 
         cleanup_project(&pool, pid).await;
     }

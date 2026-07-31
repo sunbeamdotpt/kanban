@@ -34,6 +34,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tracing::{error, warn};
 
+use crate::auth::identity_client::IdentityClient;
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
@@ -66,6 +67,7 @@ const MAX_PROJECTS: usize = 10_000;
 pub struct ProjectServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
+    pub identity: Arc<IdentityClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub heartbeat_interval: Duration,
     pub permission_recheck_interval: Duration,
@@ -868,6 +870,7 @@ impl ProjectService for ProjectServiceImpl {
             match build_subscribe_board_stream(SubscribeBoardArgs {
                 registry: Arc::clone(&self.registry),
                 permission: Arc::clone(&permission),
+                identity: Arc::clone(&self.identity),
                 auth: auth.clone(),
                 board_id: board_id_str.clone(),
                 is_private: !is_public_or_internal(&visibility),
@@ -1099,6 +1102,7 @@ mod tests {
         ProjectServiceImpl {
             pool,
             permission,
+            identity: crate::test_support::setup_identity().await,
             registry,
             heartbeat_interval: Duration::from_millis(500),
             permission_recheck_interval: Duration::from_millis(30_000),
@@ -2281,6 +2285,7 @@ mod tests {
             let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
                 pool.clone(),
                 Arc::clone(&nats),
+                crate::test_support::setup_identity().await,
                 crate::realtime::outbox::OutboxConfig::default(),
             )
             .with_board_filter(board);
@@ -2310,6 +2315,7 @@ mod tests {
         let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
             pool.clone(),
             Arc::clone(&nats),
+            crate::test_support::setup_identity().await,
             crate::realtime::outbox::OutboxConfig::default(),
         )
         .with_board_filter(project_id);

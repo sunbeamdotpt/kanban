@@ -652,6 +652,21 @@ pub async fn run_with_config(
         config.opensearch_url
     );
 
+    // ── 4c2. Identity client for user-directory lookups (assignee validation
+    // and email hydration). Built before the outbox dispatcher, which hydrates
+    // full cards for CardCreated events. ────────────────────────────────────
+    let identity = Arc::new(
+        IdentityClient::new(&IdentityClientConfig {
+            base_url: config.sso_gateway_url.clone(),
+            token_url: config.sso_gateway_token_url.clone(),
+            client_id: config.sso_gateway_client_id.clone(),
+            client_secret: config.sso_gateway_client_secret.clone(),
+        })
+        .context("failed to build identity client")?,
+    );
+
+    info!("Identity client initialised");
+
     // ── 4d. Outbox dispatcher (event_log → JetStream) ──────────────────────
     // Drains undispatched event_log rows to NATS JetStream. The shutdown
     // watch flips when the serve future resolves (SIGTERM/SIGINT), giving the
@@ -660,6 +675,7 @@ pub async fn run_with_config(
     let outbox_handle = crate::realtime::outbox::OutboxDispatcher::new(
         pg_pool.clone(),
         Arc::clone(&nats),
+        Arc::clone(&identity),
         crate::realtime::outbox::OutboxConfig {
             poll_interval: Duration::from_millis(config.outbox_poll_interval_ms),
             batch_size: config.outbox_batch_size,
@@ -693,19 +709,6 @@ pub async fn run_with_config(
     );
 
     info!("Permission client initialised");
-
-    // ── 5b. Identity client for user-directory lookups (assignee validation) ─
-    let identity = Arc::new(
-        IdentityClient::new(&IdentityClientConfig {
-            base_url: config.sso_gateway_url.clone(),
-            token_url: config.sso_gateway_token_url.clone(),
-            client_id: config.sso_gateway_client_id.clone(),
-            client_secret: config.sso_gateway_client_secret.clone(),
-        })
-        .context("failed to build identity client")?,
-    );
-
-    info!("Identity client initialised");
 
     // ── 7. Prometheus metrics ───────────────────────────────────────────────
     let metrics = Arc::new(
@@ -742,6 +745,7 @@ pub async fn run_with_config(
     let connect_router = Arc::new(BoardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
+        identity: Arc::clone(&identity),
         registry: Arc::clone(&board_registry),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
         permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
@@ -764,6 +768,7 @@ pub async fn run_with_config(
     let connect_router = Arc::new(AggregatedBoardServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
+        identity: Arc::clone(&identity),
         registry: Arc::clone(&board_registry),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
         permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),
@@ -773,6 +778,7 @@ pub async fn run_with_config(
     let connect_router = Arc::new(ProjectServiceImpl {
         pool: pg_pool.clone(),
         permission: Arc::clone(&permission),
+        identity: Arc::clone(&identity),
         registry: Arc::clone(&board_registry),
         heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
         permission_recheck_interval: Duration::from_millis(config.permission_recheck_interval_ms),

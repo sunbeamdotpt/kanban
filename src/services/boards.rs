@@ -29,6 +29,7 @@ use sqlx::Row;
 use tokio::sync::broadcast;
 use tracing::{error, warn};
 
+use crate::auth::identity_client::IdentityClient;
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
@@ -58,6 +59,7 @@ const PERMISSION_TYPE_BOARD: &str = "KanbanBoard";
 pub struct BoardServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
+    pub identity: Arc<IdentityClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub heartbeat_interval: Duration,
     pub permission_recheck_interval: Duration,
@@ -382,6 +384,7 @@ pub(crate) async fn revalidate_permission(
 pub struct SubscribeBoardArgs {
     pub registry: Arc<BoardSubscriberRegistry>,
     pub permission: Arc<PermissionClient>,
+    pub identity: Arc<IdentityClient>,
     pub auth: AuthContext,
     pub board_id: String,
     pub is_private: bool,
@@ -423,6 +426,7 @@ async fn read_board_snapshot(
     pool: &PgPool,
     tenant_id: &str,
     board_id: &str,
+    identity: &IdentityClient,
 ) -> Result<(Vec<Column>, Vec<crate::cpb::sunbeam::kanban::v1::Card>, u64), ConnectError> {
     let last_replay: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(nats_seq), 0) FROM event_log WHERE board_id = $1 AND tenant_id = $2",
@@ -460,7 +464,7 @@ async fn read_board_snapshot(
         .map_err(|e| internal("failed to fetch cards for snapshot", e))?;
         for row in &card_rows {
             let id: Id = row.get("id");
-            let card = fetch_full_card(pool, id, tenant_id).await?;
+            let card = fetch_full_card(pool, id, tenant_id, identity).await?;
             cards.push(card);
         }
     }
@@ -491,6 +495,7 @@ pub async fn build_subscribe_board_stream(
     let SubscribeBoardArgs {
         registry,
         permission,
+        identity,
         auth,
         board_id,
         is_private,
@@ -519,7 +524,7 @@ pub async fn build_subscribe_board_stream(
 
         // ── Step 2: snapshot replay (fresh) or direct cutover (resume) ───────
         let cutover_seq = if since_seq == 0 {
-            match read_board_snapshot(&pool, &tenant_id, &board_id).await {
+            match read_board_snapshot(&pool, &tenant_id, &board_id, &identity).await {
                 Ok((columns, cards, last_replay)) => {
                     for col in &columns {
                         let envelope = snapshot_envelope(
@@ -1656,6 +1661,7 @@ impl BoardService for BoardServiceImpl {
         let stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry: Arc::clone(&self.registry),
             permission,
+            identity: Arc::clone(&self.identity),
             auth,
             board_id,
             is_private,
@@ -1722,6 +1728,10 @@ mod tests {
         crate::test_support::setup_permission().await
     }
 
+    async fn identity_client() -> Arc<IdentityClient> {
+        crate::test_support::setup_identity().await
+    }
+
     async fn make_registry(nats: Arc<NatsClient>) -> Arc<BoardSubscriberRegistry> {
         Arc::new(BoardSubscriberRegistry::new(nats, "pod-test-boards"))
     }
@@ -1749,6 +1759,7 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission: Arc::clone(&permission),
+            identity: identity_client().await,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1818,6 +1829,7 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission: Arc::clone(&permission),
+            identity: identity_client().await,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1916,6 +1928,7 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission: Arc::clone(&permission),
+            identity: identity_client().await,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -1996,6 +2009,7 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission: Arc::clone(&permission),
+            identity: identity_client().await,
             auth,
             board_id: board_id.clone(),
             is_private: true,
@@ -2077,6 +2091,7 @@ mod tests {
         BoardServiceImpl {
             pool,
             permission,
+            identity: crate::test_support::setup_identity().await,
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
             permission_recheck_interval: Duration::from_millis(30_000),
@@ -3556,6 +3571,7 @@ mod tests {
         let mut stream = build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission: Arc::clone(&permission),
+            identity: identity_client().await,
             auth,
             board_id: board_id.clone(),
             is_private: false,
@@ -3607,6 +3623,7 @@ mod tests {
         build_subscribe_board_stream(SubscribeBoardArgs {
             registry,
             permission,
+            identity: identity_client().await,
             auth: make_auth(subject),
             board_id: board_id.to_string(),
             is_private: false,
@@ -3771,6 +3788,7 @@ mod tests {
         let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
             pool.clone(),
             Arc::clone(&nats),
+            crate::test_support::setup_identity().await,
             crate::realtime::outbox::OutboxConfig::default(),
         )
         .with_board_filter(board_id);
@@ -3858,6 +3876,7 @@ mod tests {
         let dispatcher = crate::realtime::outbox::OutboxDispatcher::new(
             pool.clone(),
             nats,
+            crate::test_support::setup_identity().await,
             crate::realtime::outbox::OutboxConfig::default(),
         )
         .with_board_filter(object_id);

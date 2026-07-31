@@ -21,6 +21,7 @@ use connectrpc::{
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{error, warn};
 
+use crate::auth::identity_client::IdentityClient;
 use crate::auth::permission_client::PermissionClient;
 use sunbeam_g2v::middleware::auth::AuthContext;
 
@@ -59,6 +60,7 @@ const CARD_BATCH_SIZE: usize = 100;
 pub struct AggregatedBoardServiceImpl {
     pub pool: PgPool,
     pub permission: Arc<PermissionClient>,
+    pub identity: Arc<IdentityClient>,
     pub registry: Arc<BoardSubscriberRegistry>,
     pub heartbeat_interval: Duration,
     pub permission_recheck_interval: Duration,
@@ -282,6 +284,7 @@ async fn fetch_cards_for_boards(
     board_ids: &[Id],
     visible_board_ids: &[Id],
     tenant_id: &str,
+    identity: &IdentityClient,
 ) -> Result<Vec<Card>, ConnectError> {
     if board_ids.is_empty() {
         return Ok(vec![]);
@@ -312,7 +315,7 @@ async fn fetch_cards_for_boards(
         }
 
         let labels = fetch_labels(pool, card_id, tenant_id).await;
-        let assignees = fetch_assignees(pool, card_id, tenant_id).await;
+        let assignees = fetch_assignees(pool, card_id, tenant_id, identity).await;
         let checklist = fetch_checklist(pool, card_id, tenant_id).await;
         let comments_count = fetch_comments_count(pool, card_id, tenant_id).await;
         let attachments_count = fetch_attachments_count(pool, card_id, tenant_id).await;
@@ -612,8 +615,14 @@ impl AggregatedBoardService for AggregatedBoardServiceImpl {
 
         let visible_board_ids: Vec<Id> = allowed_source_ids.iter().copied().collect();
 
-        let cards =
-            fetch_cards_for_boards(&self.pool, &board_ids, &visible_board_ids, &tenant_id).await?;
+        let cards = fetch_cards_for_boards(
+            &self.pool,
+            &board_ids,
+            &visible_board_ids,
+            &tenant_id,
+            &self.identity,
+        )
+        .await?;
 
         let mut chunks: Vec<AggregatedBoardChunk> = Vec::new();
         chunks.push(AggregatedBoardChunk {
@@ -1344,6 +1353,7 @@ mod tests {
         AggregatedBoardServiceImpl {
             pool: infra.pool.clone(),
             permission: Arc::clone(&infra.permission),
+            identity: Arc::clone(&infra.identity),
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
             permission_recheck_interval: Duration::from_millis(30_000),
@@ -1359,6 +1369,7 @@ mod tests {
         BoardServiceImpl {
             pool: infra.pool.clone(),
             permission: Arc::clone(&infra.permission),
+            identity: Arc::clone(&infra.identity),
             registry,
             heartbeat_interval: Duration::from_millis(15_000),
             permission_recheck_interval: Duration::from_millis(30_000),

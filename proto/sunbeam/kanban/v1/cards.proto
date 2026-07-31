@@ -57,6 +57,9 @@ message Assignee {
   string subject = 1;       // OIDC sub.
   string display_name = 2;  // optional cache; may be empty.
   string avatar_url = 3;    // optional cache; may be empty.
+  // Directory email, resolved read-time from the tenant's user directory;
+  // empty when the subject has no directory identity.
+  string email = 4;
 }
 
 // GitHubLink lives in github.proto (Stage 1c) — imported above.
