@@ -43,7 +43,10 @@ timestamp: 2026-07-31T15:00:00Z
   implemented (test-covered since v2026.07.3); KANBAN-039 root-caused to a
   CLI header bug → CLI-023 (high), depends_on set; KANBAN-021 marked
   blocked (product decision pending); KANBAN-024 narrowed to
-  display_name/avatar after 035 shipped the email tier; KANBAN-008/010
+  display_name/avatar after 035 shipped the email tier, then BLOCKED
+  upstream: the Kratos identity schema allows only traits.email, so
+  SSO-028 (display-name trait) was filed and set as a dependency;
+  KANBAN-008/010
   confirmed canonical (no cli/dev equivalents). Priorities reviewed; only
   pre-existing sane values kept.
 - In review: KANBAN-031 (blocked on **G2V-001**), KANBAN-033, KANBAN-035.
