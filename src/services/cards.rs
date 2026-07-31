@@ -335,18 +335,18 @@ pub(crate) async fn fetch_assignees(
 
     let mut assignees = Vec::with_capacity(subjects.len());
     for subject in subjects {
-        // Best-effort read-time hydration (KANBAN-035): clients fall back to
-        // email when display_name is empty; the directory lookup is cached
-        // and never fails the card read.
-        let email = identity
-            .resolve_email(tenant_id, &subject)
-            .await
-            .unwrap_or_default();
+        // Best-effort read-time hydration (KANBAN-035/024): clients fall
+        // back display_name → email → subject; the directory lookup is
+        // cached and never fails the card read.
+        let profile = identity.resolve_profile(tenant_id, &subject).await;
         assignees.push(Assignee {
             subject,
-            display_name: String::new(),
+            display_name: profile
+                .as_ref()
+                .map(|p| p.display_name.clone())
+                .unwrap_or_default(),
             avatar_url: String::new(),
-            email,
+            email: profile.map(|p| p.email).unwrap_or_default(),
             ..Default::default()
         });
     }
@@ -1629,15 +1629,14 @@ impl CardService for CardServiceImpl {
 
         // Target column must belong to the target board; fetch its done
         // marker, and the source column's, for the completed_at rule.
-        let target_col_row = sqlx::query(
-            "SELECT board_id, is_done FROM columns WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(target_col_id)
-        .bind(&tenant_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal("failed to fetch target column", e))?
-        .ok_or_else(|| ConnectError::not_found("target column not found"))?;
+        let target_col_row =
+            sqlx::query("SELECT board_id, is_done FROM columns WHERE id = $1 AND tenant_id = $2")
+                .bind(target_col_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch target column", e))?
+                .ok_or_else(|| ConnectError::not_found("target column not found"))?;
 
         let target_col_board: Id = target_col_row.get("board_id");
         if target_col_board != target_board_id {
@@ -4917,6 +4916,65 @@ mod tests {
         cleanup_project(&pool, pid).await;
     }
 
+    /// KANBAN-024: display_name hydrates from the identity's
+    /// given_name/family_name traits (deployed `employee` schema).
+    #[tokio::test]
+    async fn get_card_hydrates_assignee_display_name() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+
+        let (subject, card_id, pid) = scaffold_card(&svc, &pool, "ADN").await;
+        let infra = crate::test_support::containers::setup().await;
+        let email = format!(
+            "ada-{}@kanban-test.example",
+            Id::new().to_string().to_lowercase()
+        );
+        let identity_id = crate::test_support::containers::create_identity_named(
+            &infra.sso_gateway_url,
+            &crate::test_support::test_tenant_id(),
+            &email,
+            "Ada",
+            "Lovelace",
+        )
+        .await
+        .expect("create named identity failed");
+        let canonical = canonical_subject(&identity_id);
+
+        svc.assign_card(
+            authed_ctx_with_object(&subject, &card_id),
+            connect_request(&AssignCardRequest {
+                card_id: card_id.clone(),
+                subject: canonical.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("assign failed");
+
+        let fetched = svc
+            .get_card(
+                authed_ctx_with_object(&subject, &card_id),
+                connect_request(&GetCardRequest {
+                    card_id: card_id.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("get_card failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        assert_eq!(fetched.assignees.len(), 1);
+        assert_eq!(fetched.assignees[0].subject, canonical);
+        assert_eq!(fetched.assignees[0].display_name, "Ada Lovelace");
+        assert_eq!(fetched.assignees[0].email, email);
+
+        cleanup_project(&pool, pid).await;
+    }
+
     #[tokio::test]
     async fn assign_card_rejects_malformed_subject() {
         let pool = setup_pool().await;
@@ -6688,7 +6746,9 @@ mod tests {
             .grant_with_retry("KanbanBoard", &tgt_board.to_string(), "editor", &owner)
             .await
             .expect("grant target board editor failed");
-        (owner, src_pid, src_board, src_col, tgt_pid, tgt_board, tgt_col)
+        (
+            owner, src_pid, src_board, src_col, tgt_pid, tgt_board, tgt_col,
+        )
     }
 
     #[tokio::test]
@@ -6783,10 +6843,7 @@ mod tests {
             moved.r#ref
         );
         assert!(moved.milestone_id.is_empty(), "milestone is scrubbed");
-        assert_eq!(
-            moved.comments_count, 1,
-            "comments survive the transfer"
-        );
+        assert_eq!(moved.comments_count, 1, "comments survive the transfer");
         assert_eq!(
             moved.labels.len(),
             1,

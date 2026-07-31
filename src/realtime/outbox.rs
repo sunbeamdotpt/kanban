@@ -110,10 +110,10 @@ use super::jetstream_bootstrap::{board_subject, project_subject};
 use crate::cpb::sunbeam::kanban::v1::{
     AggregatedBoardCreated, AggregatedBoardDeleted, AggregatedBoardUpdated, BoardCreated,
     BoardDeleted, BoardEventEnvelope, BoardRenamed, BoardUpdated, CardCreated, CardDeleted,
-    CardMoved, CardUpdated, ColumnAdded, ColumnRemoved, ColumnRenamed, ColumnUpdated,
-    ColumnsReordered, EventBoard, EventColumn, GitHubLinkAdded, GitHubLinkRefreshed, MemberAdded,
-    MemberRemoved, MemberRoleChanged, MembershipChanged, ProjectUpdated, SourceBoardAdded,
-    SourceBoardRemoved, CardTransferred, board_event_envelope::Payload,
+    CardMoved, CardTransferred, CardUpdated, ColumnAdded, ColumnRemoved, ColumnRenamed,
+    ColumnUpdated, ColumnsReordered, EventBoard, EventColumn, GitHubLinkAdded, GitHubLinkRefreshed,
+    MemberAdded, MemberRemoved, MemberRoleChanged, MembershipChanged, ProjectUpdated,
+    SourceBoardAdded, SourceBoardRemoved, board_event_envelope::Payload,
 };
 use crate::event_log::EVENT_LOG_NOTIFY_CHANNEL;
 use crate::integrations::opensearch::OpenSearchClient;

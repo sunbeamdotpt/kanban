@@ -1338,7 +1338,12 @@ pub(crate) mod containers {
                                     "recovery": { "via": "email" },
                                     "verification": { "via": "email" }
                                 }
-                            }
+                            },
+                            // Optional name traits, mirroring the deployed
+                            // `employee` schema so display-name hydration
+                            // (KANBAN-024) is testable.
+                            "given_name": { "type": "string" },
+                            "family_name": { "type": "string" }
                         },
                         "required": ["email"],
                         "additionalProperties": false
@@ -1393,6 +1398,41 @@ pub(crate) mod containers {
         let traits: buffa_types::google::protobuf::Struct =
             serde_json::from_value(serde_json::json!({ "email": email }))
                 .map_err(|e| format!("failed to build identity traits: {e}"))?;
+
+        let identity = auth
+            .identity()
+            .create_identity(sdk::auth::v1::CreateIdentityRequest {
+                schema_id: String::new(),
+                traits: buffa::MessageField::some(traits),
+                password: String::new(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("CreateIdentity failed: {e}"))?
+            .into_owned();
+
+        Ok(identity.id)
+    }
+
+    /// Register an identity with email and name traits (mirroring the
+    /// deployed `employee` schema) and return its gateway identity ULID.
+    pub async fn create_identity_named(
+        sso_gateway_url: &str,
+        tenant_id: &str,
+        email: &str,
+        given_name: &str,
+        family_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        ensure_default_identity_schema(sso_gateway_url, tenant_id).await?;
+        let auth = identity_admin_client(sso_gateway_url, tenant_id).await?;
+
+        let traits: buffa_types::google::protobuf::Struct =
+            serde_json::from_value(serde_json::json!({
+                "email": email,
+                "given_name": given_name,
+                "family_name": family_name,
+            }))
+            .map_err(|e| format!("failed to build identity traits: {e}"))?;
 
         let identity = auth
             .identity()

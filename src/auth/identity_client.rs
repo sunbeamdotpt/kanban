@@ -10,6 +10,25 @@
 //! The gateway has no lookup-by-email RPC (`ListIdentities` ignores filters),
 //! so email resolution pages the tenant directory and matches `traits.email`
 //! client-side — the same approach the CLI uses.
+//!
+//! # Identity traits contract
+//!
+//! Hydration reads these traits from the identity's traits document (see
+//! `.maintainer/interfaces.md` for the authoritative contract):
+//!
+//! | Trait         | Used for       | Schema                              |
+//! |---------------|----------------|-------------------------------------|
+//! | `email`       | `Assignee.email`, email resolution | required everywhere |
+//! | `given_name`  | `Assignee.display_name` (first part) | deployed `employee` schema |
+//! | `family_name` | `Assignee.display_name` (last part)  | deployed `employee` schema |
+//!
+//! Display name is `"given_name family_name"`, falling back to whichever
+//! part is present. **Do not trust the schema file vendored in the
+//! sso-gateway repo** (`deploy/kratos-identity.schema.json`) — it lags the
+//! deployed schemas (it documents an email-only base schema while
+//! production uses `employee` with name traits). Check the live directory
+//! (`sunbeam user get <email>`) when in doubt. There is no avatar trait
+//! anywhere yet (SSO-028).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,10 +47,10 @@ const IDENTITY_SCOPE: &str = "identity:read";
 /// Directory page size for email scans (gateway maximum).
 const DIRECTORY_PAGE_SIZE: u32 = 200;
 
-/// How long a resolved subject→email mapping is trusted. Emails change
+/// How long a resolved subject→profile mapping is trusted. Profiles change
 /// rarely and every card read hydrates assignees, so without a cache list
 /// endpoints would hammer the gateway directory (KANBAN-035).
-const EMAIL_CACHE_TTL: Duration = Duration::from_secs(300);
+const PROFILE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Configuration for building an [`IdentityClient`].
 #[derive(Clone, Debug)]
@@ -60,14 +79,24 @@ pub enum ResolveError {
     Backend(String),
 }
 
-/// (tenant_id, subject) → (email, resolved_at) cache for `resolve_email`.
-type EmailCache = Arc<Mutex<HashMap<(String, String), (String, Instant)>>>;
+/// Best-effort directory profile for an assignee: display name and email.
+/// Either field may be empty when the identity lacks the trait.
+#[derive(Clone, Debug, Default)]
+pub struct AssigneeProfile {
+    /// `"given_name family_name"` from the identity traits; empty when unset.
+    pub display_name: String,
+    /// `email` trait; empty when unset.
+    pub email: String,
+}
+
+/// (tenant_id, subject) → (profile, resolved_at) cache for `resolve_profile`.
+type ProfileCache = Arc<Mutex<HashMap<(String, String), (AssigneeProfile, Instant)>>>;
 
 /// Wrapper around the SDK [`AuthClient`] scoped to the identity surface.
 #[derive(Clone)]
 pub struct IdentityClient {
     auth: AuthClient,
-    email_cache: EmailCache,
+    profile_cache: ProfileCache,
 }
 
 /// Format an sso-gateway identity ULID as the canonical Kanban assignee
@@ -84,6 +113,29 @@ fn identity_email(identity: &Identity) -> String {
         .and_then(|t| serde_json::to_value(t).ok())
         .and_then(|v| v.get("email").and_then(|e| e.as_str()).map(str::to_owned))
         .unwrap_or_default()
+}
+
+/// Extract a display name from an identity's traits document:
+/// `"given_name family_name"` (deployed `employee` schema), falling back to
+/// whichever part is present. Empty when neither trait is set.
+fn identity_display_name(identity: &Identity) -> String {
+    let traits = identity
+        .traits
+        .as_option()
+        .and_then(|t| serde_json::to_value(t).ok());
+    let part = |key: &str| {
+        traits
+            .as_ref()
+            .and_then(|v| v.get(key).and_then(|s| s.as_str()))
+            .unwrap_or("")
+    };
+    let (given, family) = (part("given_name"), part("family_name"));
+    match (given.is_empty(), family.is_empty()) {
+        (false, false) => format!("{given} {family}"),
+        (false, true) => given.to_string(),
+        (true, false) => family.to_string(),
+        (true, true) => String::new(),
+    }
 }
 
 impl IdentityClient {
@@ -108,52 +160,55 @@ impl IdentityClient {
 
         Ok(Self {
             auth: AuthClient::new(client, base_uri).context("invalid identity service base URL")?,
-            email_cache: Arc::new(Mutex::new(HashMap::new())),
+            profile_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Resolve the directory email for a canonical assignee subject
-    /// (`user:<ulid>`), best-effort.
+    /// Resolve the directory profile (display name + email) for a canonical
+    /// assignee subject (`user:<ulid>`), best-effort.
     ///
     /// Returns `None` for non-canonical subjects (legacy rows), unknown
     /// identities, and backend errors — assignee hydration must never fail a
-    /// card read. Fresh results are cached for [`EMAIL_CACHE_TTL`].
-    pub async fn resolve_email(&self, tenant_id: &str, subject: &str) -> Option<String> {
+    /// card read. Fresh results are cached for [`PROFILE_CACHE_TTL`].
+    pub async fn resolve_profile(&self, tenant_id: &str, subject: &str) -> Option<AssigneeProfile> {
         let key = (tenant_id.to_string(), subject.to_string());
-        if let Ok(cache) = self.email_cache.lock()
-            && let Some((email, at)) = cache.get(&key)
-            && at.elapsed() < EMAIL_CACHE_TTL
+        if let Ok(cache) = self.profile_cache.lock()
+            && let Some((profile, at)) = cache.get(&key)
+            && at.elapsed() < PROFILE_CACHE_TTL
         {
-            return Some(email.clone());
+            return Some(profile.clone());
         }
 
         let id = subject.strip_prefix("user:")?;
         if !Id::is_ulid(id) {
             return None;
         }
-        let email = match self.get_identity(tenant_id, id).await {
+        let profile = match self.get_identity(tenant_id, id).await {
             Ok(Some(identity)) => {
-                let email = identity_email(&identity);
-                if email.is_empty() {
+                let profile = AssigneeProfile {
+                    display_name: identity_display_name(&identity),
+                    email: identity_email(&identity),
+                };
+                if profile.display_name.is_empty() && profile.email.is_empty() {
                     return None;
                 }
-                email
+                profile
             }
             Ok(None) => return None,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     subject,
-                    "assignee email hydration failed; returning empty email"
+                    "assignee profile hydration failed; returning empty hints"
                 );
                 return None;
             }
         };
 
-        if let Ok(mut cache) = self.email_cache.lock() {
-            cache.insert(key, (email.clone(), Instant::now()));
+        if let Ok(mut cache) = self.profile_cache.lock() {
+            cache.insert(key, (profile.clone(), Instant::now()));
         }
-        Some(email)
+        Some(profile)
     }
 
     /// Fetch an identity by its gateway ULID within `tenant_id`.
@@ -280,5 +335,48 @@ impl IdentityClient {
 impl std::fmt::Debug for IdentityClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IdentityClient").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_with_traits(traits: serde_json::Value) -> Identity {
+        Identity {
+            id: "01KWF0KYZ0FRNR23ZXAWJZV43T".to_string(),
+            traits: buffa::MessageField::some(
+                serde_json::from_value(traits).expect("traits must build"),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_name_joins_given_and_family() {
+        let identity = identity_with_traits(serde_json::json!({
+            "email": "ada@example.com",
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+        }));
+        assert_eq!(identity_display_name(&identity), "Ada Lovelace");
+        assert_eq!(identity_email(&identity), "ada@example.com");
+    }
+
+    #[test]
+    fn display_name_falls_back_to_whichever_part_exists() {
+        let given_only = identity_with_traits(serde_json::json!({"given_name": "Ada"}));
+        assert_eq!(identity_display_name(&given_only), "Ada");
+        let family_only = identity_with_traits(serde_json::json!({"family_name": "Lovelace"}));
+        assert_eq!(identity_display_name(&family_only), "Lovelace");
+    }
+
+    #[test]
+    fn display_name_is_empty_without_name_traits() {
+        let email_only = identity_with_traits(serde_json::json!({"email": "ada@example.com"}));
+        assert_eq!(identity_display_name(&email_only), "");
+        let no_traits = Identity::default();
+        assert_eq!(identity_display_name(&no_traits), "");
+        assert_eq!(identity_email(&no_traits), "");
     }
 }

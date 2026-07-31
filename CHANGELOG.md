@@ -23,6 +23,11 @@ and this project now adheres to [Calendar Versioning](https://calver.org) (CalVe
   streams with the full post-transfer card hydrated at dispatch time, and
   the search index is updated on dispatch.
 Published to `buf.build/sunbeamdotpt/kanban:096a3791210a45a89ad2d820c7c028c5`.
+- **Assignee display-name hydration (KANBAN-024).** `Assignee.display_name`
+  now hydrates alongside email from the identity's `given_name` /
+  `family_name` traits (deployed `employee` schema) on the same read paths
+  and the same TTL-cached resolver. `avatar_url` stays empty — no avatar
+  trait exists yet (SSO-028).
 - **Assignee email hydration (KANBAN-035).** The `Assignee` message gains an
   additive `email` field (tag 4), populated read-time from the tenant's
   sso-gateway user directory on every card read path: card RPCs,
