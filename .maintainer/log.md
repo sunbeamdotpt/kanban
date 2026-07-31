@@ -586,3 +586,19 @@ unreleased mainline commits). Assigned to tony (GitHub: mckenzietony,
 resolved via org member list). Review focus posted in the PR body:
 grammar semantics, pusher-identity authorization, time-tracking totals,
 rollout phasing + the sso-gateway verified-login dependency.
+
+2026-07-31 — **KANBAN-024 implemented after a schema reality-check; lesson
+recorded.** I had marked 024 blocked upstream after reading the
+sso-gateway repo's deploy/kratos-identity.schema.json (email-only).
+Sienna: check the DEPLOYED schemas via the CLI. Live directory truth: the
+'employee' schema carries given_name/family_name/tenant_id/email, all
+populated. display_name hydration shipped from those traits
+(resolve_profile generalizes the 035 resolver; harness schema now mirrors
+employee). SSO-028 narrowed to the only real gap (avatar_url, low) and
+024's dependency on it removed. Lesson now documented in
+.maintainer/interfaces.md and identity_client.rs: never reason about
+identity traits from the vendored schema file — query the live directory
+(sunbeam user get/list). CLI upgraded 3.2.1 → 3.3.0 locally to gain the
+--unblocked flag. Data note flagged to sienna: directory has her
+family_name as 'Satterthwaite', git config says 'Satterwhite' — hydration
+shows whatever the directory says.

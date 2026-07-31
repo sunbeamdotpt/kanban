@@ -22,7 +22,30 @@ timestamp: 2026-07-20T00:00:00Z
   One-way chain: [migrations-policy.md](migrations-policy.md).
 - **sso-gateway** — OAuth2 introspection (`SSO_GATEWAY_*` env vars since
   v2026.07.1; the old `HYDRA_*` names are silently ignored), `PermissionService`,
-  readiness proxy. Service app needs `tenant:admin` + `permission:admin` scopes.
+  readiness proxy. Service app needs `tenant:admin` + `permission:admin` scopes
+  (+ `identity:read` for assignee validation/hydration — SBBB-016 in prod).
+
+### sso-gateway identity traits contract
+
+Kanban reads these traits from identity objects (`IdentityService`,
+via `src/auth/identity_client.rs`):
+
+| Trait | Used for | Availability |
+|-------|----------|--------------|
+| `email` | `Assignee.email`, email→identity resolution | required on every schema |
+| `given_name` | `Assignee.display_name` (first part) | deployed `employee` schema |
+| `family_name` | `Assignee.display_name` (last part) | deployed `employee` schema |
+
+Display name hydrates as `"given_name family_name"` (either part alone if
+the other is missing). **No avatar trait exists anywhere** (SSO-028
+narrowed to that gap). **Do not trust `deploy/kratos-identity.schema.json`
+in the sso-gateway repo** — it documents an email-only base schema and
+lags the deployed schemas (prod uses `employee` with name traits; verified
+2026-07-31 via `sunbeam user get sienna@sunbeam.pt`). Always check the live
+directory (`sunbeam user get <email>` / `sunbeam user list`) before
+reasoning about traits. The test harness schema mirrors the deployed
+`employee` shape (optional `given_name`/`family_name`) so hydration is
+testable.
 - **NATS JetStream** — subjects `kanban.board.{id}.events`; auth via callout
   (grants live in the `nats-callout` repo / sbbb docs).
 - **OpenSearch** — index `sunbeam-kanban-cards-v1`.
