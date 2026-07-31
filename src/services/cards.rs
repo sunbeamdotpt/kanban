@@ -301,10 +301,12 @@ pub(crate) async fn fetch_labels(pool: &PgPool, card_id: Id, tenant_id: &str) ->
     .iter()
     .map(|r| {
         let lid: Id = r.get("id");
-        let pid: Id = r.get("project_id");
+        // Global labels have NULL project_id (migration 0032) — decode as
+        // Option or every card read carrying a global label panics.
+        let pid: Option<Id> = r.get("project_id");
         Label {
             id: lid.to_string(),
-            project_id: pid.to_string(),
+            project_id: pid.map(|p| p.to_string()).unwrap_or_default(),
             name: r.get("name"),
             style: r.get("style"),
             ..Default::default()
