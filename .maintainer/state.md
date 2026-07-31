@@ -10,8 +10,13 @@ timestamp: 2026-07-31T15:00:00Z
 
 ## In flight
 
-- **Unreleased on mainline** (now 8 commits, awaiting a release decision
-  from sienna — releases escalate per charter):
+- **v2026.07.12 RELEASED 2026-07-31** (sienna approved in-session):
+  TransferCard, Assignee email + display_name hydration, template is_done,
+  authn logging + introspection timeout knob, harness reaper/retries/
+  self-bootstrap, fetch_labels global-label fix, CardMoved key fix,
+  smart-commits RFC (also PR #3 to tony). See CHANGELOG. Deployment card:
+  SBBB-036 (tony, depends_on SBBB-016 identity:read — hard dep).
+- Previously unreleased, now shipped in v2026.07.12:
   - `6ab6901f66` feat(cards): KANBAN-034 TransferCard (relocate-in-place).
   - `e3f67c83cf` fix(realtime): CardMoved event payload keys.
   - `093678758f` fix(cards): fetch_labels global-label panic.
