@@ -602,3 +602,16 @@ identity traits from the vendored schema file — query the live directory
 --unblocked flag. Data note flagged to sienna: directory has her
 family_name as 'Satterthwaite', git config says 'Satterwhite' — hydration
 shows whatever the directory says.
+
+2026-07-31 — **v2026.07.12 released; review cards stay until verified.**
+Sienna approved the release train in-session. Pre-release full suite:
+341 passed + 2 parallel-load flakes passing in isolation. Conventional
+split: docs (changelog [2026.07.12] + state, ba7d492197) then
+chore(release) (327a9b24ec), mainline pushed (16f5d1ebbb..327a9b24ec),
+annotated tag v2026.07.12 pushed; release workflow run 30650855154.
+Deploy card SBBB-036 filed (tony, depends_on SBBB-016 identity:read —
+hard dependency for both assign validation and assignee hydration).
+**Process change by sienna: cards in review are NOT moved to done at tag
+time anymore — they move only after verification** (previously: done on
+release). Watching the run; GHCR image verification, then prod
+verification of the review cards against the deployed build.
