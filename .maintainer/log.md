@@ -622,3 +622,22 @@ floating v2026.07 / v2026 / latest updated. SBBB-036 commented
 image-live; deploy (tony) + SBBB-016 are the remaining production steps.
 Review cards (024/031/033/034/035/036/037/038) stay in review until
 post-deploy verification per the new policy.
+
+2026-07-31 — **Smart-commits RFC approved (PR #3 merged d51c616d71) and
+ticketed.** Status bumped Draft → Planned Implementation on the review
+branch, merged via local add/add resolution (the RFC file was identical
+both sides except the status edit; took --theirs). Umbrella KANBAN-041
+closed as superseded by the phase breakdown; tickets filed per the
+feature card template (Given/When/Then acceptance criteria), each sized
+~4 story points (noted in-description — KANBAN-013's numeric estimate
+field doesn't exist yet):
+- Phase 1: KANBAN-043 repo mapping, 044 receiver+push ingress, 045
+  parser, 046 github_identities (all high) → KANBAN-047 executor+audit+
+  backlinks+#comment (depends on all four).
+- Phase 2: KANBAN-048 #fixes typed links, 049 #label/#assign commands
+  (medium, depend on 047).
+- Phase 3: KANBAN-042 TimeTrackingService (re-scoped to template, dep on
+  the closed umbrella removed) + KANBAN-050 #time execution + totals
+  (depends on 042+047).
+KANBAN-019 relationship noted: 044 delivers the shared receiver; 019's
+issue/PR handling layers on it when scheduled.
