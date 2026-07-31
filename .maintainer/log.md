@@ -615,3 +615,10 @@ hard dependency for both assign validation and assignee hydration).
 time anymore — they move only after verification** (previously: done on
 release). Watching the run; GHCR image verification, then prod
 verification of the review cards against the deployed build.
+
+2026-07-31 — **v2026.07.12 image live.** Run 30650855154 succeeded
+(~14 min); GHCR index sha256:a463a998… with linux/amd64 + linux/arm64,
+floating v2026.07 / v2026 / latest updated. SBBB-036 commented
+image-live; deploy (tony) + SBBB-016 are the remaining production steps.
+Review cards (024/031/033/034/035/036/037/038) stay in review until
+post-deploy verification per the new policy.
