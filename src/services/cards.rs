@@ -34,9 +34,9 @@ use crate::cpb::sunbeam::kanban::v1::{
     EditCommentResponse, GetCardRequest, GetCardResponse, Label, ListCardsByBoardRequest,
     ListCardsByBoardResponse, ListCommentsRequest, ListCommentsResponse, MoveCardRequest,
     MoveCardResponse, RemoveCardDependencyRequest, RemoveCardDependencyResponse,
-    RemoveChecklistItemRequest, RemoveChecklistItemResponse, UnassignCardRequest,
-    UnassignCardResponse, UpdateCardRequest, UpdateCardResponse, UpdateChecklistItemRequest,
-    UpdateChecklistItemResponse,
+    RemoveChecklistItemRequest, RemoveChecklistItemResponse, TransferCardRequest,
+    TransferCardResponse, UnassignCardRequest, UnassignCardResponse, UpdateCardRequest,
+    UpdateCardResponse, UpdateChecklistItemRequest, UpdateChecklistItemResponse,
 };
 use crate::event_log::insert_board_event;
 
@@ -45,6 +45,7 @@ use crate::event_log::insert_board_event;
 const DEFAULT_PAGE_LIMIT: i32 = 50;
 const MAX_PAGE_LIMIT: i32 = 200;
 const PERMISSION_TYPE_CARD: &str = "KanbanCard";
+const PERMISSION_TYPE_BOARD: &str = "KanbanBoard";
 
 /// Resolve a request page limit: unset (≤ 0) → `DEFAULT_PAGE_LIMIT`, otherwise
 /// clamped to `1..=MAX_PAGE_LIMIT`.
@@ -1508,6 +1509,290 @@ impl CardService for CardServiceImpl {
         let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
         Ok(Response::new(MoveCardResponse {
             card: Some(card).into(),
+            ..Default::default()
+        }))
+    }
+
+    // ── TransferCard ────────────────────────────────────────────────────────
+    //
+    // CheckedObjectId = source card_id (KanbanCard + edit, per matrix); the
+    // handler additionally requires edit on the TARGET board — a transfer
+    // writes into another project, so one header object cannot authorize it
+    // (KANBAN-034). Relocate-in-place: the card keeps comments, attachments,
+    // checklist, assignees, github links, and dependencies; the ref is
+    // re-minted under the target project; milestone and project-scoped
+    // labels are scrubbed. completed_at follows only the is_done column
+    // rule — a transfer is not a completion.
+
+    async fn transfer_card(
+        &self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, TransferCardRequest>,
+    ) -> ServiceResult<TransferCardResponse> {
+        let object_id = checked_object_id(&ctx)?;
+        let card_id = object_id
+            .parse::<Id>()
+            .map_err(|_| ConnectError::invalid_argument("invalid card_id"))?;
+
+        let tenant_id = tenant_id_from_request(&ctx)?;
+        let req = request.to_owned_message();
+        let target_board_id = req
+            .target_board_id
+            .parse::<Id>()
+            .map_err(|_| ConnectError::invalid_argument("invalid target_board_id"))?;
+        let target_col_id = req
+            .target_column_id
+            .parse::<Id>()
+            .map_err(|_| ConnectError::invalid_argument("invalid target_column_id"))?;
+
+        // Idempotency: on replay, return the card plus the previous ref
+        // recorded in the transfer event payload.
+        if check_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key)
+            .await?
+            .is_some()
+        {
+            let previous_ref: String = sqlx::query(
+                "SELECT payload->>'previous_ref' FROM event_log \
+                 WHERE tenant_id = $1 AND event_type = 'CardTransferred' \
+                   AND payload->>'card_id' = $2 AND payload->>'idempotency_key' = $3 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&tenant_id)
+            .bind(card_id.to_string())
+            .bind(&req.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| internal("failed to recover previous ref", e))?
+            .map(|r| r.get::<String, _>(0))
+            .unwrap_or_default();
+
+            let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
+            return Ok(Response::new(TransferCardResponse {
+                card: Some(card).into(),
+                previous_ref,
+                ..Default::default()
+            }));
+        }
+
+        // Fetch the card's current state.
+        let card_row = sqlx::query(
+            "SELECT board_id, column_id, project_id, ref, revision FROM cards WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(card_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch card", e))?
+        .ok_or_else(|| ConnectError::not_found("card not found"))?;
+
+        let board_id: Id = card_row.get("board_id");
+        let from_col_id: Id = card_row.get("column_id");
+        let card_project_id: Id = card_row.get("project_id");
+        let previous_ref: String = card_row.get("ref");
+        let prev_revision: i64 = card_row.get("revision");
+
+        // Target board must exist, live in a DIFFERENT project (same-project
+        // cross-board moves are MoveCard's job), and the caller must hold
+        // edit on it.
+        let target_project_id: Id =
+            sqlx::query("SELECT project_id FROM boards WHERE id = $1 AND tenant_id = $2")
+                .bind(target_board_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch target board", e))?
+                .ok_or_else(|| ConnectError::not_found("target board not found"))?
+                .get("project_id");
+
+        if card_project_id == target_project_id {
+            return Err(ConnectError::invalid_argument(
+                "target board is in the same project; use MoveCard",
+            ));
+        }
+
+        let subject = subject_from_request(&ctx)?;
+        let permission = tenant_client_for(&self.permission, &ctx).await?;
+        let allowed = permission
+            .check_permission_with_retry(
+                PERMISSION_TYPE_BOARD,
+                &target_board_id.to_string(),
+                "edit",
+                &subject,
+            )
+            .await
+            .map_err(|e| internal("failed to check target board permission", e))?;
+        if !allowed {
+            return Err(ConnectError::permission_denied(
+                "edit required on the target board",
+            ));
+        }
+
+        // Target column must belong to the target board; fetch its done
+        // marker, and the source column's, for the completed_at rule.
+        let target_col_row = sqlx::query(
+            "SELECT board_id, is_done FROM columns WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(target_col_id)
+        .bind(&tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| internal("failed to fetch target column", e))?
+        .ok_or_else(|| ConnectError::not_found("target column not found"))?;
+
+        let target_col_board: Id = target_col_row.get("board_id");
+        if target_col_board != target_board_id {
+            return Err(ConnectError::invalid_argument(
+                "target column does not belong to the target board",
+            ));
+        }
+        let to_is_done: bool = target_col_row.get("is_done");
+
+        let from_is_done: bool =
+            sqlx::query("SELECT is_done FROM columns WHERE id = $1 AND tenant_id = $2")
+                .bind(from_col_id)
+                .bind(&tenant_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| internal("failed to fetch source column", e))?
+                .map(|r| r.get("is_done"))
+                .unwrap_or(false);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| internal("begin tx failed", e))?;
+
+        // Re-mint the ref under the target project (advisory lock inside).
+        let new_ref = allocate_card_ref(&mut tx, target_project_id, &tenant_id).await?;
+
+        // Append at the end of the target column.
+        let to_pos: i32 = sqlx::query(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM cards WHERE column_id = $1 AND tenant_id = $2",
+        )
+        .bind(target_col_id)
+        .bind(&tenant_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to allocate target position", e))?
+        .get(0);
+
+        // Relocate: re-home project/board/column, re-mint ref, scrub the
+        // project-scoped milestone, apply the is_done completed_at rule.
+        let new_revision_row = sqlx::query(
+            "UPDATE cards SET project_id = $2, board_id = $3, column_id = $4, ref = $5, \
+                              position = $6, milestone_id = NULL, revision = revision + 1, \
+                              completed_at = CASE WHEN $8 THEN COALESCE(completed_at, now()) \
+                                                  WHEN $9 THEN NULL \
+                                                  ELSE completed_at END, \
+                              updated_at = now() \
+             WHERE id = $1 AND tenant_id = $7 RETURNING revision",
+        )
+        .bind(card_id)
+        .bind(target_project_id)
+        .bind(target_board_id)
+        .bind(target_col_id)
+        .bind(&new_ref)
+        .bind(to_pos)
+        .bind(&tenant_id)
+        .bind(to_is_done)
+        .bind(from_is_done && !to_is_done)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to relocate card", e))?;
+
+        let new_revision: i64 = new_revision_row.get("revision");
+
+        // Scrub project-scoped labels; global labels (project_id IS NULL)
+        // survive the transfer.
+        sqlx::query(
+            "DELETE FROM card_labels WHERE card_id = $1 AND label_id IN \
+             (SELECT id FROM labels WHERE project_id IS NOT NULL AND project_id <> $2)",
+        )
+        .bind(card_id)
+        .bind(target_project_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to scrub project-scoped labels", e))?;
+
+        // Event on BOTH boards: source-board subscribers remove the card,
+        // target-board subscribers insert it. The full card is hydrated at
+        // dispatch time (post-transfer state), as with CardCreated.
+        let payload = |idem: &str| {
+            json!({
+                "card_id": card_id.to_string(),
+                "from_board_id": board_id.to_string(),
+                "to_board_id": target_board_id.to_string(),
+                "to_column_id": target_col_id.to_string(),
+                "to_position": to_pos,
+                "previous_ref": previous_ref,
+                "prev_revision": prev_revision,
+                "new_revision": new_revision,
+                "idempotency_key": idem,
+            })
+        };
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            board_id,
+            "CardTransferred",
+            payload(&req.idempotency_key),
+        )
+        .await?;
+        insert_board_event(
+            &mut tx,
+            &tenant_id,
+            target_board_id,
+            "CardTransferred",
+            payload(&req.idempotency_key),
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| internal("commit failed", e))?;
+
+        // Re-home the permission parent tuple so access follows the target
+        // board (same pattern as cross-board MoveCard). Best-effort; the
+        // reconciler catches drift.
+        if let Err(e) = permission
+            .delete_relation_tuples(
+                PERMISSION_TYPE_CARD,
+                Some(card_id.to_string()),
+                Some("parent".to_string()),
+                Some(format!("KanbanBoard:{board_id}")),
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                card_id = %card_id,
+                "mirror_drift: failed to delete old parent tuple on card transfer"
+            );
+        }
+        if let Err(e) = permission
+            .grant_with_retry(
+                PERMISSION_TYPE_CARD,
+                &card_id.to_string(),
+                "parent",
+                &format!("KanbanBoard:{target_board_id}"),
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                card_id = %card_id,
+                target_board_id = %target_board_id,
+                "mirror_drift: failed to write new parent tuple on card transfer"
+            );
+        }
+
+        store_idempotency_card(&self.pool, &tenant_id, &req.idempotency_key, card_id).await;
+
+        let card = fetch_full_card(&self.pool, card_id, &tenant_id, &self.identity).await?;
+        Ok(Response::new(TransferCardResponse {
+            card: Some(card).into(),
+            previous_ref,
             ..Default::default()
         }))
     }
@@ -6377,6 +6662,273 @@ mod tests {
                 .unwrap_or(false),
             "viewer of board B must see the card after the move"
         );
+
+        cleanup_project(&pool, pid).await;
+    }
+
+    // ── TransferCard (KANBAN-034) ────────────────────────────────────────────
+
+    /// Scaffold two projects with a board + column each, returning
+    /// `(owner, src_pid, src_board, src_col, tgt_pid, tgt_board, tgt_col)`.
+    async fn scaffold_transfer(
+        pool: &PgPool,
+        permission: &Arc<PermissionClient>,
+        tenant_id: &str,
+    ) -> (String, Id, Id, Id, Id, Id, Id) {
+        let owner = format!("user:test-owner-{}", Id::new());
+        let src_pid = seed_project(pool, &owner, "TSR").await;
+        let src_board = seed_board(pool, src_pid, tenant_id).await;
+        let src_col = seed_column(pool, src_board, tenant_id).await;
+        let tgt_pid = seed_project(pool, &owner, "TTG").await;
+        let tgt_board = seed_board(pool, tgt_pid, tenant_id).await;
+        let tgt_col = seed_column(pool, tgt_board, tenant_id).await;
+        // seed_project only grants the owner implicitly via owner_id; the
+        // handler-side target check goes through the permission backend.
+        permission
+            .grant_with_retry("KanbanBoard", &tgt_board.to_string(), "editor", &owner)
+            .await
+            .expect("grant target board editor failed");
+        (owner, src_pid, src_board, src_col, tgt_pid, tgt_board, tgt_col)
+    }
+
+    #[tokio::test]
+    async fn transfer_card_relocates_in_place_and_preserves_details() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let (owner, src_pid, src_board, src_col, tgt_pid, tgt_board, tgt_col) =
+            scaffold_transfer(&pool, &permission, &tenant_id).await;
+
+        let milestone = seed_milestone(&pool, src_pid, &tenant_id, "v1").await;
+        let project_label = seed_label(&pool, src_pid, &tenant_id, "project-only").await;
+        let global_label = Id::new();
+        sqlx::query(
+            "INSERT INTO labels (id, tenant_id, project_id, name, style) VALUES ($1, $2, NULL, $3, 'blue')",
+        )
+        .bind(global_label)
+        .bind(&tenant_id)
+        .bind("global-keep")
+        .execute(&pool)
+        .await
+        .expect("seed global label failed");
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&owner, &src_board.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: src_board.to_string(),
+                    column_id: src_col.to_string(),
+                    title: "Transfer me".to_string(),
+                    milestone_id: milestone.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+        let old_ref = card.r#ref.clone();
+        assert!(old_ref.starts_with("TSR-"), "ref uses the source prefix");
+
+        // Attach a comment, both labels, and a checklist item — all must
+        // survive except the project-scoped label and the milestone.
+        svc.add_comment(
+            authed_ctx_with_object(&owner, &card.id),
+            connect_request(&AddCommentRequest {
+                card_id: card.id.clone(),
+                body: "keep me".to_string(),
+                idempotency_key: Id::new().to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("add comment failed");
+        for lid in [project_label, global_label] {
+            sqlx::query("INSERT INTO card_labels (card_id, label_id) VALUES ($1, $2)")
+                .bind(card.id.parse::<Id>().unwrap())
+                .bind(lid)
+                .execute(&pool)
+                .await
+                .expect("attach label failed");
+        }
+
+        let resp = svc
+            .transfer_card(
+                authed_ctx_with_object(&owner, &card.id),
+                connect_request(&TransferCardRequest {
+                    card_id: card.id.clone(),
+                    target_board_id: tgt_board.to_string(),
+                    target_column_id: tgt_col.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("transfer failed")
+            .body;
+
+        assert_eq!(resp.previous_ref, old_ref, "response echoes the dead ref");
+        let moved = resp.card.into_option().expect("card missing");
+        assert_eq!(moved.project_id, tgt_pid.to_string());
+        assert_eq!(moved.board_id, tgt_board.to_string());
+        assert_eq!(moved.column_id, tgt_col.to_string());
+        assert!(
+            moved.r#ref.starts_with("TTG-"),
+            "ref must be re-minted under the target prefix, got {}",
+            moved.r#ref
+        );
+        assert!(moved.milestone_id.is_empty(), "milestone is scrubbed");
+        assert_eq!(
+            moved.comments_count, 1,
+            "comments survive the transfer"
+        );
+        assert_eq!(
+            moved.labels.len(),
+            1,
+            "only the global label survives: {:?}",
+            moved.labels
+        );
+        assert_eq!(moved.labels[0].id, global_label.to_string());
+        assert!(
+            moved.completed_at.as_option().is_none(),
+            "transfer into a non-done column never stamps completed_at"
+        );
+
+        // CardTransferred was written to BOTH boards' event logs.
+        for bid in [src_board, tgt_board] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM event_log WHERE board_id = $1 AND event_type = 'CardTransferred'",
+            )
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "CardTransferred expected on board {bid}");
+        }
+
+        // The permission parent tuple follows the target board.
+        let outsider = format!("user:test-outsider-{}", Id::new());
+        permission
+            .grant_with_retry("KanbanBoard", &tgt_board.to_string(), "viewer", &outsider)
+            .await
+            .expect("grant target viewer failed");
+        assert!(
+            permission
+                .check_permission_with_retry("KanbanCard", &card.id, "view", &outsider)
+                .await
+                .unwrap_or(false),
+            "a viewer of the target board must see the transferred card"
+        );
+
+        cleanup_project(&pool, src_pid).await;
+        cleanup_project(&pool, tgt_pid).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_card_requires_edit_on_target_board() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let owner = format!("user:test-owner-{}", Id::new());
+        let src_pid = seed_project(&pool, &owner, "TDN").await;
+        let src_board = seed_board(&pool, src_pid, &tenant_id).await;
+        let src_col = seed_column(&pool, src_board, &tenant_id).await;
+        // Target board the owner has NO grant on (owned by someone else).
+        let other = format!("user:test-other-{}", Id::new());
+        let tgt_pid = seed_project(&pool, &other, "TDT").await;
+        let tgt_board = seed_board(&pool, tgt_pid, &tenant_id).await;
+        let tgt_col = seed_column(&pool, tgt_board, &tenant_id).await;
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&owner, &src_board.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: src_board.to_string(),
+                    column_id: src_col.to_string(),
+                    title: "No entry".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let err = svc
+            .transfer_card(
+                authed_ctx_with_object(&owner, &card.id),
+                connect_request(&TransferCardRequest {
+                    card_id: card.id.clone(),
+                    target_board_id: tgt_board.to_string(),
+                    target_column_id: tgt_col.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("transfer without target edit must be denied");
+        assert_eq!(err.code, connectrpc::ErrorCode::PermissionDenied);
+
+        cleanup_project(&pool, src_pid).await;
+        cleanup_project(&pool, tgt_pid).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_card_rejects_same_project_target() {
+        let pool = setup_pool().await;
+        let permission = setup_permission().await;
+        let svc = make_service(pool.clone(), Arc::clone(&permission)).await;
+        let tenant_id = crate::test_support::test_tenant_id();
+
+        let subject = format!("user:test-{}", Id::new());
+        let pid = seed_project(&pool, &subject, "TSP").await;
+        let board_a = seed_board(&pool, pid, &tenant_id).await;
+        let board_b = seed_board(&pool, pid, &tenant_id).await;
+        let col_a = seed_column(&pool, board_a, &tenant_id).await;
+        let col_b = seed_column(&pool, board_b, &tenant_id).await;
+
+        let card = svc
+            .create_card(
+                authed_ctx_with_object(&subject, &board_a.to_string()),
+                connect_request(&CreateCardRequest {
+                    board_id: board_a.to_string(),
+                    column_id: col_a.to_string(),
+                    title: "Stay put".to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create failed")
+            .body
+            .card
+            .into_option()
+            .expect("card missing");
+
+        let err = svc
+            .transfer_card(
+                authed_ctx_with_object(&subject, &card.id),
+                connect_request(&TransferCardRequest {
+                    card_id: card.id.clone(),
+                    target_board_id: board_b.to_string(),
+                    target_column_id: col_b.to_string(),
+                    idempotency_key: Id::new().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("same-project target must be rejected");
+        assert_eq!(err.code, connectrpc::ErrorCode::InvalidArgument);
 
         cleanup_project(&pool, pid).await;
     }

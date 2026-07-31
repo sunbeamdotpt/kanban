@@ -39,6 +39,7 @@
 //! | "CardUpdated"     | payload::CardUpdated (patch as google.protobuf.Struct) |
 //! | "CardMoved"       | payload::CardMoved   |
 //! | "CardDeleted"     | payload::CardDeleted |
+//! | "CardTransferred" | payload::CardTransferred (full Card hydrated from the DB) |
 //! | "ColumnAdded"     | payload::ColumnAdded |
 //! | "ColumnUpdated"   | payload::ColumnUpdated |
 //! | "ColumnRenamed"   | payload::ColumnRenamed |
@@ -112,7 +113,7 @@ use crate::cpb::sunbeam::kanban::v1::{
     CardMoved, CardUpdated, ColumnAdded, ColumnRemoved, ColumnRenamed, ColumnUpdated,
     ColumnsReordered, EventBoard, EventColumn, GitHubLinkAdded, GitHubLinkRefreshed, MemberAdded,
     MemberRemoved, MemberRoleChanged, MembershipChanged, ProjectUpdated, SourceBoardAdded,
-    SourceBoardRemoved, board_event_envelope::Payload,
+    SourceBoardRemoved, CardTransferred, board_event_envelope::Payload,
 };
 use crate::event_log::EVENT_LOG_NOTIFY_CHANNEL;
 use crate::integrations::opensearch::OpenSearchClient;
@@ -471,7 +472,7 @@ impl OutboxDispatcher {
                             .and_then(|s| s.parse::<Id>().ok());
                         if let Some(card_id) = card_id {
                             match event_type.as_str() {
-                                "CardCreated" | "CardUpdated" | "CardMoved" => {
+                                "CardCreated" | "CardUpdated" | "CardMoved" | "CardTransferred" => {
                                     crate::search_indexing::index_card_by_id(
                                         os, index, &self.pool, card_id, &tenant_id,
                                     )
@@ -514,8 +515,9 @@ impl OutboxDispatcher {
     /// `CardCreated` hydrates the full `Card` proto from the cards table at
     /// dispatch time; when the card no longer exists (deleted between the
     /// mutation and the drain) it falls back to the minimal variant so the
-    /// event still reaches subscribers. Every other event type maps purely
-    /// from the JSONB payload.
+    /// event still reaches subscribers. `CardTransferred` hydrates the same
+    /// way (post-transfer state). Every other event type maps purely from
+    /// the JSONB payload.
     async fn build_payload(
         &self,
         event_type: &str,
@@ -539,6 +541,30 @@ impl OutboxDispatcher {
                 card: Some(card).into(),
                 column_id: json_str(json, "column_id"),
                 position: json_i32(json, "position"),
+                idempotency_key: json_str(json, "idempotency_key"),
+                ..Default::default()
+            })));
+        }
+        if event_type == "CardTransferred"
+            && let Some(card_id) = json
+                .get("card_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Id>().ok())
+            && let Ok(card) = crate::services::cards::fetch_full_card(
+                &self.pool,
+                card_id,
+                tenant_id,
+                &self.identity,
+            )
+            .await
+        {
+            return Some(Payload::CardTransferred(Box::new(CardTransferred {
+                card: Some(card).into(),
+                from_board_id: json_str(json, "from_board_id"),
+                to_board_id: json_str(json, "to_board_id"),
+                to_column_id: json_str(json, "to_column_id"),
+                to_position: json_i32(json, "to_position"),
+                previous_ref: json_str(json, "previous_ref"),
                 idempotency_key: json_str(json, "idempotency_key"),
                 ..Default::default()
             })));
@@ -729,6 +755,17 @@ fn build_payload(event_type: &str, json: &JsonValue) -> Option<Payload> {
                 ..Default::default()
             })))
         }
+        "CardTransferred" => Some(Payload::CardTransferred(Box::new(CardTransferred {
+            // Minimal variant: the full Card is hydrated by the dispatcher.
+            card: None.into(),
+            from_board_id: json_str(json, "from_board_id"),
+            to_board_id: json_str(json, "to_board_id"),
+            to_column_id: json_str(json, "to_column_id"),
+            to_position: json_i32(json, "to_position"),
+            previous_ref: json_str(json, "previous_ref"),
+            idempotency_key,
+            ..Default::default()
+        }))),
         "ColumnAdded" => Some(Payload::ColumnAdded(Box::new(ColumnAdded {
             column: Some(parse_event_column(
                 json.get("column").unwrap_or(&JsonValue::Null),

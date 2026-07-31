@@ -137,6 +137,8 @@ message BoardEventEnvelope {
     AggregatedBoardDeleted aggregated_board_deleted = 47;
     SourceBoardAdded source_board_added = 48;
     SourceBoardRemoved source_board_removed = 49;
+    // ── Transfer ─────────────────────────────────────────────────────────────
+    CardTransferred card_transferred = 50;
     // ── Stream control ───────────────────────────────────────────────────────
     Heartbeat heartbeat = 19;
     Cutover cutover = 20;
@@ -202,6 +204,24 @@ message CardDeleted {
   string card_id = 1;
   uint64 prev_revision = 2;
   string idempotency_key = 3;
+}
+
+// Emitted on `CardService.TransferCard` — a cross-project relocation where
+// the card keeps its comments, attachments, checklist, assignees, github
+// links, and history. Written to BOTH boards' streams: source-board
+// subscribers remove the card from their view, target-board subscribers
+// insert it. The full Card (post-transfer state) is hydrated at dispatch
+// time, as with CardCreated.
+message CardTransferred {
+  Card card = 1;
+  string from_board_id = 2;
+  string to_board_id = 3;
+  string to_column_id = 4;
+  int32 to_position = 5;
+  // The card's ref before the transfer; the ref is re-minted under the
+  // target project's prefix and the previous ref stops resolving.
+  string previous_ref = 6;
+  string idempotency_key = 7;
 }
 
 // ── Local value types (avoid circular import with boards.proto) ───────────────

@@ -228,6 +228,24 @@ message MoveCardResponse {
   Card card = 1;
 }
 
+message TransferCardRequest {
+  string card_id = 1;
+  // Board in another project the card is relocated to.
+  string target_board_id = 2;
+  // Column on the target board; the card is appended at the end.
+  string target_column_id = 3;
+  // ULID — optional on the wire but strongly recommended.
+  string idempotency_key = 4;
+}
+
+message TransferCardResponse {
+  Card card = 1;
+  // The card's ref before the transfer. Refs are project-scoped, so the
+  // ref is re-minted under the target project's prefix; the previous ref
+  // stops resolving and is returned here for display/audit.
+  string previous_ref = 2;
+}
+
 message DeleteCardRequest {
   string card_id = 1;
 }
@@ -402,10 +420,22 @@ service CardService {
   rpc UpdateCard(UpdateCardRequest) returns (UpdateCardResponse);
 
   // MoveCard repositions a card within or between columns on the same board.
-  // Cross-project moves return Unimplemented (MF-3). idempotency_key is
+  // Cross-board moves within one project re-home the card; cross-project
+  // relocation is TransferCard. idempotency_key is
   // strongly recommended; echoed in the CardMoved stream event for optimistic-UI
   // deduplication (Tension 7 / Pre-mortem 3).
   rpc MoveCard(MoveCardRequest) returns (MoveCardResponse);
+
+  // TransferCard relocates a card to a board in ANOTHER project (KANBAN-034):
+  // the card keeps its comments, attachments, checklist, assignees, github
+  // links, and history — it is not a recreate-and-close. The card's ref is
+  // re-minted under the target project's prefix (the previous ref is returned
+  // and stops resolving). Project-scoped fields are scrubbed: milestone is
+  // cleared and project-scoped labels are dropped (global labels survive).
+  // A transfer is not a completion: completed_at follows only the normal
+  // is_done column rule. Requires edit on the source card (header object id)
+  // AND edit on the target board. Emits CardTransferred on both boards.
+  rpc TransferCard(TransferCardRequest) returns (TransferCardResponse);
 
   // DeleteCard requires "edit" on the board. Emits CardDeleted stream event.
   rpc DeleteCard(DeleteCardRequest) returns (DeleteCardResponse);

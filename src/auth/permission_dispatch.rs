@@ -120,7 +120,7 @@ pub fn matrix() -> &'static [DispatchEntry] {
     &MATRIX
 }
 
-static MATRIX: [DispatchEntry; 77] = [
+static MATRIX: [DispatchEntry; 78] = [
     // ── ProjectService (9) ──────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.ProjectService/ListProjects",
@@ -239,7 +239,7 @@ static MATRIX: [DispatchEntry; 77] = [
         relation: "",
         object_id_source: ObjectIdSource::None,
     },
-    // ── CardService (19) ────────────────────────────────────────────────────
+    // ── CardService (20) ────────────────────────────────────────────────────
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/GetCard",
         namespace: "KanbanCard",
@@ -272,6 +272,14 @@ static MATRIX: [DispatchEntry; 77] = [
     },
     DispatchEntry {
         method: "/sunbeam.kanban.v1.CardService/MoveCard",
+        namespace: "KanbanCard",
+        relation: "edit",
+        object_id_source: ObjectIdSource::Header,
+    },
+    DispatchEntry {
+        // Source card id in the header; the handler additionally requires
+        // edit on the TARGET board (dual authorization, KANBAN-034).
+        method: "/sunbeam.kanban.v1.CardService/TransferCard",
         namespace: "KanbanCard",
         relation: "edit",
         object_id_source: ObjectIdSource::Header,
@@ -1012,8 +1020,8 @@ mod tests {
     }
 
     #[test]
-    fn matrix_size_is_77() {
-        assert_eq!(MATRIX.len(), 77, "matrix must contain exactly 77 entries");
+    fn matrix_size_is_78() {
+        assert_eq!(MATRIX.len(), 78, "matrix must contain exactly 78 entries");
     }
 
     #[test]
