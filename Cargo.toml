@@ -39,7 +39,7 @@ hmac = "0.12"
 metrics = "0.24"
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] }
 parking_lot = "0.12"
 prometheus = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
